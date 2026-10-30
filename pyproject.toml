@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "easyebl"
+version = "0.1.0"
+description = "DIY SEM imaging and e-beam lithography control over NI-DAQmx (prototype)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+gds = ["gdstk>=0.9"]
+gui = ["PySide6>=6.5", "pyqtgraph>=0.13"]
+ni = ["nidaqmx>=0.9"]
+test = ["pytest>=7", "pytest-qt>=4", "gdstk>=0.9", "PySide6>=6.5", "pyqtgraph>=0.13"]
+all = ["gdstk>=0.9", "PySide6>=6.5", "pyqtgraph>=0.13", "nidaqmx>=0.9"]
+
+[project.scripts]
+easyebl-demo = "easyebl.gui.launcher:main"
+
+[tool.setuptools.packages.find]
+include = ["easyebl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "system: subsystem tests running full pipelines on the simulator",
+  "gui: GUI smoke tests (offscreen Qt)",
+]
