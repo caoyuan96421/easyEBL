@@ -20,8 +20,8 @@ def ramp_sample():
 
 def test_step_response_matches_first_order_lag():
     tau = 50e-6
-    be = SimulatedBackend(params=SimParams(lag_tau_s=tau, noise_sigma=0, video_delay_s=0, video_gain_v=1.0),
-                          sample=ramp_sample())
+    be = SimulatedBackend(params=SimParams(lag_tau_s=tau, noise_sigma=0, video_delay_s=0, video_gain_v=1.0,
+                                           ai_latency_samples=0), sample=ramp_sample())
     n = 200
     x = np.full(n, 5.0)  # step from 0 V to 5 V (25 µm)
     r = run(be, [OutputChunk(x, np.zeros(n), np.zeros(n, bool))])
@@ -42,7 +42,7 @@ def test_chunk_boundaries_do_not_matter():
 
 
 def test_video_delay_and_blank_signal():
-    p = SimParams(lag_tau_s=0, noise_sigma=0, video_delay_s=30e-6, video_gain_v=1.0)  # 3 samples
+    p = SimParams(lag_tau_s=0, noise_sigma=0, video_delay_s=20e-6, video_gain_v=1.0)  # 2 + 1 (AI latency)
     be = SimulatedBackend(params=p, sample=FunctionSample(lambda x, y: np.ones_like(x)))
     blank = np.zeros(20, bool)
     blank[10:] = True

@@ -115,6 +115,11 @@ alignment of AO/DO/AI, the clock routing, the start order, blanker polarity, the
 * Default `DAQConfig`: `ao0/ao1` = X/Y (±10 V), `port0/line0` = blanker (active high), AI `ai0`
   = video (differential), `port1/line0` = scan relay. Save a config with
   `DAQConfig(...).to_json()` and pass it with `--config`.
-* Keep **port0** for hardware‑timed lines only: the DO task drives the whole port.
+* Keep **port0** for hardware‑timed lines only: the DO task drives the whole port, and the
+  config validation rejects static lines placed there.
+* Choose sample rates that divide 100 MHz (e.g. 400 k or 500 kS/s). Other rates are coerced by
+  the device, and easyEBL warns when that happens.
+* Fit a hardware **blanker watchdog** (blank unless a heartbeat is present). Software cannot
+  guarantee blanking if the host stalls mid‑stream.
 * The S‑3000N DBC input is scaled by the SEM magnification. Calibrate `FieldCalibration` for
   each magnification you write at, and match the voltage range to the SEM's own X‑OUT/Y‑OUT signals.

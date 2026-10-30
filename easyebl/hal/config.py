@@ -43,7 +43,10 @@ class DAQConfig:
     park_y_v: float = 0.0
     max_ao_rate: float = 840e3  # USB-6341, two channels
     max_ai_aggregate_rate: float = 500e3  # USB-6341, multiplexed
-    buffer_samples: int = 200_000
+    buffer_samples: int = 200_000  # minimum output buffer (samples)
+    min_buffer_s: float = 1.0  # …and at least this much time at the stream rate
+    tail_hold_s: float = 20e-6  # end of stream: hold last position blanked before parking
+    abort_drain_timeout_s: float = 3.0  # abort: max wait for the safe tail to play out
     write_timeout_s: float = 10.0
 
     def validate(self) -> None:
@@ -59,8 +62,16 @@ class DAQConfig:
                 )
             if line == self.blank_line:
                 raise ValueError(f"timed line '{name}' collides with the blank line")
+        for name, line in self.static_lines.items():
+            if line.split("/")[0] == port:
+                raise ValueError(
+                    f"static line '{name}' ({line}) is on the hardware-timed port {port}; "
+                    "the stream drives that whole port – move it to another port"
+                )
         if self.buffer_samples < 1000:
             raise ValueError("buffer_samples too small")
+        if self.min_buffer_s <= 0 or self.tail_hold_s < 0:
+            raise ValueError("min_buffer_s must be > 0 and tail_hold_s ≥ 0")
 
     def physical(self, terminal: str) -> str:
         return f"{self.device}/{terminal}"

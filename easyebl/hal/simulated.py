@@ -189,6 +189,7 @@ class SimParams:
     blank_delay_s: float = 0.0  # blanker responds this much after the DO edge
     blank_leakage: float = 0.0  # fraction of current reaching sample when blanked
     video_delay_s: float = 1e-6  # detector/amplifier delay
+    ai_latency_samples: int = 1  # AI converts on the clock edge that updates the DAC (sees previous sample)
     video_tau_s: float = 0.0  # detector bandwidth (first order)
     beam_current_a: float = 100e-12
     noise_sigma: float = 0.02  # volts rms on the video signal
@@ -325,7 +326,7 @@ class SimulatedBackend(DAQBackend):
             a = 1.0 - np.exp(-dt / p.video_tau_s)
             sig, zf = signal.lfilter([a], [1.0, -(1.0 - a)], sig, zi=[(1.0 - a) * self._video_state])
             self._video_state = sig[-1]
-        d_v = int(round(p.video_delay_s * rate))
+        d_v = int(round(p.video_delay_s * rate)) + int(p.ai_latency_samples)
         if d_v > 0:
             vh = np.concatenate([self._video_hist, sig])
             if len(vh) < n + d_v:

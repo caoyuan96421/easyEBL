@@ -11,10 +11,18 @@ Timing model
 * The DO task (blanker + timed marker lines, all on port0) and the AI task
   use that clock as their sample clock, so output sample *k*, DO sample *k*
   and AI sample *k* share one clock edge.
-* AO and DO stream with regeneration disabled; the AI buffer is drained
-  between writes.  After the last real sample a tail of safe samples
-  (blanked, parked) is appended so the real data is fully generated before
-  the tasks stop.
+* AO and DO stream with regeneration disabled into an explicitly sized
+  buffer (≥ ``min_buffer_s`` of data); input is re-chunked to ¼ buffer.  The
+  AI buffer is drained between writes.
+* Every stream ends with a clocked safe tail: blank while holding the last
+  position (``tail_hold_s``, covers blanker latency), then park.  An abort
+  plays the same tail instead of freezing the lines.  On errors the clock
+  master (AO) is stopped first, the tasks are closed, then the static safe
+  state is written blank-first.
+
+Remaining hardware risk: a buffer underflow (host too slow) stops AO with
+the blank line frozen in its last state until the error surfaces.  Keep
+callbacks light; a hardware watchdog on the blanker is recommended.
 
 Port0 is driven as a whole by the DO task (bit *n* = ``port0/line n``), so
 reserve port0 for hardware-timed lines; put relays etc. on port1/port2.
@@ -24,10 +32,11 @@ from __future__ import annotations
 import threading
 import time
 from typing import Callable, Iterable, Sequence
+import warnings
 
 import numpy as np
 
-from ..core.waveform import OutputChunk
+from ..core.waveform import OutputChunk, concat_chunks, rechunk
 from .backend import AIConsumer, BackendCapabilities, DAQBackend, HALError, StreamResult
 from .config import DAQConfig
 
@@ -88,20 +97,31 @@ class NIDAQBackend(DAQBackend):
     def _phys(self, t: str) -> str:
         return self.config.physical(t)
 
-    def write_static(self, x_v: float, y_v: float, blank: bool) -> None:
-        nidaqmx = self._nidaqmx
+    def _write_blank_static(self, blank: bool) -> None:
         from nidaqmx.constants import LineGrouping
 
-        lim = self.config.ao_limit_v
-        with nidaqmx.Task() as t:
-            t.ao_channels.add_ao_voltage_chan(self._phys(self.config.ao_x), min_val=-lim, max_val=lim)
-            t.ao_channels.add_ao_voltage_chan(self._phys(self.config.ao_y), min_val=-lim, max_val=lim)
-            t.write([float(x_v), float(y_v)], auto_start=True)
-        with nidaqmx.Task() as t:
+        with self._nidaqmx.Task() as t:
             t.do_channels.add_do_chan(
                 self._phys(self.config.blank_line), line_grouping=LineGrouping.CHAN_PER_LINE
             )
             t.write(self.blank_level(blank), auto_start=True)
+
+    def _write_xy_static(self, x_v: float, y_v: float) -> None:
+        lim = self.config.ao_limit_v
+        with self._nidaqmx.Task() as t:
+            t.ao_channels.add_ao_voltage_chan(self._phys(self.config.ao_x), min_val=-lim, max_val=lim)
+            t.ao_channels.add_ao_voltage_chan(self._phys(self.config.ao_y), min_val=-lim, max_val=lim)
+            t.write([float(x_v), float(y_v)], auto_start=True)
+
+    def write_static(self, x_v: float, y_v: float, blank: bool) -> None:
+        # Blank *before* moving and move *before* unblanking, so the beam never
+        # travels unblanked between the two (slow, software-timed) writes.
+        if blank:
+            self._write_blank_static(True)
+            self._write_xy_static(x_v, y_v)
+        else:
+            self._write_xy_static(x_v, y_v)
+            self._write_blank_static(False)
 
     def set_static_line(self, name: str, value: bool) -> None:
         nidaqmx = self._nidaqmx
@@ -122,11 +142,14 @@ class NIDAQBackend(DAQBackend):
             words |= arr.astype(np.uint32) << _line_bit(cfg.timed_lines[name])
         return words
 
-    def _safe_samples(self, n: int) -> OutputChunk:
+    def _safe_tail(self, last_xy, n_park: int, rate: float) -> OutputChunk:
+        """Blank while holding the last position, then park (still blanked)."""
         cfg = self.config
-        return OutputChunk.constant(
-            n, cfg.park_x_v, cfg.park_y_v, True, {k: False for k in cfg.timed_lines}
-        )
+        n_hold = max(1, int(round(cfg.tail_hold_s * rate)))
+        mk = {k: False for k in cfg.timed_lines}
+        hold = OutputChunk.constant(n_hold, last_xy[0], last_xy[1], True, mk)
+        park = OutputChunk.constant(max(1, n_park), cfg.park_x_v, cfg.park_y_v, True, mk)
+        return concat_chunks([hold, park])
 
     def run_stream(
         self,
@@ -144,22 +167,24 @@ class NIDAQBackend(DAQBackend):
 
         cfg = self.config
         dev = cfg.device
-        buf = int(cfg.buffer_samples)
+        buf = int(max(cfg.buffer_samples, cfg.min_buffer_s * rate))
+        piece = max(1000, buf // 4)  # write granularity: keeps ≥ 3/4 buffer of margin
         lim = cfg.ao_limit_v
         n_ai = len(ai_channels)
         clock = f"/{dev}/ao/SampleClock"
         term = getattr(TerminalConfiguration, cfg.ai_terminal, TerminalConfiguration.DIFF)
+        n_tail_park = max(1000, int(0.01 * rate))
 
-        ao = nidaqmx.Task("easyebl_ao")
-        do = nidaqmx.Task("easyebl_do")
-        ai = nidaqmx.Task("easyebl_ai") if n_ai else None
-        tasks = [t for t in (ai, do, ao) if t is not None]
+        tasks: list = []  # creation order: ao, do, ai
+        ao = do = ai = None
         written = 0
         ai_read = 0
         aborted = False
         collected = []
+        info: dict = {}
+        last_xy = (cfg.park_x_v, cfg.park_y_v)
         t0 = time.perf_counter()
-        it = iter(chunks)
+        it = rechunk(chunks, piece)
 
         def deliver(block: np.ndarray, n_real: int):
             nonlocal ai_read
@@ -173,10 +198,28 @@ class NIDAQBackend(DAQBackend):
             ai_read += block.shape[1]
 
         try:
+            ao = nidaqmx.Task("easyebl_ao")
+            tasks.append(ao)
+            do = nidaqmx.Task("easyebl_do")
+            tasks.append(do)
+            if n_ai:
+                ai = nidaqmx.Task("easyebl_ai")
+                tasks.append(ai)
+
             ao.ao_channels.add_ao_voltage_chan(self._phys(cfg.ao_x), min_val=-lim, max_val=lim)
             ao.ao_channels.add_ao_voltage_chan(self._phys(cfg.ao_y), min_val=-lim, max_val=lim)
             ao.timing.cfg_samp_clk_timing(rate, sample_mode=AcquisitionType.CONTINUOUS, samps_per_chan=buf)
             ao.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
+            ao.out_stream.output_buf_size = buf
+            actual = float(ao.timing.samp_clk_rate)
+            info["actual_rate"] = actual
+            if abs(actual - rate) > 1e-6 * rate:
+                warnings.warn(
+                    f"sample clock coerced from {rate:g} to {actual:g} S/s "
+                    f"({(actual / rate - 1) * 100:+.4f}% timing/dose error) – choose a rate dividing 100 MHz",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
 
             port = _port_of(cfg.blank_line)
             do.do_channels.add_do_chan(f"{dev}/{port}", line_grouping=LineGrouping.CHAN_FOR_ALL_LINES)
@@ -184,6 +227,7 @@ class NIDAQBackend(DAQBackend):
                 rate, source=clock, sample_mode=AcquisitionType.CONTINUOUS, samps_per_chan=buf
             )
             do.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
+            do.out_stream.output_buf_size = buf
 
             reader = None
             if ai is not None:
@@ -198,7 +242,7 @@ class NIDAQBackend(DAQBackend):
                     rate,
                     source=clock,
                     sample_mode=AcquisitionType.CONTINUOUS,
-                    samps_per_chan=max(10 * buf, int(rate * 2)),
+                    samps_per_chan=max(4 * buf, int(rate * 4)),
                 )
                 reader = AnalogMultiChannelReader(ai.in_stream)
 
@@ -206,32 +250,30 @@ class NIDAQBackend(DAQBackend):
             do_w = DigitalSingleChannelWriter(do.out_stream, auto_start=False)
 
             def write(c: OutputChunk):
+                nonlocal last_xy
                 ao_w.write_many_sample(np.vstack([c.x, c.y]), timeout=cfg.write_timeout_s)
                 do_w.write_many_sample_port_uint32(self._do_words(c), timeout=cfg.write_timeout_s)
+                if len(c):
+                    last_xy = (float(c.x[-1]), float(c.y[-1]))
 
-            # ---- prefill
-            pre: list[OutputChunk] = []
-            n_pre = 0
+            # ---- prefill (half the buffer) before starting the clock
+            n_real = 0
             exhausted = False
-            while n_pre < buf // 2:
+            while n_real < buf // 2:
                 try:
                     c = next(it)
                 except StopIteration:
                     exhausted = True
                     break
-                if len(c):
-                    pre.append(c)
-                    n_pre += len(c)
-            n_real = n_pre  # grows as we write
-            for c in pre:
                 write(c)
-            written = n_pre
-            tail = max(1000, int(0.02 * rate))
+                n_real += len(c)
+            written = n_real
             if exhausted:
-                write(self._safe_samples(tail))
+                write(self._safe_tail(last_xy, n_tail_park, rate))
 
-            for t in tasks:  # AI, DO first: they wait for the AO clock
-                t.start()
+            for t in (ai, do, ao):  # slaves first: they wait for the AO sample clock
+                if t is not None:
+                    t.start()
 
             def drain():
                 if reader is None:
@@ -246,15 +288,15 @@ class NIDAQBackend(DAQBackend):
             while not exhausted:
                 if abort is not None and abort.is_set():
                     aborted = True
+                    # controlled stop: blank at the current position and park, played by the clock
+                    write(self._safe_tail(last_xy, n_tail_park, rate))
                     break
                 try:
                     c = next(it)
                 except StopIteration:
                     exhausted = True
-                    write(self._safe_samples(tail))
+                    write(self._safe_tail(last_xy, n_tail_park, rate))
                     break
-                if not len(c):
-                    continue
                 write(c)
                 written += len(c)
                 n_real = written
@@ -262,37 +304,36 @@ class NIDAQBackend(DAQBackend):
                 if progress is not None:
                     progress(written)
 
-            # ---- wait for completion
-            if not aborted:
-                deadline = time.perf_counter() + cfg.write_timeout_s + written / rate
-                while True:
-                    if abort is not None and abort.is_set():
-                        aborted = True
-                        break
-                    drain()
-                    gen = ao.out_stream.total_samp_per_chan_generated
-                    if gen >= n_real and (reader is None or ai_read >= n_real):
-                        break
-                    if time.perf_counter() > deadline:
-                        raise HALError("timeout waiting for stream completion")
-                    time.sleep(0.002)
+            # ---- wait until the real data (or, on abort, the safe tail) has been generated
+            n_hold = max(1, int(round(cfg.tail_hold_s * rate)))
+            target = n_real + (n_hold + n_tail_park // 2 if aborted else 0)
+            timeout = cfg.abort_drain_timeout_s if aborted else cfg.write_timeout_s + written / rate
+            deadline = time.perf_counter() + timeout
+            while True:
+                drain()
+                gen = ao.out_stream.total_samp_per_chan_generated
+                if gen >= target and (aborted or reader is None or ai_read >= n_real):
+                    break
+                if time.perf_counter() > deadline:
+                    raise HALError("timeout waiting for stream completion")
+                time.sleep(0.002)
             if progress is not None:
                 progress(written)
         finally:
-            for t in tasks:
-                try:
-                    t.stop()
-                except Exception:
-                    pass
+            # stop the clock master first so DO/AI freeze together, then release everything;
+            # safe_state() (blank first, then park) runs only after the tasks are closed.
+            for t in (ao, do, ai):
+                if t is not None:
+                    try:
+                        t.stop()
+                    except Exception:
+                        pass
             for t in tasks:
                 try:
                     t.close()
                 except Exception:
                     pass
-            try:
-                self.safe_state()
-            except Exception:
-                pass
+            self.safe_state()
 
         ai_all = None
         if n_ai and on_ai is None:
@@ -304,4 +345,5 @@ class NIDAQBackend(DAQBackend):
             ai=ai_all,
             ai_channels=tuple(ai_channels),
             elapsed_s=time.perf_counter() - t0,
+            info=info,
         )

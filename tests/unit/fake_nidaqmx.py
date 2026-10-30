@@ -82,12 +82,15 @@ class _Timing:
 
     def cfg_samp_clk_timing(self, rate, source=None, sample_mode=None, samps_per_chan=None):
         self.task.timing_cfg = dict(rate=rate, source=source, mode=sample_mode, buf=samps_per_chan)
+        # X-series: the internal timebase divides 100 MHz
+        self.samp_clk_rate = 100e6 / round(100e6 / rate)
 
 
 class _OutStream:
     def __init__(self, task):
         self.task = task
         self.regen_mode = RegenerationMode.ALLOW_REGENERATION
+        self.output_buf_size = None
 
     @property
     def total_samp_per_chan_generated(self):
@@ -125,8 +128,10 @@ class Task:
     def write(self, data, auto_start=False):
         if "ao" in self.kinds():
             DEVICE.static_ao.append(list(data))
+            DEVICE.log.append(("static_ao", tuple(data)))
         else:
             DEVICE.static_do.append(data)
+            DEVICE.log.append(("static_do", data))
 
     def start(self):
         self.started = True
@@ -155,6 +160,7 @@ class AnalogMultiChannelWriter:
 
     def write_many_sample(self, data, timeout=10):
         DEVICE.ao_written.append(np.array(data, copy=True))
+        DEVICE.log.append(("ao_write", np.shape(data)[1]))
 
 
 class DigitalSingleChannelWriter:

@@ -9,7 +9,7 @@ CAL = FieldCalibration(100.0, 10.0)
 
 def plan(**kw):
     base = dict(nx=8, ny=4, width_um=8.0, rate=100e3, dwell_s=30e-6, preline_s=40e-6, flyback_s=50e-6,
-                frame_settle_s=100e-6)
+                frame_settle_s=100e-6, ai_latency_samples=0.0)
     base.update(kw)
     return RasterPlan(RasterConfig(**base), CAL)
 
@@ -160,6 +160,22 @@ class TestAssembler:
         s = p.pixel_sample_starts(0, 0)
         # samples s+1, s+2 shifted by +2.5 → mean index s + 1.5 + 2.5
         np.testing.assert_allclose(img[p.line_rows[0]], s + 4.0)
+
+    def test_default_ai_latency_is_one_sample(self):
+        p = plan(ai_latency_samples=1.0)
+        img = self._feed_index_signal(p).images()["v"]
+        np.testing.assert_allclose(img[p.line_rows[0]], p.pixel_sample_starts(0, 0) + 1 + 1)
+        assert RasterConfig().lag_comp_samples == 1.0
+
+    @pytest.mark.parametrize("seed", range(5))
+    def test_random_block_sizes(self, seed):
+        """Blocks ending anywhere (inside flyback/pre-line) must not corrupt the image."""
+        p = plan(frames=2, bidirectional=True, lag_comp_s=12e-6, settle_samples=1)
+        rng = np.random.default_rng(seed)
+        sizes = tuple(int(v) for v in rng.integers(1, 40, 50))
+        ref = self._feed_index_signal(p, (10**9,)).images()["v"]
+        got = self._feed_index_signal(p, sizes).images()["v"]
+        np.testing.assert_allclose(got, ref)
 
     def test_incomplete_data_gives_nan_rows(self):
         p = plan()

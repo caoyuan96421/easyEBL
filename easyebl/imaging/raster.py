@@ -68,7 +68,8 @@ class RasterConfig:
     y_direction: str = "down"  # first row scanned: "down" = top row first
     frames: int = 1  # frames averaged
     ai_channels: tuple = ("video",)
-    lag_comp_s: float = 0.0
+    lag_comp_s: float = 0.0  # deflection + detector lag compensation
+    ai_latency_samples: float = 1.0  # AI converts on the edge that updates the DAC → sees the previous sample
     line_sync_marker: str | None = None  # timed DO line asserted during pixels
     frame_sync_marker: str | None = None  # asserted during the first pixel line of each frame
     blank_during_pixels: bool = False  # dark/reference scan: beam blanked for the whole line
@@ -115,7 +116,8 @@ class RasterConfig:
 
     @property
     def lag_comp_samples(self) -> float:
-        return self.lag_comp_s * self.rate
+        """Total AI delay in samples (fixed converter latency + lag compensation)."""
+        return self.ai_latency_samples + self.lag_comp_s * self.rate
 
     def n(self, t: float) -> int:
         return max(0, int(round(t * self.rate)))
@@ -197,7 +199,7 @@ class RasterPlan:
         self.n_frame_settle = max(1, cfg.n(cfg.frame_settle_s))
         d = cfg.lag_comp_samples
         if d < 0:
-            raise ValueError("lag_comp_s must be ≥ 0")
+            raise ValueError("total AI delay (ai_latency_samples + lag_comp_s) must be ≥ 0")
         self.n_tail = int(math.ceil(d)) + 2
         # frame = frame-settle + ny lines (the first line's flyback acts as part of the settle)
         self.frame_len = self.n_frame_settle + cfg.ny * self.line_len
@@ -446,7 +448,8 @@ class LineAssembler:
             # drop consumed samples
             if f < cfg.frames:
                 keep_from = int(plan.pixel_sample_starts(f, line).min())
-                drop = keep_from - self._buf_start
+                # never drop samples that have not arrived yet (blocks may end mid-line)
+                drop = min(keep_from - self._buf_start, self._buf.shape[1])
                 if drop > 0:
                     self._buf = self._buf[:, drop:]
                     self._buf_start += drop
@@ -480,21 +483,23 @@ class RasterImager:
     def acquire(
         self,
         cfg: RasterConfig,
-        on_row: Callable[[int, dict], None] | None = None,
+        on_row: Callable[[int, Callable[[], dict]], None] | None = None,
         timeout: float = 0.0,
         lines_per_chunk: int = 8,
     ) -> RasterImage:
         """Run one acquisition (``cfg.frames`` frames averaged).
 
-        ``on_row(row, partial_images)`` is called from the acquisition thread
-        whenever a row is completed (for live display).  Call
-        ``handle.abort()`` from another thread to stop early.
+        ``on_row(row, get_images)`` is called from the acquisition thread
+        whenever a row is completed; ``get_images()`` returns the partial
+        images and should only be called when actually needed (it copies the
+        frame).  Keep the callback cheap – it runs in the streaming thread.
+        Call ``handle.abort()`` from another thread to stop early.
         """
         plan = self.plan(cfg)
         asm = LineAssembler(plan, cfg.ai_channels)
 
         def consume(block):
-            asm.feed(block, (lambda r: on_row(r, asm.images())) if on_row else None)
+            asm.feed(block, (lambda r: on_row(r, asm.images)) if on_row else None)
 
         res = self.handle.run_stream(
             cfg.rate,

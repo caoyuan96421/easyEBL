@@ -20,8 +20,13 @@ Rules enforced here (not in the backends):
 * **Safe state.**  After every stream – normal end, abort or exception – the
   beam is blanked and parked.  Static writes are rejected while a stream is
   running.
-* **Output validation.**  Rate limits, AO voltage limits, AI channel names and
-  marker line names are checked before/while streaming.
+* **Output validation.**  Rate limits, AO voltage limits (and NaN/inf), AI
+  channel names and marker line names are checked before/while streaming.
+
+Callbacks (``on_ai``, ``progress``, listeners) run in the streaming thread
+while the device lock is held: keep them short and never block on another
+thread that may itself be waiting for the device (e.g. a GUI thread calling
+``close()``).  GUIs should forward data through queued signals.
 """
 from __future__ import annotations
 
@@ -188,6 +193,8 @@ class DAQManager:
 
     def _static(self, handle: "DAQHandle", x_v: float, y_v: float, blank: bool) -> None:
         lim = self.config.ao_limit_v
+        if not (np.isfinite(x_v) and np.isfinite(y_v)):
+            raise VoltageRangeError("static position must be finite")
         if abs(x_v) > lim or abs(y_v) > lim:
             raise VoltageRangeError(f"static position ({x_v:.4g}, {y_v:.4g}) V exceeds ±{lim} V")
         if not self._op_lock.acquire(blocking=False):
@@ -240,6 +247,8 @@ class DAQManager:
         lim = self.config.ao_limit_v * (1 + 1e-9)
         allowed = set(self.config.timed_lines)
         for c in chunks:
+            if len(c) and not (np.all(np.isfinite(c.x)) and np.all(np.isfinite(c.y))):
+                raise VoltageRangeError("output stream contains non-finite (NaN/inf) samples")
             if c.max_abs_voltage() > lim:
                 raise VoltageRangeError(
                     f"output sample {c.max_abs_voltage():.4g} V exceeds ±{self.config.ao_limit_v} V"
@@ -281,11 +290,16 @@ class DAQManager:
             )
             return result
         finally:
+            safe = False
             try:
                 self.backend.safe_state()
+                safe = True
             finally:
                 with self._state:
-                    self._beam = BeamState(self.config.park_x_v, self.config.park_y_v, True)
+                    if safe:
+                        self._beam = BeamState(self.config.park_x_v, self.config.park_y_v, True)
+                    else:  # unknown – never claim the beam is blanked if we could not blank it
+                        self._beam = BeamState(float("nan"), float("nan"), False)
                     self._active = None
                     self._active_abort = None
                 self._op_lock.release()
@@ -343,7 +357,8 @@ class DAQHandle:
 
     @property
     def claimed(self) -> set[str]:
-        return {r for r, o in self._mgr._claims.items() if o is self}
+        with self._mgr._state:
+            return {r for r, o in self._mgr._claims.items() if o is self}
 
     # ----------------------------------------------------------------- claims
     def claim(self, *resources: str) -> "DAQHandle":

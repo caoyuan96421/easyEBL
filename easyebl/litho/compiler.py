@@ -92,7 +92,7 @@ class CompileStats:
     dose_error_rms: float = 0.0  # relative, per point (dwell-weighted)
     dose_error_max: float = 0.0  # relative, worst single point
     dose_error_total: float = 0.0  # relative error of the total exposure time
-    clamped_points: int = 0  # points raised to min_samples_per_point
+    clamped_points: int = 0  # points whose request was below min_samples_per_point (overdosed)
     zero_dose_points: int = 0
 
     @property
@@ -143,13 +143,17 @@ class CompiledJob:
         still within ±1 sample of its request.
         """
         s = self.settings
-        req = run.dwell_s * s.rate
+        pos = run.dwell_s > 0
+        # clamp the *request* first so diffusion never hands a point 0 samples
+        req = np.where(pos, np.maximum(run.dwell_s * s.rate, s.min_samples_per_point), 0.0)
         if s.quantization == "diffuse" and len(req) > 1:
             c = np.rint(np.cumsum(req))
             n = np.diff(np.concatenate([[0.0], c])).astype(np.int64)
+            # rounding can still yield min-1 for a point next to a large one; enforce the floor
+            n = np.where(pos, np.maximum(n, s.min_samples_per_point), 0)
         else:
-            n = np.rint(req).astype(np.int64)
-        return np.where(run.dwell_s > 0, np.maximum(n, s.min_samples_per_point), 0)
+            n = np.where(pos, np.maximum(np.rint(req).astype(np.int64), s.min_samples_per_point), 0)
+        return n
 
     def _segments(self):
         """Yield (kind, payload) tuples describing the stream (shared by stats and chunks)."""
@@ -195,9 +199,7 @@ class CompiledJob:
                     num += float((w * err * err).sum())
                     den += float(w.sum())
                     st.dose_error_max = max(st.dose_error_max, float(np.max(np.abs(err))))
-                    st.clamped_points += int(
-                        np.count_nonzero(np.rint(req[pos] * s.rate) < s.min_samples_per_point)
-                    )
+                    st.clamped_points += int(np.count_nonzero(req[pos] * s.rate < s.min_samples_per_point))
             else:
                 st.overhead_samples += s.n(s.blank_lead_s)
                 if s.park_um is not None:

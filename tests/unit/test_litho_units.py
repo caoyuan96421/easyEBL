@@ -231,6 +231,12 @@ class TestCompiler:
         with pytest.raises(ValueError):
             VectorScanSettings(quantization="dither")
 
+    def test_diffusion_respects_min_samples(self):
+        run = ExposureRun(np.zeros((1000, 2)), np.full(1000, 6e-6))  # 0.6 samples each at 100 kS/s
+        job = compile_runs([run], quantization="diffuse")
+        assert job.stats.exposure_samples == 1000 and np.all(job.samples[0] == 1)
+        assert job.stats.clamped_points == 1000
+
     def test_out_of_field(self):
         with pytest.raises(OutOfFieldError):
             compile_runs([ExposureRun([[60, 0]], 10e-6)])

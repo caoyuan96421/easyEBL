@@ -32,6 +32,7 @@ RASTER_FORM_OVERRIDES = {
     "flyback_s": {"label": "flyback (µs)", "scale": 1e6, "decimals": 2, "min": 0},
     "frame_settle_s": {"label": "frame settle (µs)", "scale": 1e6, "decimals": 1, "min": 0},
     "lag_comp_s": {"label": "lag comp (µs)", "scale": 1e6, "decimals": 3, "min": 0},
+    "ai_latency_samples": {"label": "AI latency (samples)", "decimals": 2, "min": 0, "max": 100},
     "preline_mode": {"choices": ["ramp", "hold"]},
     "flyback_shape": {"choices": ["linear", "cosine", "step"]},
     "x_direction": {"choices": [1, -1]},
@@ -142,7 +143,12 @@ class ImagingWidget(QtWidgets.QWidget):
         self._cfg = cfg
 
         def job():
-            return self.imager.acquire(cfg, on_row=lambda r, imgs: self._row.emit(r, imgs), timeout=1.0)
+            # throttle in the acquisition thread: copy the partial image only every 16 rows
+            def on_row(r, get_images):
+                if r % 16 == 0 or r == cfg.ny - 1:
+                    self._row.emit(r, get_images())
+
+            return self.imager.acquire(cfg, on_row=on_row, timeout=1.0)
 
         self._worker = Worker(job)
         self._worker.result.connect(self._done)
@@ -150,8 +156,6 @@ class ImagingWidget(QtWidgets.QWidget):
         self._worker.start()
 
     def _on_row(self, row: int, imgs: dict):
-        if row % 16 and row != self._cfg.ny - 1:
-            return
         cx, cy = self._cfg.center_um
         w, h = self._cfg.width_um, self._cfg.height
         self.view.set_image(next(iter(imgs.values())), (cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2))

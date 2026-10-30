@@ -52,6 +52,8 @@ class TestConfig:
             DAQConfig(timed_lines={"sync": "port0/line0"}).validate()  # collides with blank
         with pytest.raises(ValueError):
             DAQConfig(park_x_v=20).validate()
+        with pytest.raises(ValueError, match="hardware-timed port"):
+            DAQConfig(static_lines={"relay": "port0/line5"}).validate()
 
     def test_json_roundtrip(self):
         c = DAQConfig(device="Dev3", timed_lines={"sync": "port0/line2"})
@@ -165,6 +167,10 @@ class TestHandles:
             h.run_stream(600e3, chunks(), ai_channels=["video"])  # AI aggregate
         with pytest.raises(VoltageRangeError):
             h.run_stream(100e3, chunks(v=11.0))
+        with pytest.raises(VoltageRangeError):
+            h.run_stream(100e3, chunks(v=float("nan")))
+        with pytest.raises(VoltageRangeError):
+            h.park(float("nan"), 0)
         assert manager.beam_state.blank and not manager.is_busy
         with pytest.raises(HALError):
             h.run_stream(100e3, chunks(markers={"sync": np.zeros(1000, bool)}))
