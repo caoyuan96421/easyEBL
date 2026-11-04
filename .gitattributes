@@ -1,0 +1,4 @@
+# Keep Windows scripts CRLF and shell scripts LF, regardless of core.autocrlf
+*.bat -text
+*.ps1 -text
+*.sh  text eol=lf

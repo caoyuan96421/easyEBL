@@ -19,9 +19,28 @@ physics‑flavoured **SEM simulator**, so all subsystems, tests and GUIs run wit
 
 ## Install
 
-```bash
-pip install -e ".[all,test]"      # numpy, scipy, gdstk, PySide6, pyqtgraph, nidaqmx, pytest
+The install scripts create a `.venv` next to the code and install easyEBL into it in editable
+mode, with every extra (numpy, scipy, gdstk, PySide6, pyqtgraph, nidaqmx, pytest). They need
+Python 3.10–3.13.
+
+**Windows:** double‑click `install.bat`, or run it from a terminal:
+
+```bat
+install.bat                      :: create .venv and install everything
+install.bat -RunTests            :: also run the test suite
+install.bat -Recreate            :: delete and rebuild .venv
+install.bat -InstallNIDriver     :: also install the NI-DAQmx driver (admin; DAQ PC only)
+install.bat -Python C:\path\to\python.exe   -Extras gui,gds
+run_demo.bat                     :: start the demo GUI on the simulator
+run_demo.bat --backend nidaqmx --device Dev1
 ```
+
+If the folder is inside Dropbox, the script marks `.venv` as ignored, so the environment is not
+synced. Each PC builds its own `.venv`. Pass `-SyncVenv` to turn this off.
+
+**Linux / macOS:** `./install.sh [--tests] [--recreate] [--extras all,test] [--python python3.12]`
+
+**Manually:** `pip install -e ".[all,test]"`
 
 ## Quick start (simulator)
 
