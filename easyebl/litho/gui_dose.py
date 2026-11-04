@@ -23,6 +23,14 @@ OVERRIDES = {
 }
 
 
+def _fmt_time(t: float) -> str:
+    if t < 60:
+        return f"{t:.4g} s"
+    if t < 3600:
+        return f"{t / 60:.3g} min ({t:.4g} s)"
+    return f"{t / 3600:.3g} h ({t:.4g} s)"
+
+
 class DoseCalculatorWidget(QtWidgets.QWidget):
     def __init__(self, session: Session | None = None, parent=None):
         super().__init__(parent)
@@ -59,7 +67,11 @@ class DoseCalculatorWidget(QtWidgets.QWidget):
             ("area dwell", f"{r.area_dwell_s * 1e6:.4g} µs → {r.area_dwell_samples} samples ({r.area_dwell_error * 100:+.2f}%)"),
             ("line dwell", f"{r.line_dwell_s * 1e6:.4g} µs → {r.line_dwell_samples} samples"),
             ("dot dwell", f"{r.dot_dwell_s * 1e6:.4g} µs → {r.dot_dwell_samples} samples"),
-            ("exposure time / 100 µm²", f"{r.time_per_100um2_s:.4g} s"),
+            ("exposure time / µm²", f"{r.time_per_um2_s * 1e3:.4g} ms"),
+            ("exposure time, 10 × 10 µm square", f"{_fmt_time(r.time_per_100um2_s)}"),
+            (f"exposure time, full field {r.field_um:g} × {r.field_um:g} µm",
+             f"{_fmt_time(r.time_full_field_s)}  (streamed: {_fmt_time(r.time_full_field_quantised_s)}, "
+             "beam-on only, no settling)"),
             ("beam speed in area fill", f"{r.step_um / r.area_dwell_s * 1e-3:.4g} mm/s"),
         ]
         self.out.setRowCount(len(rows))

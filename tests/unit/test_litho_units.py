@@ -64,6 +64,16 @@ class TestDose:
         assert "below the DAC resolution" in text and "minimum" in text
         assert set(bad.as_dict()) >= {"area_dwell_s", "warnings"}
 
+    def test_calculator_write_times(self):
+        # 300 µC/cm² = 3e-12 C/µm²; at 100 pA: 30 ms/µm², 3 s per 10×10 µm, 300 s per 100×100 µm field
+        r = DoseCalculator(field_um=100, points=5000, current_pA=100, area_dose_uC_cm2=300, rate_hz=500e3).report()
+        assert r.time_per_um2_s == pytest.approx(0.03)
+        assert r.time_per_100um2_s == pytest.approx(3.0)
+        assert r.time_full_field_s == pytest.approx(300.0)
+        # brute force: points² × dwell
+        assert r.points**2 * r.area_dwell_s == pytest.approx(r.time_full_field_s)
+        assert r.time_full_field_quantised_s == pytest.approx(5000**2 * 6 / 500e3)
+
 
 # -------------------------------------------------------------------- geometry
 class TestGeometry:

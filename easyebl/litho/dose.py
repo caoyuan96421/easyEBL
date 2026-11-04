@@ -123,7 +123,10 @@ class DoseReport:
     dot_dose_fC: float
     dot_dwell_s: float
     dot_dwell_samples: int
-    time_per_100um2_s: float
+    time_per_100um2_s: float  # 10 µm × 10 µm square (kept for compatibility)
+    time_per_um2_s: float
+    time_full_field_s: float  # field_um × field_um, every point exposed
+    time_full_field_quantised_s: float  # same, with the quantised dwell actually streamed
     warnings: list
 
     def as_dict(self) -> dict:
@@ -192,5 +195,8 @@ class DoseCalculator:
             dot_dwell_s=d,
             dot_dwell_samples=nd,
             time_per_100um2_s=area_write_time_s(100.0, self.area_dose_uC_cm2, I),
+            time_per_um2_s=area_write_time_s(1.0, self.area_dose_uC_cm2, I),
+            time_full_field_s=area_write_time_s(self.field_um**2, self.area_dose_uC_cm2, I),
+            time_full_field_quantised_s=self.points**2 * na / self.rate_hz,
             warnings=warn,
         )
