@@ -7,3 +7,5 @@ dist/
 .venv/
 *.gds
 !tests/data/*.gds
+scripts/logs/
+scripts/hw_scan_test_*.txt
