@@ -4,6 +4,7 @@ rem Builds .venv on first use, lists NI devices, then runs scripts\hw_scan_test.
 rem All output goes to scripts\logs\ so it can be read afterwards.
 setlocal
 cd /d "%~dp0"
+set PYTHONIOENCODING=utf-8
 if not exist scripts\logs mkdir scripts\logs
 set LOG=scripts\logs\console.txt
 echo [%date% %time%] start > %LOG%

@@ -5,6 +5,7 @@ rem   run_imaging.bat --field-um 120
 rem   run_imaging.bat --backend sim        (simulator, no hardware)
 rem Messages and errors are written to scripts\logs\imaging_gui.txt
 cd /d "%~dp0"
+set PYTHONIOENCODING=utf-8
 if not exist .venv\Scripts\python.exe (
     echo .venv not found - run install.bat first.
     pause

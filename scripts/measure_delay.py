@@ -25,6 +25,11 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+for _s in (sys.stdout, sys.stderr):  # Windows consoles may use a legacy code page (e.g. GBK)
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
 
 from easyebl.core import OutputChunk  # noqa: E402
 from easyebl.hal import DAQConfig, DAQManager, create_backend  # noqa: E402
