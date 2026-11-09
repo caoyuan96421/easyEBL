@@ -73,6 +73,35 @@ class DAQConfig:
         if self.min_buffer_s <= 0 or self.tail_hold_s < 0:
             raise ValueError("min_buffer_s must be > 0 and tail_hold_s ≥ 0")
 
+    @classmethod
+    def usb6363(cls, device: str = "Dev1") -> "DAQConfig":
+        """Wiring for an NI USB-6363 (X Series) on the S-3000N scan break-in.
+
+        * ``ao0``/``ao1`` = X/Y deflection (DBC X-IN / Y-IN).  Full scale is set by
+          ``ao_limit_v``; check it against the SEM's external-scan level before use.
+        * Blanker on ``port0/line23`` (P0.23), clocked by the AO sample clock.  The
+          blanker input is active LOW: a low level blanks the beam, and an
+          undriven input must also blank (fail-safe wiring).
+        * PFI6 / PFI7 = relay-enable lines, held HIGH before taking control.
+          X-Series PFI lines are static digital outputs only, so they are not
+          hardware-timed; they are written from software between streams.
+        * AI ``ai0`` = video, differential.
+        """
+        return cls(
+            device=device,
+            ao_x="ao0",
+            ao_y="ao1",
+            ao_limit_v=5.0,
+            blank_line="port0/line23",
+            blank_active_high=False,
+            timed_lines={},
+            static_lines={"relay_pfi6": "PFI6", "relay_pfi7": "PFI7"},
+            ai_channels={"video": "ai0"},
+            ai_terminal="DIFF",
+            max_ao_rate=2e6,
+            max_ai_aggregate_rate=2e6,
+        )
+
     def physical(self, terminal: str) -> str:
         return f"{self.device}/{terminal}"
 
