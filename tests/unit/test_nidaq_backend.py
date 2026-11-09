@@ -153,3 +153,33 @@ def test_task_creation_failure_cleans_up(fake, monkeypatch):
         mgr.get_handle("t").run_stream(100e3, stream(1, 100))
     assert ("close", "easyebl_ao") in fake.log
     assert mgr.beam_state.blank
+
+
+def test_usb6363_preset_live_imaging(fake):
+    """Live raster on the USB-6363 preset: P0.23 active-low blanker, PFI relay lines,
+    frames streamed back-to-back (the fake loops AI back from AO X)."""
+    from dataclasses import replace
+
+    from easyebl.core import FieldCalibration
+    from easyebl.imaging import RasterConfig, RasterImager
+
+    cfg = replace(DAQConfig.usb6363(), buffer_samples=5000)
+    mgr = DAQManager(NIDAQBackend(cfg)).open()
+    h = mgr.get_handle("img")
+    h.claim("relay_pfi6", "relay_pfi7")
+    h.set_line("relay_pfi6", True)
+    h.set_line("relay_pfi7", True)
+    assert mgr.line_state == {"relay_pfi6": True, "relay_pfi7": True}
+    cal = FieldCalibration(100.0, cfg.ao_limit_v)
+    rc = RasterConfig(nx=16, ny=8, width_um=40, rate=1e6, dwell_s=4e-6, ai_latency_samples=0.0)
+    frames = []
+    n = RasterImager(h, cal).live(rc, lambda k, img: frames.append(img.image()), max_frames=3)
+    assert n == 3
+    # AI == AO X, so every row is the X staircase in volts
+    xs = (np.arange(16) + 0.5) * 40 / 16 - 20
+    for img in frames:
+        np.testing.assert_allclose(img, np.tile(xs * cal.volts_per_um, (8, 1)), atol=1e-9)
+    # blanker on bit 23, active low: unblanked pixel samples drive the bit high
+    w = fake.do_words
+    assert set(np.unique(w)) <= {0, 1 << 23} and (w == (1 << 23)).any()
+    assert mgr.beam_state.blank

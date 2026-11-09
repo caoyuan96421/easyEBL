@@ -517,3 +517,94 @@ class RasterImager:
             aborted=res.aborted,
             rows_completed=asm.rows_done,
         )
+
+    # ------------------------------------------------------------------ live
+    def live(
+        self,
+        cfg: RasterConfig,
+        on_frame: Callable[[int, "RasterImage"], None],
+        on_row: Callable[[int, Callable[[], dict]], None] | None = None,
+        stop: threading.Event | None = None,
+        max_frames: int | None = None,
+        timeout: float = 0.0,
+        lines_per_chunk: int = 8,
+        cache_limit_samples: int = 20_000_000,
+    ) -> int:
+        """Scan frames back-to-back in **one** hardware-timed stream.
+
+        Unlike repeated :meth:`acquire` calls, the DAQ is never stopped between
+        frames: the frame waveform is written into the output buffer over and
+        over, and the AI stream is cut into frames as it arrives.  This removes
+        the per-run task setup (≈0.2 s on USB) and keeps the deflection in a
+        steady state.
+
+        ``cfg.frames`` is ignored (each frame is delivered on its own; average
+        in the caller).  ``on_frame(index, image)`` is called from the
+        streaming thread for every completed frame; ``on_row`` as in
+        :meth:`acquire` for the frame in progress.  The stream ends after the
+        current frame when ``stop`` is set or ``max_frames`` frames are done;
+        ``handle.abort()`` stops it immediately.  Returns the number of
+        completed frames.
+        """
+        one = cfg.with_(frames=1)
+        plan = self.plan(one)
+        L = plan.frame_len
+        span = L + plan.n_tail  # samples one frame's assembler needs (lag tail)
+        channels = tuple(one.ai_channels)
+        stop = stop or threading.Event()
+        dirs = _row_directions(plan)
+        state = {"k": 0, "asm": LineAssembler(plan, channels), "fed": 0, "buf": None, "buf0": 0}
+
+        def frames_wanted() -> bool:
+            return not stop.is_set() and (max_frames is None or state["k"] < max_frames)
+
+        def gen():
+            # first frame starts from the parked position, later frames travel from the previous end
+            yield from plan._frame_chunks(0, lines_per_chunk, None)
+            steady_end = plan._last_end
+            cached = None
+            if L <= cache_limit_samples:
+                cached = list(plan._frame_chunks(0, lines_per_chunk, steady_end))
+            produced = 1
+            # keep at least one frame queued beyond the one being delivered
+            while frames_wanted() and (max_frames is None or produced < max_frames):
+                yield from (cached if cached is not None else plan._frame_chunks(0, lines_per_chunk, steady_end))
+                produced += 1
+            v = self.calibration.um_to_volts(plan._last_end[None, :], check=False)[0]
+            markers = [m for m in (one.line_sync_marker, one.frame_sync_marker) if m]
+            yield OutputChunk.constant(plan.n_tail, v[0], v[1], True, {m: False for m in markers})
+
+        def consume(block: np.ndarray):
+            st = state
+            st["buf"] = block if st["buf"] is None else np.concatenate([st["buf"], block], axis=1)
+            while True:
+                k = st["k"]
+                start = k * L  # absolute index of this frame's first sample
+                have_end = st["buf0"] + st["buf"].shape[1]
+                lo = start + st["fed"]
+                hi = min(have_end, start + span)
+                if hi > lo:
+                    seg = st["buf"][:, lo - st["buf0"] : hi - st["buf0"]]
+                    cb = (lambda r: on_row(r, st["asm"].images)) if on_row else None
+                    st["asm"].feed(seg, cb)
+                    st["fed"] += hi - lo
+                if st["fed"] < span:
+                    return
+                img = RasterImage(
+                    data=st["asm"].images(),
+                    config=one,
+                    calibration=self.calibration,
+                    line_directions=dirs,
+                    frame_time_s=plan.frame_time_s,
+                    rows_completed=st["asm"].rows_done,
+                )
+                on_frame(k, img)
+                st["k"] = k + 1
+                st["asm"] = LineAssembler(plan, channels)
+                st["fed"] = 0
+                drop = (k + 1) * L - st["buf0"]
+                st["buf"] = st["buf"][:, drop:]
+                st["buf0"] += drop
+
+        self.handle.run_stream(one.rate, gen(), ai_channels=channels, on_ai=consume, timeout=timeout)
+        return state["k"]

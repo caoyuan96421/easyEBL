@@ -94,7 +94,33 @@ def main(argv=None) -> int:
                 ok = False
                 say(f"  !! more than 10% of pixels missing at {rate:g} S/s (buffer or timing problem)")
 
-        # 4. optional loopback
+        # 4. live mode: one continuous stream, frames back-to-back
+        say("")
+        say(f"{'live rate':>10} {'frame':>9} {'frames':>7} {'fps':>7} {'theory':>7} {'NaN %':>6}")
+        for rate, nx, ny in [(500e3, 256, 256), (1e6, 256, 256), (2e6, 128, 128), (2e6, 512, 512)]:
+            raster = RasterConfig(nx=nx, ny=ny, width_um=50, rate=rate, dwell_s=4 / rate,
+                                  bidirectional=True, ai_channels=["video"])
+            imager = RasterImager(h, cal)
+            plan = imager.plan(raster)
+            n_want = max(3, int(round(3.0 / plan.frame_time_s)))  # ~3 s of streaming
+            stamps, nan = [], []
+
+            def on_frame(k, img, stamps=stamps, nan=nan):
+                stamps.append(time.perf_counter())
+                nan.append(float(np.isnan(img.image()).mean()))
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                n = imager.live(raster, on_frame, max_frames=n_want, timeout=120)
+            fps = (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) > 1 else float("nan")
+            msgs = "; ".join(str(w.message) for w in caught)
+            say(f"{rate:>10.0f} {nx}x{ny:<5} {n:>7d} {fps:>7.2f} {1 / plan.frame_time_s:>7.2f} "
+                f"{100 * max(nan):>6.2f} {msgs}")
+            if n != n_want or max(nan) > 0 or fps < 0.95 / plan.frame_time_s:
+                ok = False
+                say("  !! live stream lost frames or ran slow")
+
+        # 5. optional loopback
         if args.loopback:
             n = 20000
             ramp = np.linspace(-cfg.ao_limit_v * 0.8, cfg.ao_limit_v * 0.8, n)

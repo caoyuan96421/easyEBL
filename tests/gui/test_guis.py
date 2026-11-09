@@ -89,6 +89,32 @@ def test_imaging_gui(qtbot, session):
     assert "outside" in w.summary.text()
 
 
+def test_imaging_gui_live(qtbot, session):
+    from easyebl.imaging.gui import ImagingWidget
+
+    w = ImagingWidget(session)
+    qtbot.addWidget(w)
+    w.form.set_value(w.config().with_(nx=32, ny=24, width_um=20, rate=400e3, dwell_s=5e-6))
+    # scan control claims the relay lines and drives them high
+    w.cb_control.setChecked(True)
+    assert all(session.manager.line_state[n] for n in w.static_names)
+    w.sp_avg.setValue(4)
+    frames = []
+    w._frame.connect(lambda k, img, t: frames.append(k))
+    w.b_live.setChecked(True)
+    qtbot.waitUntil(lambda: len(frames) >= 3, timeout=10000)
+    assert session.manager.is_busy  # one stream, still running
+    # changing a setting restarts the stream with the new size
+    w.form.set_value(w.config().with_(nx=40))
+    qtbot.waitUntil(lambda: w.last is not None and w.last.image().shape == (24, 40), timeout=10000)
+    w.stop()
+    qtbot.waitUntil(lambda: not w._busy(), timeout=10000)
+    assert not session.manager.is_busy and session.manager.beam_state.blank
+    assert not w.b_live.isChecked()
+    w.cb_control.setChecked(False)
+    assert not any(session.manager.line_state[n] for n in w.static_names)
+
+
 def test_alignment_gui(qtbot, session):
     from easyebl.alignment.gui import AlignmentWidget
 

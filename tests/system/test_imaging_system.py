@@ -116,3 +116,57 @@ def test_dark_scan_and_sync_markers(make_manager, calibration):
     assert m.backend.dose.total_charge() == 0
     rec = m.backend.recorded
     assert sum(c.markers["line"].sum() for c in rec) == 8 * 32 * img.config.samples_per_pixel
+
+
+# ---------------------------------------------------------------- live streaming
+def test_live_frames_match_single_scans(make_manager, quiet_params):
+    """Back-to-back frames in one stream are identical to separate acquisitions."""
+    from easyebl.core import FieldCalibration
+
+    cal = FieldCalibration(100, 10)
+    m = make_manager(quiet_params)
+    imager = RasterImager(m.get_handle("img"), cal)
+    cfg = CFG.with_(nx=64, ny=48, lag_comp_s=12e-6, bidirectional=True)
+    ref = imager.acquire(cfg).image()
+    got = []
+    n = imager.live(cfg, lambda k, img: got.append((k, img)), max_frames=4)
+    assert n == 4 and [k for k, _ in got] == [0, 1, 2, 3]
+    for _, img in got:
+        assert img.rows_completed == cfg.ny and not np.isnan(img.image()).any()
+        np.testing.assert_allclose(img.image(), ref, atol=1e-9)
+    # without lag compensation the ideal system reproduces the specimen exactly
+    got0 = []
+    imager.live(cfg.with_(lag_comp_s=0.0), lambda k, img: got0.append(img), max_frames=2)
+    for img in got0:
+        np.testing.assert_allclose(img.image(), ground_truth(m.backend, img), atol=1e-9)
+
+
+def test_live_with_lag_is_steady(make_manager):
+    """With deflection lag, later frames equal each other (steady state)."""
+    from easyebl.core import FieldCalibration
+
+    m = make_manager(SimParams(lag_tau_s=8e-6, noise_sigma=0, video_delay_s=0))
+    imager = RasterImager(m.get_handle("img"), FieldCalibration(100, 10))
+    cfg = CFG.with_(nx=48, ny=32)
+    got = []
+    imager.live(cfg, lambda k, img: got.append(img.image()), max_frames=3)
+    np.testing.assert_allclose(got[1], got[2], atol=1e-9)
+
+
+def test_live_stop_event_and_abort(make_manager, quiet_params):
+    from easyebl.core import FieldCalibration
+
+    m = make_manager(quiet_params)
+    h = m.get_handle("img")
+    imager = RasterImager(h, FieldCalibration(100, 10))
+    stop = threading.Event()
+    got = []
+
+    def on_frame(k, img):
+        got.append(k)
+        if k == 2:
+            stop.set()
+
+    n = imager.live(CFG.with_(nx=32, ny=16), on_frame, stop=stop)
+    assert n >= 3 and got == list(range(n))
+    assert m.beam_state.blank and not m.is_busy

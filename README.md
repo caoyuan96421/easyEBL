@@ -67,6 +67,21 @@ params = ExposureParameters(beam_current_a=250e-12, area_dose_uC_cm2=300, area_s
 report = LithoWriter(mgr.get_handle("litho"), cal).expose(pattern, params, transform=res.transform)
 ```
 
+## Live imaging on the USB-6363
+
+Double-click `run_imaging.bat`, or run
+`python -m easyebl.imaging.gui --backend nidaqmx --preset usb6363 [--field-um 100]`.
+
+* **External scan control** claims PFI6/PFI7 and drives them high, which switches the SEM to
+  DAQ scanning. Unchecking it returns the SEM to internal scan.
+* **Live** runs one continuous hardware-timed stream. The frame waveform is looped through the
+  DAQ output buffer, so frames follow each other with no restart gap. Changing any setting
+  while live restarts the stream.
+* **Single scan** takes one frame. **Average frames** sets a running average over about N frames.
+* **Save image** writes a PNG (contrast-stretched) and an `.npy` file with the raw values.
+* `run_hw_test.bat` is a headless check of the board: static lines, single scans and live
+  streaming at several rates. It logs to `scripts/logs/console.txt`.
+
 ## Demo / debug GUIs
 
 ```bash

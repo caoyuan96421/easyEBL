@@ -68,12 +68,22 @@ class Session:
 
     @classmethod
     def from_args(cls, args) -> "Session":
-        cfg = DAQConfig.from_json(open(args.config).read()) if args.config else DAQConfig()
+        preset = getattr(args, "preset", None)
+        if args.config:
+            cfg = DAQConfig.from_json(open(args.config).read())
+        elif preset == "usb6363":
+            cfg = DAQConfig.usb6363()
+        else:
+            cfg = DAQConfig()
         if args.device:
             cfg.device = args.device
+        field = getattr(args, "field_um", None) or 100.0
+        cal = FieldCalibration(field, cfg.ao_limit_v)
         if args.backend == "sim":
-            return cls.simulated(config=cfg)
-        return cls(DAQManager(create_backend(args.backend, cfg)).open())
+            s = cls.simulated(config=cfg, params=SimParams(field_size_um=field, v_full_scale=cfg.ao_limit_v))
+            s.calibration = cal
+            return s
+        return cls(DAQManager(create_backend(args.backend, cfg)).open(), cal)
 
     @property
     def simulator(self) -> SimulatedBackend | None:
@@ -220,6 +230,7 @@ class DataclassForm(QtWidgets.QWidget):
             else:
                 w.setText("" if v is None else self._fmt(v))
             w.blockSignals(False)
+        self.changed.emit()
 
 
 # --------------------------------------------------------------------- worker
@@ -365,6 +376,9 @@ def standalone_parser(desc: str) -> argparse.ArgumentParser:
     p.add_argument("--backend", default="sim", choices=["sim", "nidaqmx"], help="hardware backend")
     p.add_argument("--device", default=None, help="NI device name (e.g. Dev1)")
     p.add_argument("--config", default=None, help="DAQConfig JSON file")
+    p.add_argument("--preset", default=None, choices=["usb6363"], help="built-in wiring preset")
+    p.add_argument("--field-um", dest="field_um", type=float, default=None,
+                   help="field size (µm) that the full AO range maps to (default 100)")
     return p
 
 
