@@ -5,7 +5,7 @@ Run on the Windows PC that has the board, from the repo folder with the venv act
     python scripts/hw_scan_test.py --device Dev1
 
 What it does
-  1. Sets relay-enable PFI6 and PFI7 HIGH (required before taking control).
+  1. Switches the SEM to external scan (HAL external control: PFI6 + PFI7 HIGH).
   2. Parks the beam blanked, then checks the blanker/park path with a static write.
   3. Takes dummy raster images (video input = floating / noise) at several sample
      rates, checking the actual clock rate, buffer underflow/overflow warnings,
@@ -65,11 +65,9 @@ def main(argv=None) -> int:
     cal = FieldCalibration(field_size_um=100.0, v_full_scale=cfg.ao_limit_v)
     ok = True
     try:
-        # 1. relay enables
-        h.claim("relay_pfi6", "relay_pfi7")
-        for name in ("relay_pfi6", "relay_pfi7"):
-            h.set_line(name, True)
-        say(f"relay enables set HIGH: {mgr.line_state}")
+        # 1. external scan control (the HAL maps it to PFI6 + PFI7 HIGH on the 6363)
+        h.set_external_control(True)
+        say(f"external scan control ON ({cfg.external_control_map()}): {mgr.external_control}")
 
         # 2. beam parked and blanked
         h.park(0.0, 0.0, blank=True)
@@ -141,8 +139,7 @@ def main(argv=None) -> int:
     finally:
         try:
             h.park(0.0, 0.0, blank=True)
-            h.set_line("relay_pfi6", False)
-            h.set_line("relay_pfi7", False)
+            h.set_external_control(False)
         except Exception as e:  # noqa: BLE001
             say(f"cleanup problem: {e}")
         mgr.close()

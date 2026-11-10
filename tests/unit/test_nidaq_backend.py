@@ -166,10 +166,8 @@ def test_usb6363_preset_live_imaging(fake):
     cfg = replace(DAQConfig.usb6363(), buffer_samples=5000)
     mgr = DAQManager(NIDAQBackend(cfg)).open()
     h = mgr.get_handle("img")
-    h.claim("relay_pfi6", "relay_pfi7")
-    h.set_line("relay_pfi6", True)
-    h.set_line("relay_pfi7", True)
-    assert mgr.line_state == {"relay_pfi6": True, "relay_pfi7": True}
+    h.set_external_control(True)
+    assert mgr.external_control is True
     cal = FieldCalibration(100.0, cfg.ao_limit_v)
     rc = RasterConfig(nx=16, ny=8, width_um=40, rate=1e6, dwell_s=4e-6, ai_latency_samples=0.0)
     frames = []
@@ -183,3 +181,175 @@ def test_usb6363_preset_live_imaging(fake):
     w = fake.do_words
     assert set(np.unique(w)) <= {0, 1 << 23} and (w == (1 << 23)).any()
     assert mgr.beam_state.blank
+
+
+# ------------------------------------------------------------------ low-latency streaming
+def test_latency_sets_buffer_and_never_overfills_before_start(fake):
+    from easyebl.hal import StreamMonitor
+
+    mgr, be = make(fake)
+    mon = StreamMonitor()
+    rate = 500e3
+    n = 300_000
+    r = mgr.get_handle("t").run_stream(rate, [OutputChunk(np.zeros(n), np.zeros(n), np.zeros(n, bool))],
+                                       ai_channels=["video"], latency_s=0.05, monitor=mon)
+    buf = int(0.05 * rate)
+    assert r.info["buffer_samples"] == buf and r.info["piece_samples"] == buf // 8
+    sizes = [v for ev, v in fake.log if ev == "ao_write"]
+    assert max(sizes[:-1]) <= buf // 8  # data pieces; the last write is the safe tail
+    assert fake.max_prestart_queue <= buf
+    assert mon.buffer_samples == buf and mon.written == n and mon.ai_read >= n and not mon.running
+    assert mon.latency_s == pytest.approx(0.05)
+
+
+def test_latency_floor(fake):
+    mgr, be = make(fake)
+    assert be.buffer_samples(1e6, 0.001) == mgr.config.min_latency_samples
+    assert be.buffer_samples(1e6, None) == 1_000_000  # conservative default: ≥ min_buffer_s
+
+
+def test_short_stream_with_tail_larger_than_free_buffer(fake):
+    """Prefill + safe tail exceed the buffer: the clock must start before the tail is queued."""
+    mgr, be = make(fake)
+    n = 15_000  # tail at 500 kS/s is 10 ms = 5 000 samples; buffer 16 384
+    r = mgr.get_handle("t").run_stream(500e3, [OutputChunk(np.zeros(n), np.zeros(n), np.zeros(n, bool))],
+                                       latency_s=0.001)
+    assert r.samples_written == n and fake.max_prestart_queue <= mgr.config.min_latency_samples
+
+
+@pytest.mark.parametrize("code,exc", [(-200290, "StreamUnderflowError"), (-200621, "StreamUnderflowError"),
+                                      (-200279, "StreamOverflowError")])
+def test_driver_errors_are_classified_and_cleaned_up(fake, code, exc):
+    import easyebl.hal as hal
+
+    mgr, be = make(fake)
+    fake.fail_on_write = (5, code)
+    with pytest.raises(getattr(hal, exc)):
+        mgr.get_handle("t").run_stream(100e3, stream(20, 3000), ai_channels=["video"], latency_s=0.05)
+    assert ("stop", "easyebl_ao") in fake.log and ("close", "easyebl_ai") in fake.log
+    assert mgr.beam_state.blank and not mgr.is_busy
+    statics = [ev for ev, _ in fake.log if ev.startswith("static")]
+    assert statics[-2:] == ["static_do", "static_ao"]
+
+
+def test_unknown_driver_error_passes_through(fake):
+    import nidaqmx.errors
+
+    mgr, be = make(fake)
+    fake.fail_on_write = (2, -123)
+    with pytest.raises(nidaqmx.errors.DaqError):
+        mgr.get_handle("t").run_stream(100e3, stream(5, 3000))
+    assert mgr.beam_state.blank
+
+
+def test_ai_blocks_are_reused_consumer_must_copy(fake):
+    mgr, be = make(fake)
+    ids, got = set(), []
+
+    def consume(block):
+        ids.add(id(block.base) if block.base is not None else id(block))
+        got.append(block.copy())
+
+    r = mgr.get_handle("t").run_stream(100e3, stream(10, 3000), ai_channels=["video"], on_ai=consume,
+                                       latency_s=0.05)
+    np.testing.assert_allclose(np.concatenate(got, axis=1)[0], fake.ao_x[: r.samples_written])
+
+
+def test_external_control_wires_and_polarity(fake):
+    """One HAL function drives several wires, each with its own polarity, in a single write."""
+    cfg = DAQConfig.usb6363()
+    cfg.external_control_lines = {"PFI6": True, "PFI7": False}
+    mgr = DAQManager(NIDAQBackend(cfg)).open()
+    ext_tasks = lambda: [t for t in fake.tasks if [p for _, p in t.channels] == ["Dev1/PFI6", "Dev1/PFI7"]]
+    # opening the device selects the SEM's internal scan
+    assert mgr.external_control is False and len(ext_tasks()) == 1
+    assert fake.static_do[-1] == [False, True]
+    h = mgr.get_handle("sem")
+    n_log = len(fake.log)
+    h.set_external_control(True)
+    assert fake.static_do[-1] == [True, False] and len(ext_tasks()) == 2
+    # the beam was blanked (active-low blanker: level False) before the switch
+    assert ("static_do", False) in fake.log[n_log:-1]
+    k = len(fake.static_do)
+    mgr.close()  # closing returns the scan to the SEM (then the backend blanks once more)
+    assert [False, True] in fake.static_do[k:] and mgr.external_control is False
+
+
+# ------------------------------------------------------------------ lost USB connection
+def _wait(cond, timeout=5.0):
+    import time
+
+    t_end = time.monotonic() + timeout
+    while time.monotonic() < t_end:
+        if cond():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def test_unplug_mid_stream_is_device_lost_and_cleans_up(fake):
+    from easyebl.hal import DeviceLostError
+
+    mgr = DAQManager(NIDAQBackend(DAQConfig.usb6363()), auto_reconnect=False).open()
+    h = mgr.get_handle("t")
+    fake.unplug_after_writes = fake.ao_writes + 6
+    with pytest.raises(DeviceLostError):
+        h.run_stream(500e3, (OutputChunk.constant(3000, 0.5, -0.5, False) for _ in range(40)),
+                     ai_channels=["video"], latency_s=0.05)
+    # every task was stopped and closed even though the driver kept failing
+    names = {"easyebl_ao", "easyebl_do", "easyebl_ai"}
+    assert names <= {n for ev, n in fake.log if ev == "close"}
+    assert not mgr.connected and not mgr.is_busy and mgr.active_owner is None
+    assert not mgr.backend.probe()
+    with pytest.raises(DeviceLostError):
+        h.park()
+    mgr.close()  # completes although the device is gone
+
+
+def test_reconnect_resets_device_and_restores_external_control(fake):
+    from easyebl.hal import DeviceLostError
+
+    mgr = DAQManager(NIDAQBackend(DAQConfig.usb6363()), reconnect_interval_s=0.01).open()
+    h = mgr.get_handle("sem")
+    h.set_external_control(True)
+    fake.present = False
+    with pytest.raises(DeviceLostError):
+        h.park()
+    assert mgr.reconnecting and fake.resets == 0
+    fake.present = True
+    assert mgr.wait_connected(3)
+    assert fake.resets == 1  # stale driver state cleared after the reconnect
+    assert mgr.external_control is True and fake.static_do[-1] == [True, True]
+    r = h.run_stream(500e3, (OutputChunk.constant(3000, 0.5, -0.5, False) for _ in range(3)),
+                     ai_channels=["video"], latency_s=0.05)
+    assert r.samples_written == 9000
+    mgr.close()
+
+
+def test_lost_codes_vs_other_errors(fake):
+    from easyebl.hal.nidaq import _is_lost
+
+    Err = fake_nidaqmx.DaqError
+    assert _is_lost(Err("x", -201003)) and _is_lost(Err("x", -50405))
+    assert _is_lost(Err("Device is no longer present in the system", -12345))
+    assert not _is_lost(Err("buffer underflow", -200290)) and not _is_lost(RuntimeError("no longer present"))
+    # an unknown driver error while the device still answers is *not* a lost device
+    mgr, be = make(fake)
+    fake.fail_on_write = (2, -99999)
+    with pytest.raises(fake_nidaqmx.DaqError):
+        mgr.get_handle("t").run_stream(100e3, stream(5, 3000))
+    assert mgr.connected
+
+
+def test_open_with_missing_device_waits_for_it(fake):
+    fake.present = False
+    fake.name = "Dev1"
+    mgr = DAQManager(NIDAQBackend(DAQConfig.usb6363()), reconnect_interval_s=0.01)
+    mgr.open(allow_missing=True)
+    assert not mgr.connected
+    fake.present = True
+    assert mgr.wait_connected(3) and mgr.external_control is False
+    mgr.close()
+
+
+# ------------------------------------------------------------------ phantom on aux0 = AO2

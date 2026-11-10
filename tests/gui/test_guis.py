@@ -60,10 +60,14 @@ def test_hal_gui(qtbot, session):
     assert session.manager.beam_state.x_v == 1.5 and not session.manager.beam_state.blank
     w._park()
     assert session.manager.beam_state.blank
-    claim, val = w._line_boxes["scan_relay"]
+    claim, val = w._line_boxes["aux"]
     claim.setChecked(True)
     val.setChecked(True)
-    assert session.manager.line_state["scan_relay"] is True
+    assert session.manager.line_state["aux"] is True
+    w.ext.setChecked(True)
+    assert session.manager.external_control is True
+    w.ext.setChecked(False)
+    assert session.manager.external_control is False
     for kind in ("sine", "square", "triangle", "step"):
         c = test_waveform(kind, 2.0, 1e3, 1e-3, 100e3, True)
         assert len(c) == 100 and c.max_abs_voltage() <= 2.0 + 1e-12
@@ -95,9 +99,9 @@ def test_imaging_gui_live(qtbot, session):
     w = ImagingWidget(session)
     qtbot.addWidget(w)
     w.form.set_value(w.config().with_(nx=32, ny=24, width_um=20, rate=400e3, dwell_s=5e-6))
-    # scan control claims the relay lines and drives them high
+    # scan control switches the SEM to external scan (HAL external control)
     w.cb_control.setChecked(True)
-    assert all(session.manager.line_state[n] for n in w.static_names)
+    assert session.manager.external_control is True
     w.sp_avg.setValue(4)
     frames = []
     w._frame.connect(lambda k, img, t: frames.append(k))
@@ -112,7 +116,7 @@ def test_imaging_gui_live(qtbot, session):
     assert not session.manager.is_busy and session.manager.beam_state.blank
     assert not w.b_live.isChecked()
     w.cb_control.setChecked(False)
-    assert not any(session.manager.line_state[n] for n in w.static_names)
+    assert session.manager.external_control is False
 
 
 def test_alignment_gui(qtbot, session):

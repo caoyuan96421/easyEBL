@@ -127,23 +127,23 @@ class TestHandles:
     def test_claims(self, manager):
         a, b = manager.get_handle("a"), manager.get_handle("b")
         with pytest.raises(ResourceConflictError):
-            a.set_line("scan_relay", True)  # not claimed
-        a.claim("scan_relay", "stage")
-        assert a.claimed == {"scan_relay", "stage"}
+            a.set_line("aux", True)  # not claimed
+        a.claim("aux", "stage")
+        assert a.claimed == {"aux", "stage"}
         with pytest.raises(ResourceConflictError):
             b.claim("stage")
         with pytest.raises(ResourceConflictError):
-            b.set_line("scan_relay", True)
-        a.set_line("scan_relay", True)
-        assert manager.line_state == {"scan_relay": True}
-        assert manager.backend.static_lines["scan_relay"] is True
+            b.set_line("aux", True)
+        a.set_line("aux", True)
+        assert manager.line_state == {"aux": True}
+        assert manager.backend.static_lines["aux"] is True
         assert manager.beam_state.blank  # switching a line blanks first
         with pytest.raises(HALError):
             a.set_line("nonexistent", True)
         a.release("stage")
         b.claim("stage")
         a.close()
-        assert "scan_relay" not in manager.claims()
+        assert "aux" not in manager.claims()
         with pytest.raises(HALError):
             a.park()
 
@@ -203,7 +203,7 @@ class TestHandles:
         manager.add_listener(lambda e, d: 1 / 0)  # faulty listener must not break anything
         h = manager.get_handle("x")
         h.run_stream(100e3, chunks(1))
-        h.claim("scan_relay")
+        h.claim("aux")
         assert {"handle_created", "stream_started", "stream_finished", "claim"} <= set(events)
         assert [x.owner for x in manager.handles()].count("x") == 1
 
@@ -212,3 +212,77 @@ class TestHandles:
         h = m.get_handle("a")
         h.run_stream(100e3, chunks(1, markers={"sync": np.ones(1000, bool)}))
         assert m.backend.recorded[0].markers["sync"].all()
+
+
+class TestExternalControl:
+    """The HAL's SEM internal/external scan switch."""
+
+    def mk(self, make_manager, lines=None, **kw):
+        if lines is None:
+            lines = {"port1/line0": True, "port2/line1": False}
+        return make_manager(config=DAQConfig(external_control_lines=lines, **kw))
+
+    def test_defaults_high_active_and_internal_after_open(self, make_manager):
+        m = make_manager()
+        assert DAQConfig().external_control_map() == {"port1/line0": True}
+        assert DAQConfig.usb6363().external_control_map() == {"PFI6": True, "PFI7": True}
+        assert m.has_external_control and m.external_control is False
+        assert m.backend.external_wires == {"port1/line0": False}  # LOW = internal
+
+    def test_wires_and_polarity(self, make_manager):
+        m = self.mk(make_manager)
+        h = m.get_handle("sem")
+        h.set_external_control(True)
+        assert m.backend.external_wires == {"port1/line0": True, "port2/line1": False}
+        h.set_external_control(False)
+        assert m.backend.external_wires == {"port1/line0": False, "port2/line1": True}
+        lst = DAQConfig(external_control_lines=["port1/line0", "port1/line2"], external_control_active_high=False)
+        lst.validate()
+        assert lst.external_control_lines == {"port1/line0": False, "port1/line2": False}
+        assert DAQConfig.from_json(lst.to_json()).external_control_map() == lst.external_control_lines
+
+    def test_config_validation(self):
+        with pytest.raises(ValueError, match="hardware-timed"):
+            DAQConfig(external_control_lines={"port0/line3": True}).validate()
+        with pytest.raises(ValueError, match="also configured"):
+            DAQConfig(external_control_lines={"port1/line1": True}).validate()  # = default "aux"
+
+    def test_exclusive_and_returned_on_close(self, make_manager):
+        m = self.mk(make_manager)
+        a, b = m.get_handle("a"), m.get_handle("b")
+        a.set_external_control(True)
+        assert m.claims()["external_control"] == "a"
+        with pytest.raises(ResourceConflictError):
+            b.set_external_control(True)
+        with pytest.raises(ResourceConflictError):
+            b.set_external_control(False)
+        assert m.beam_state.blank  # switching blanks first
+        a.close()
+        assert m.external_control is False and "external_control" not in m.claims()
+        b.set_external_control(True)
+        b.release("external_control")
+        assert m.external_control is False
+
+    def test_refused_while_streaming(self, make_manager):
+        m = self.mk(make_manager)
+        a, b = m.get_handle("a"), m.get_handle("b")
+        started, release = threading.Event(), threading.Event()
+        t, out = run_in_thread(lambda: a.run_stream(100e3, slow_chunks(started, release)))
+        assert started.wait(2)
+        with pytest.raises(DeviceBusyError):
+            b.set_external_control(True)
+        release.set()
+        t.join(5)
+        assert m.external_control is False
+
+    def test_manager_close_and_exit_hook_return_to_internal(self, make_manager):
+        m = self.mk(make_manager)
+        m.get_handle("a").set_external_control(True)
+        m._atexit()  # what atexit runs if the program ends without close()
+        assert m.backend.external_control is False and not m.backend.is_open
+
+    def test_no_lines_configured(self, make_manager):
+        m = make_manager(config=DAQConfig(external_control_lines={}))
+        assert not m.has_external_control and m.external_control is None
+        with pytest.raises(HALError):
+            m.get_handle("a").set_external_control(True)

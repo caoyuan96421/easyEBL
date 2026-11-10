@@ -19,18 +19,39 @@ class FakeDevice:
         self.reset()
 
     def reset(self):
+        self.present = True  # False = USB unplugged: every driver call fails with -201003
+        self.unplug_after_writes = None  # unplug when this many AO stream writes have happened
+        self.resets = 0
+        self.fail_on_write = None  # (k, error_code): raise DaqError on the k-th AO stream write
+        self.ao_writes = 0
+        self.max_prestart_queue = 0
         self.ao_written = []  # list of (2, n) arrays
         self.do_written = []
         self.static_ao = []
+        self.static_aux = []  # (physical channel, volts) of single-channel static AO writes
         self.static_do = []
+        self.loopback_row = 0  # which AO channel of the stream the AI input sees (0 = X, 2 = AO2 …)
+        self.stream_ao_channels = []
         self.ao_running = False
         self.ai_read = 0
+        self.base = 0  # first sample of the running stream
+        self._x = np.zeros(1 << 16)
+        self.total = 0  # AO samples written over all streams
         self.tasks = []
         self.log = []
 
+    def append_x(self, x):
+        n = len(x)
+        if self.total + n > len(self._x):
+            new = np.zeros(max(2 * len(self._x), self.total + n))
+            new[: self.total] = self._x[: self.total]
+            self._x = new
+        self._x[self.total : self.total + n] = x
+        self.total += n
+
     @property
     def ao_x(self):
-        return np.concatenate([a[0] for a in self.ao_written]) if self.ao_written else np.zeros(0)
+        return self._x[: self.total].copy()
 
     @property
     def do_words(self):
@@ -38,6 +59,22 @@ class FakeDevice:
 
 
 DEVICE = FakeDevice()
+
+
+class DaqError(Exception):
+    def __init__(self, message, error_code, task_name=""):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def _check():
+    if DEVICE.unplug_after_writes is not None and DEVICE.ao_writes >= DEVICE.unplug_after_writes:
+        DEVICE.unplug_after_writes = None
+        DEVICE.present = False
+        DEVICE.ao_running = False
+    if not DEVICE.present:
+        raise DaqError("Device cannot be accessed. Possible causes: Device is no longer present in the system.",
+                       -201003)
 
 
 class AcquisitionType(enum.Enum):
@@ -94,7 +131,8 @@ class _OutStream:
 
     @property
     def total_samp_per_chan_generated(self):
-        return DEVICE.ao_x.shape[0] if DEVICE.ao_running else 0
+        _check()
+        return DEVICE.total - DEVICE.base if DEVICE.ao_running else 0
 
 
 class _InStream:
@@ -103,9 +141,10 @@ class _InStream:
 
     @property
     def avail_samp_per_chan(self):
+        _check()
         if not DEVICE.ao_running:
             return 0
-        return DEVICE.ao_x.shape[0] - DEVICE.ai_read
+        return DEVICE.total - DEVICE.ai_read
 
 
 class Task:
@@ -126,18 +165,30 @@ class Task:
         return {k for k, _ in self.channels}
 
     def write(self, data, auto_start=False):
-        if "ao" in self.kinds():
+        _check()
+        if "ao" in self.kinds() and np.isscalar(data):
+            phys = [p for k, p in self.channels if k == "ao"][0]
+            DEVICE.static_aux.append((phys, float(data)))
+            DEVICE.log.append(("static_aux", (phys, float(data))))
+        elif "ao" in self.kinds():
             DEVICE.static_ao.append(list(data))
             DEVICE.log.append(("static_ao", tuple(data)))
         else:
             DEVICE.static_do.append(data)
             DEVICE.log.append(("static_do", data))
 
+    def read(self, timeout=1.0):
+        _check()
+        return 0.0
+
     def start(self):
+        _check()
         self.started = True
         DEVICE.log.append(("start", self.name))
         if "ao" in self.kinds():
             DEVICE.ao_running = True
+            DEVICE.base = getattr(self, "_base", DEVICE.total)
+            DEVICE.ai_read = DEVICE.base
 
     def stop(self):
         DEVICE.log.append(("stop", self.name))
@@ -159,7 +210,25 @@ class AnalogMultiChannelWriter:
         self.s = out_stream
 
     def write_many_sample(self, data, timeout=10):
+        _check()
+        DEVICE.ao_writes += 1
+        if DEVICE.fail_on_write and DEVICE.ao_writes == DEVICE.fail_on_write[0]:
+            code = DEVICE.fail_on_write[1]
+            raise DaqError(f"simulated DAQmx error {code}", code)
+        t = self.s.task
+        if not hasattr(t, "_base"):
+            t._base = DEVICE.total
+        n = np.shape(data)[1]
+        if not DEVICE.ao_running:
+            # a real device would block (and finally time out) on a full, stopped buffer
+            queued = DEVICE.total - t._base + n
+            DEVICE.max_prestart_queue = max(DEVICE.max_prestart_queue, queued)
+            buf = self.s.output_buf_size
+            if buf is not None and queued > buf:
+                raise DaqError("write timed out: buffer full before start", -200292)
         DEVICE.ao_written.append(np.array(data, copy=True))
+        DEVICE.stream_ao_channels = [p for k, p in t.channels if k == "ao"]
+        DEVICE.append_x(np.asarray(data)[DEVICE.loopback_row])
         DEVICE.log.append(("ao_write", np.shape(data)[1]))
 
 
@@ -168,6 +237,7 @@ class DigitalSingleChannelWriter:
         self.s = out_stream
 
     def write_many_sample_port_uint32(self, data, timeout=10):
+        _check()
         DEVICE.do_written.append(np.array(data, dtype=np.uint32, copy=True))
 
 
@@ -176,9 +246,10 @@ class AnalogMultiChannelReader:
         self.s = in_stream
 
     def read_many_sample(self, data, number_of_samples_per_channel, timeout=1):
-        x = DEVICE.ao_x
+        _check()
+        assert data.flags["C_CONTIGUOUS"] and data.shape[1] == number_of_samples_per_channel
         n = number_of_samples_per_channel
-        seg = x[DEVICE.ai_read : DEVICE.ai_read + n]
+        seg = DEVICE._x[DEVICE.ai_read : min(DEVICE.total, DEVICE.ai_read + n)]
         data[:, : len(seg)] = seg[None, :]
         DEVICE.ai_read += len(seg)
         return len(seg)
@@ -199,14 +270,28 @@ def install(monkeypatch, device_name="Dev1"):
         def local():
             return types.SimpleNamespace(devices=[types.SimpleNamespace(name=DEVICE.name)])
 
+    class _Device:
+        def __init__(self, name):
+            self.name = name
+
+        def reset_device(self):
+            _check()
+            DEVICE.resets += 1
+            DEVICE.log.append(("reset_device", self.name))
+
     system.System = _Sys
+    system.Device = _Device
     writers = types.ModuleType("nidaqmx.stream_writers")
     writers.AnalogMultiChannelWriter = AnalogMultiChannelWriter
     writers.DigitalSingleChannelWriter = DigitalSingleChannelWriter
+    errors = types.ModuleType("nidaqmx.errors")
+    errors.DaqError = DaqError
+    root.errors = errors
     readers = types.ModuleType("nidaqmx.stream_readers")
     readers.AnalogMultiChannelReader = AnalogMultiChannelReader
     root.constants, root.system, root.stream_writers, root.stream_readers = constants, system, writers, readers
     for name, mod in [("nidaqmx", root), ("nidaqmx.constants", constants), ("nidaqmx.system", system),
-                      ("nidaqmx.stream_writers", writers), ("nidaqmx.stream_readers", readers)]:
+                      ("nidaqmx.stream_writers", writers), ("nidaqmx.stream_readers", readers),
+                      ("nidaqmx.errors", errors)]:
         monkeypatch.setitem(sys.modules, name, mod)
     return DEVICE

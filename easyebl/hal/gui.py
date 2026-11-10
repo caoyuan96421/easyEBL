@@ -81,16 +81,24 @@ class HALDebugWidget(QtWidgets.QWidget):
         g.addWidget(b_move, 3, 0)
         g.addWidget(b_park, 3, 1)
 
-        lines = QtWidgets.QGroupBox("Static lines (claim → switch)")
+        lines = QtWidgets.QGroupBox("SEM scan source / static lines")
         lg = QtWidgets.QGridLayout(lines)
+        wires = ", ".join(f"{w} ({'high' if hi else 'low'})"
+                          for w, hi in self.mgr.config.external_control_map().items())
+        self.ext = QtWidgets.QCheckBox("External scan control" + (f" – {wires}" if wires else ""))
+        self.ext.setToolTip("HAL external-control function: on = the SEM scans from the DAQ, "
+                            "off = SEM internal scan")
+        self.ext.setVisible(self.mgr.has_external_control)
+        self.ext.toggled.connect(self._external)
+        lg.addWidget(self.ext, 0, 0, 1, 2)
         self._line_boxes = {}
         for i, name in enumerate(self.mgr.config.static_lines):
             claim = QtWidgets.QCheckBox(f"claim {name}")
             val = QtWidgets.QCheckBox("on")
             claim.toggled.connect(lambda on, n=name: self._claim(n, on))
             val.toggled.connect(lambda on, n=name: self._line(n, on))
-            lg.addWidget(claim, i, 0)
-            lg.addWidget(val, i, 1)
+            lg.addWidget(claim, i + 1, 0)
+            lg.addWidget(val, i + 1, 1)
             self._line_boxes[name] = (claim, val)
 
         # --- test stream
@@ -156,7 +164,7 @@ class HALDebugWidget(QtWidgets.QWidget):
             self.handles.addTopLevelItem(it)
 
     def _on_event(self, ev: str, d: dict) -> None:
-        if ev in ("stream_started", "stream_finished", "claim", "release", "line"):
+        if ev in ("stream_started", "stream_finished", "claim", "release", "line", "external_control", "error"):
             self.log.log(f"[{ev}] {d}")
         self.refresh()
 
@@ -179,6 +187,14 @@ class HALDebugWidget(QtWidgets.QWidget):
 
     def _line(self, name, on):
         self._guard(self.handle.set_line, name, on)
+
+    def _external(self, on):
+        self._guard(self.handle.set_external_control, on)
+        if not on and "external_control" in self.handle.claimed:
+            self._guard(self.handle.release, "external_control")
+        self.ext.blockSignals(True)
+        self.ext.setChecked(bool(self.mgr.external_control))
+        self.ext.blockSignals(False)
 
     def _run_test(self):
         rate = self.rate.value()

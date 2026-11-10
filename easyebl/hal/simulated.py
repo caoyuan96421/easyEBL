@@ -25,7 +25,7 @@ from scipy import ndimage, signal
 
 from ..core.transforms import AffineTransform
 from ..core.waveform import OutputChunk
-from .backend import AIConsumer, BackendCapabilities, DAQBackend, StreamResult
+from .backend import AIConsumer, BackendCapabilities, DAQBackend, StreamMonitor, StreamResult
 from .config import DAQConfig
 
 __all__ = [
@@ -35,6 +35,7 @@ __all__ = [
     "DoseMap",
     "SimParams",
     "SimulatedBackend",
+    "SimDeviceError",
     "make_demo_sample",
     "default_demo_sample",
     "render_cross",
@@ -202,8 +203,23 @@ class SimParams:
 
 
 # --------------------------------------------------------------------- backend
+class SimDeviceError(RuntimeError):
+    """What the simulated driver raises when the device is unplugged (like a DAQmx error)."""
+
+    def __init__(self, message: str, error_code: int = -201003):
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class SimulatedBackend(DAQBackend):
-    """Drop-in replacement for :class:`NIDAQBackend`."""
+    """Drop-in replacement for :class:`NIDAQBackend`.
+
+    Fault injection for connection tests: :meth:`unplug` (now, or after a
+    number of samples of the running stream) makes every driver call fail
+    with :class:`SimDeviceError` – optionally only after ``fail_delay_s``, like
+    a USB call timing out – and :meth:`replug` brings the device back
+    power-cycled (outputs reset, SEM on internal scan).
+    """
 
     def __init__(
         self,
@@ -219,14 +235,51 @@ class SimulatedBackend(DAQBackend):
         self.record = record
         self.recorded: list[OutputChunk] = []
         self.static_lines: dict[str, bool] = {}
+        self.external_control = False  # SEM scan source: False = internal, True = DAQ
+        self.external_wires: dict[str, bool] = {}  # electrical level of each wire
         self.static_xyb = (0.0, 0.0, True)
         self._static_t = time.perf_counter()
         self._rng = np.random.default_rng(self.params.seed)
         self._lock = threading.Lock()
+        self.present = True
+        self.fail_delay_s = 0.0
+        self._unplug_at: int | None = None
+        self.unplug_count = 0
         self.reset_state()
+
+    # ----------------------------------------------------------- fault injection
+    def unplug(self, after_samples: int | None = None, fail_delay_s: float = 0.0) -> None:
+        """Disconnect now, or after *after_samples* more samples of the current/next stream."""
+        self.fail_delay_s = float(fail_delay_s)
+        if after_samples is None:
+            self.present = False
+            self.unplug_count += 1
+        else:
+            self._unplug_at = int(after_samples)
+
+    def replug(self) -> None:
+        """Reconnect; the device comes back power-cycled (outputs at 0 V, SEM internal scan)."""
+        self._unplug_at = None
+        self.static_lines = {k: False for k in self.static_lines}
+        self.external_control = False
+        self.external_wires = {}
+        self.present = True
+
+    def _require_present(self, what: str) -> None:
+        if not self.present:
+            if self.fail_delay_s > 0:
+                time.sleep(self.fail_delay_s)  # e.g. a USB request that times out
+            raise SimDeviceError(f"simulated: device cannot be accessed ({what})")
+
+    def is_device_lost(self, exc: BaseException) -> bool:
+        return isinstance(exc, SimDeviceError) or super().is_device_lost(exc)
+
+    def probe(self) -> bool:
+        return self.present
 
     # ------------------------------------------------------------- lifecycle
     def open(self) -> None:
+        self._require_present("open")
         self._open = True
 
     def close(self) -> None:
@@ -243,6 +296,7 @@ class SimulatedBackend(DAQBackend):
             timed_lines=tuple(c.timed_lines),
             static_lines=tuple(c.static_lines),
             simulated=True,
+            external_control=bool(c.external_control_lines),
         )
 
     def reset_state(self) -> None:
@@ -276,18 +330,27 @@ class SimulatedBackend(DAQBackend):
 
     # ----------------------------------------------------------------- static
     def write_static(self, x_v: float, y_v: float, blank: bool) -> None:
+        self._require_present("write_static")
         with self._lock:
             self._deposit_static()
             self.static_xyb = (float(x_v), float(y_v), bool(blank))
             self._beam = self.volts_to_true_um(np.array([[x_v, y_v]]))[0]
 
     def set_static_line(self, name: str, value: bool) -> None:
+        self._require_present("set_static_line")
         if name not in self.config.static_lines:
             raise KeyError(name)
         self.static_lines[name] = bool(value)
 
+    def set_external_control(self, on: bool) -> None:
+        if not self.config.external_control_lines:
+            raise KeyError("no external-control lines configured")
+        self._require_present("set_external_control")
+        self.external_wires = self.external_levels(on)
+        self.external_control = bool(on)
+
     # ----------------------------------------------------------------- stream
-    def _process(self, c: OutputChunk, rate: float, n_ai: int) -> np.ndarray:
+    def _process(self, c: OutputChunk, rate: float, n_ai: int, ai_range_v: float | None = None) -> np.ndarray:
         p = self.params
         dt = 1.0 / rate
         n = len(c)
@@ -320,6 +383,21 @@ class SimulatedBackend(DAQBackend):
         # video
         if n_ai == 0:
             return np.zeros((0, n))
+        phantom = self.phantom_source()
+        if phantom is not None:
+            # dummy-image test: the phantom output is wired back to the video input, so the AI
+            # sees the commanded-position phantom signal, one conversion late – no SEM physics
+            sig = phantom.output(c.x, c.y, c.blank)
+            d_v = int(p.ai_latency_samples)
+            if d_v > 0:
+                vh = np.concatenate([self._video_hist, sig])
+                if len(vh) < n + d_v:
+                    vh = np.concatenate([np.zeros(n + d_v - len(vh)), vh])
+                sig = vh[len(vh) - n - d_v : len(vh) - d_v]
+                self._video_hist = vh[-d_v:]
+            out = np.repeat(sig[None, :], n_ai, axis=0)
+            lim = self.config.ai_range_v if ai_range_v is None else ai_range_v
+            return np.clip(out, -lim, lim)
         sig = self.sample.intensity(pos[:, 0], pos[:, 1]) * p.video_gain_v
         sig = np.where(blank_eff, 0.0, sig)
         if p.video_tau_s > 0:
@@ -337,7 +415,7 @@ class SimulatedBackend(DAQBackend):
         for i in range(n_ai):
             s = sig if i == 0 else (p.video_gain_v * 0.5 - 0.5 * sig)
             out[i] = s + p.video_offset_v + self._rng.normal(0.0, p.noise_sigma, n)
-        lim = self.config.ai_range_v
+        lim = self.config.ai_range_v if ai_range_v is None else ai_range_v
         return np.clip(out, -lim, lim)
 
     def run_stream(
@@ -348,12 +426,20 @@ class SimulatedBackend(DAQBackend):
         on_ai: AIConsumer | None = None,
         abort: threading.Event | None = None,
         progress: Callable[[int], None] | None = None,
+        latency_s: float | None = None,
+        monitor: StreamMonitor | None = None,
+        ai_range_v: float | None = None,
     ) -> StreamResult:
         n_ai = len(ai_channels)
         written = 0
         collected = []
         aborted = False
         t0 = time.perf_counter()
+        mon = monitor if monitor is not None else StreamMonitor()
+        mon.rate = rate
+        mon.buffer_samples = int((latency_s or 0.0) * rate)
+        mon.running, mon.t_start, mon.t_update = True, t0, t0
+        self._require_present("run_stream")
         with self._lock:
             self._deposit_static()
             try:
@@ -361,10 +447,18 @@ class SimulatedBackend(DAQBackend):
                     if abort is not None and abort.is_set():
                         aborted = True
                         break
+                    if self._unplug_at is not None and written >= self._unplug_at:
+                        self._unplug_at = None
+                        self.present = False
+                        self.unplug_count += 1
+                    self._require_present("stream write")
                     if self.record:
                         self.recorded.append(c)
-                    ai = self._process(c, rate, n_ai)
+                    ai = self._process(c, rate, n_ai, ai_range_v)
                     written += len(c)
+                    mon.written = mon.generated = mon.ai_read = written
+                    mon.writes += 1
+                    mon.t_update = time.perf_counter()
                     if n_ai:
                         if on_ai is not None:
                             on_ai(ai)
@@ -378,6 +472,7 @@ class SimulatedBackend(DAQBackend):
                             time.sleep(lag)
             finally:
                 self._static_t = time.perf_counter()
+                mon.running = False
         ai_all = None
         if n_ai and on_ai is None:
             ai_all = np.concatenate(collected, axis=1) if collected else np.zeros((n_ai, 0))

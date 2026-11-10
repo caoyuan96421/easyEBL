@@ -82,15 +82,10 @@ class ImagingWidget(QtWidgets.QWidget):
         scroll.setWidget(self.form)
         scroll.setWidgetResizable(True)
 
-        # --- scan control (relay enables, e.g. PFI6/PFI7 on the USB-6363)
-        self.static_names = list(session.manager.config.static_lines)
-        self.cb_control = QtWidgets.QCheckBox(
-            "External scan control (" + ", ".join(
-                session.manager.config.static_lines[n] for n in self.static_names) + ")"
-        )
-        self.cb_control.setToolTip("Claims the relay-enable lines and drives them HIGH so the SEM "
-                                   "takes X/Y from the DAQ. Unchecked = SEM internal scan.")
-        self.cb_control.setVisible(bool(self.static_names))
+        # --- scan control: the HAL's external-control function (wires are configured in the HAL)
+        self.cb_control = QtWidgets.QCheckBox("External scan control")
+        self.cb_control.setToolTip("Checked: the SEM takes X/Y from the DAQ. Unchecked = SEM internal scan.")
+        self.cb_control.setVisible(self.handle.has_external_control)
         self.cb_control.toggled.connect(self._set_control)
 
         self.sp_avg = QtWidgets.QSpinBox()
@@ -188,28 +183,22 @@ class ImagingWidget(QtWidgets.QWidget):
 
     def _set_control(self, on: bool):
         try:
-            if on:
-                self.handle.claim(*self.static_names)
-                for n in self.static_names:
-                    self.handle.set_line(n, True)
-                self.log.log("external scan control ON: " + str(self.session.manager.line_state))
-            else:
-                if self._busy():
-                    self.stop()
-                    self._worker.wait(5000)
-                for n in self.static_names:
-                    if n in self.handle.claimed:
-                        self.handle.set_line(n, False)
-                self.handle.release(*[n for n in self.static_names if n in self.handle.claimed])
-                self.log.log("external scan control OFF (SEM internal scan)")
+            if self._busy():
+                self.stop()
+                self._worker.wait(5000)
+            self.handle.set_external_control(on)
+            if not on:
+                self.handle.release("external_control")
+            self.log.log("external scan control ON" if on else "external scan control OFF (SEM internal scan)")
         except Exception as e:  # noqa: BLE001
             self.log.log(f"ERROR scan control: {e}")
-            self.cb_control.blockSignals(True)
-            self.cb_control.setChecked(False)
-            self.cb_control.blockSignals(False)
+        self.cb_control.blockSignals(True)
+        self.cb_control.setChecked(bool(self.session.manager.external_control))
+        self.cb_control.blockSignals(False)
 
     def _check_control(self):
-        if self.static_names and not self.cb_control.isChecked() and self.session.simulator is None:
+        manager = self.session.manager
+        if self.handle.has_external_control and not manager.external_control and self.session.simulator is None:
             self.log.log("note: external scan control is OFF – the SEM is still on internal scan")
 
     def _extent(self, cfg):

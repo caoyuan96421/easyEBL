@@ -576,7 +576,8 @@ class RasterImager:
 
         def consume(block: np.ndarray):
             st = state
-            st["buf"] = block if st["buf"] is None else np.concatenate([st["buf"], block], axis=1)
+            # the backend may reuse *block* after this call returns: always copy
+            st["buf"] = block.copy() if st["buf"] is None else np.concatenate([st["buf"], block], axis=1)
             while True:
                 k = st["k"]
                 start = k * L  # absolute index of this frame's first sample
