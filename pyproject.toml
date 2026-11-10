@@ -19,6 +19,8 @@ all = ["gdstk>=0.9", "PySide6>=6.5", "pyqtgraph>=0.13", "nidaqmx>=0.9"]
 
 [project.scripts]
 easyebl-demo = "easyebl.gui.launcher:main"
+easyebl-sem = "easyebl.imaging.sem:main"
+easyebl-sem-cli = "easyebl.imaging.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["easyebl*"]
@@ -28,4 +30,5 @@ testpaths = ["tests"]
 markers = [
   "system: subsystem tests running full pipelines on the simulator",
   "gui: GUI smoke tests (offscreen Qt)",
+  "hardware: tests on a real NI DAQ (pytest tests/hardware --hw Dev1)",
 ]
