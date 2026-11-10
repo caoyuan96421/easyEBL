@@ -255,6 +255,49 @@ def test_ai_blocks_are_reused_consumer_must_copy(fake):
     np.testing.assert_allclose(np.concatenate(got, axis=1)[0], fake.ao_x[: r.samples_written])
 
 
+def test_engine_on_usb6363_preset(fake):
+    """The threaded engine on the NI backend: loopback image == X staircase; changes keep the stream."""
+    import time
+    from dataclasses import replace
+
+    from easyebl.core import FieldCalibration
+    from easyebl.imaging.engine import EngineOptions, EngineState, ImagingEngine
+
+    cfg = replace(DAQConfig.usb6363())
+    mgr = DAQManager(NIDAQBackend(cfg)).open()
+    cal = FieldCalibration(100.0, cfg.ao_limit_v)
+    eng = ImagingEngine(mgr, cal, options=EngineOptions(latency_s=0.02))
+    try:
+        assert eng.rate == 2e6  # fastest clock of the 6363 with one video channel
+        eng.update(nx=32, ny=16, width_um=40, dwell_s=2e-6, ai_latency_samples=0.0)
+        eng.run()
+        f = eng.wait_frame(complete=True, timeout=10)
+        f = eng.wait_frame(f.seq, complete=True, timeout=10)
+        xs = (np.arange(32) + 0.5) * 40 / 32 - 20
+        np.testing.assert_allclose(f.image, np.tile(xs * cal.volts_per_um, (16, 1)), atol=1e-5)
+        eng.update(nx=20, center_um=(4.0, 0.0))
+        deadline = time.monotonic() + 10
+        while f.config.nx != 20:
+            f = eng.wait_frame(f.seq, complete=True, timeout=10)
+            assert time.monotonic() < deadline
+        f = eng.wait_frame(f.seq, complete=True, timeout=10)
+        xs = 4.0 + (np.arange(20) + 0.5) * 40 / 20 - 20
+        np.testing.assert_allclose(f.image, np.tile(xs * cal.volts_per_um, (f.config.ny, 1)), atol=1e-5)
+        st = eng.status()
+        assert st.streams == 1 and st.underruns == 0
+        eng.freeze()
+        deadline = time.monotonic() + 10
+        while eng.state != EngineState.FROZEN:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert mgr.beam_state.blank
+        w = fake.do_words
+        assert set(np.unique(w)) <= {0, 1 << 23}  # P0.23 only, active low
+    finally:
+        eng.close()
+        mgr.close()
+
+
 def test_external_control_wires_and_polarity(fake):
     """One HAL function drives several wires, each with its own polarity, in a single write."""
     cfg = DAQConfig.usb6363()
@@ -353,3 +396,37 @@ def test_open_with_missing_device_waits_for_it(fake):
 
 
 # ------------------------------------------------------------------ phantom on aux0 = AO2
+def test_phantom_stream_on_ao2_and_aux_static(fake):
+    """The phantom adds AO2 to the hardware-timed AO task; AI looped back from AO2 gives the chart."""
+    import time
+
+    from easyebl.core import FieldCalibration
+    from easyebl.imaging.engine import EngineOptions, ImagingEngine
+
+    cfg = DAQConfig.usb6363()
+    cfg.phantom_output = "aux0"
+    mgr = DAQManager(NIDAQBackend(cfg)).open()
+    cal = FieldCalibration(100.0, cfg.ao_limit_v)
+    fake.loopback_row = 2  # the wire AO2 -> AI0
+    eng = ImagingEngine(mgr, cal, options=EngineOptions(latency_s=0.02))
+    try:
+        assert eng.rate == pytest.approx(100e6 / 65)  # 3 AO channels on the 6363
+        eng.update(nx=64, ny=48, width_um=50, dwell_s=4e-6, ai_latency_samples=0.0, center_um=(5.0, -5.0))
+        eng.run()
+        f = eng.wait_frame(complete=True, timeout=10)
+        f = eng.wait_frame(f.seq, complete=True, timeout=10)
+        assert fake.stream_ao_channels == ["Dev1/ao0", "Dev1/ao1", "Dev1/ao2"]
+        expected = mgr.backend.phantom_source().expected_image(f.config, cal)
+        np.testing.assert_allclose(f.image, expected, atol=1e-6)
+        eng.stop()
+        assert eng.wait_idle(5)
+        t0 = time.monotonic()
+        while mgr.is_busy and time.monotonic() - t0 < 2:
+            time.sleep(0.01)
+        h = mgr.get_handle("aux")
+        h.set_aux_output("aux1", 1.5)  # static write on AO3
+        assert fake.static_aux[-1] == ("Dev1/ao3", 1.5)
+    finally:
+        eng.close()
+        mgr.close()
+    assert fake.static_aux[-1] == ("Dev1/ao3", 0.0)  # back to 0 V on close
