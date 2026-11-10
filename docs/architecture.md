@@ -102,11 +102,48 @@ scans and the correction.
 Filter and delay states persist across chunks, so splitting a stream into chunks does not change
 the result (this is tested).
 
-## 8. Not yet implemented
+## 8. Imaging engine (live SEM imaging)
+
+`easyebl/imaging/engine/` runs live imaging as **one continuous hardware stream** in its own thread:
+
+* `settings.py`: speed and resolution presets, and `EngineOptions` (rate, `latency_s`, averaging, AI range, recovery).
+* `source.py`: `FrameSource` precomputes per-direction line templates in volts. A line costs one vector add,
+  and the output is identical to `RasterPlan`.
+* `program.py`: `StreamProgram` is the generator the HAL pulls from. Because the HAL pulls only as the output buffer drains,
+  the program runs exactly `latency_s` ahead of the beam. At every line boundary it reads the engine's `Directive`.
+  A settings change cuts the frame and starts a new one, a freeze finishes the frame, and stop/restart ends the program.
+* `assembler.py`: each emitted frame is registered as a `FrameRecord`, giving its sample offset and layout. Because AI sample *k* shares a
+  clock edge with output sample *k*, the records map the AI stream back to rows even though settings change mid-stream.
+  Samples sit in a ring buffer that spans a few lines, so memory is bounded for any frame size or AI block size.
+* `frames.py`: the outputs. `FrameSlot` holds the latest frame (poll or wait, never queued) and `EventBus` gives each
+  subscriber a bounded queue.
+* `core.py`: `ImagingEngine`. Commands validate in the caller's thread and store the desired state under a lock.
+  The scan thread applies them, handles underflow by doubling the buffer and restarting, and reports busy-device and other errors as events.
+
+The NI backend supports `latency_s` per stream. The buffer is `latency_s × rate`, topped up in ⅛ pieces, and
+never written past its size before the clock starts. AI goes into one preallocated array. DAQmx underflow and overflow codes
+become `StreamUnderflowError` / `StreamOverflowError`, raised after the safe state has been restored.
+
+### Lost device
+
+`DeviceLostError` (HAL) means the device stopped answering. The NI backend maps DAQmx codes such as −201003 and
+−50405 to it. For any other driver failure, the manager asks `backend.probe()`, a one-sample AI read, whether the device
+is still there. The manager then:
+1. marks the device disconnected (beam state unknown) and aborts the active stream;
+2. refuses every operation immediately;
+3. starts `ReconnectWatchdog` (`hal/connection.py`).
+
+On the first successful probe, `backend.recover()` resets and reopens the device. `_bring_up()` then writes the safe state,
+selects internal scan, and re-applies external control and static lines for handles that still hold them.
+The engine waits in `DISCONNECTED` (`manager.wait_connected`) and resumes its mode.
+The simulator injects the fault with `unplug(after_samples=…, fail_delay_s=…)` and `replug()`.
+
+## 9. Not yet implemented
 
 * EDS (Amptek DP5) integration. Hooks exist: timed marker lines (`line_sync_marker`,
   `frame_sync_marker`) for hardware sequential buffering or list‑mode sync.
-* Hitachi RS‑232 remote control (magnification, focus, stage) and multi‑field writing with
-  stage moves and per‑field marks.
+* Hitachi RS‑232 remote control (magnification, focus, stigmation, stage). The SEM GUI already calls
+  the `MicroscopeControl` stubs in `imaging/sem/optics.py`.
+* Multi‑field writing with stage moves and per‑field marks.
 * A calibration‑grid workflow (distortion and centre shift per magnification step).
 * Proximity‑effect correction (use BEAMER and import the dose classes).
