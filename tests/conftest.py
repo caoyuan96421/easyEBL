@@ -51,3 +51,18 @@ def ground_truth(sim, image):
     cols, rows = np.meshgrid(np.arange(image.config.nx), np.arange(image.config.ny))
     xy = image.pixel_to_field(cols, rows)
     return sim.sample.intensity(xy[..., 0], xy[..., 1]) * sim.params.video_gain_v
+
+
+# ------------------------------------------------------------------ hardware test options
+def pytest_addoption(parser):
+    g = parser.getgroup("easyebl hardware")
+    g.addoption("--hw", default=None, metavar="DEVICE",
+                help="run hardware tests on this NI device (e.g. Dev1); skipped otherwise")
+    g.addoption("--hw-loopback", action="store_true",
+                help="AO0 is wired to AI0: also run the image-content loopback checks")
+    g.addoption("--hw-phantom", action="store_true",
+                help="AO2 (aux0) is wired to AI0: run the dummy-image (phantom) checks")
+    g.addoption("--hw-external", action="store_true",
+                help="also toggle the SEM internal/external scan switch (HAL external control)")
+    g.addoption("--hw-soak", type=float, default=30.0, metavar="S",
+                help="duration of the hardware soak / memory test in seconds (default 30)")

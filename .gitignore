@@ -9,3 +9,5 @@ dist/
 !tests/data/*.gds
 scripts/logs/
 scripts/hw_scan_test_*.txt
+scripts/delay_*.txt
+captures/
