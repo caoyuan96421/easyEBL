@@ -4,7 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 import json
 
-__all__ = ["DAQConfig", "AUX_OUTPUTS"]
+__all__ = ["DAQConfig", "AUX_OUTPUTS", "AI_TERMINALS"]
+
+#: AI input modes.  DIFF needs both AI+ and AI− wired: an unconnected AI− floats and
+#: drives the reading into the rail.  RSE measures AI+ against AI GND.
+AI_TERMINALS = ("DIFF", "RSE", "NRSE", "PSEUDO_DIFF")
 
 #: Logical auxiliary analog outputs every HAL configuration provides.  On a board
 #: without the matching AO channel they are dummies (accepted, no hardware effect).
@@ -63,7 +67,9 @@ class DAQConfig:
     static_lines_active_high: dict = field(default_factory=dict)
     ai_channels: dict = field(default_factory=lambda: {"video": "ai0"})
     ai_range_v: float = 10.0
-    ai_terminal: str = "DIFF"  # DIFF | RSE | NRSE | PSEUDO_DIFF
+    # RSE: AI+ against AI GND (one wire + common ground).  DIFF rejects ground loops but
+    # needs AI− wired too – an unconnected AI− floats and drifts into the rail.
+    ai_terminal: str = "RSE"  # RSE | DIFF | NRSE | PSEUDO_DIFF
     aux_outputs: dict = field(default_factory=lambda: {"aux0": None, "aux1": None})
     phantom_output: str | None = None
     phantom_noise_v: float = 0.0
@@ -124,6 +130,8 @@ class DAQConfig:
             raise ValueError("phantom_noise_v must be ≥ 0")
         if self.ao_rate_limits:
             self.ao_rate_limits = {int(k): float(v) for k, v in self.ao_rate_limits.items()}
+        if self.ai_terminal not in AI_TERMINALS:
+            raise ValueError(f"ai_terminal must be one of {list(AI_TERMINALS)}")
         if self.buffer_samples < 1000:
             raise ValueError("buffer_samples too small")
         if self.min_latency_samples < 1000:
@@ -143,7 +151,7 @@ class DAQConfig:
         * PFI6 + PFI7 = external-control (relay-enable) lines, both HIGH = the SEM
           takes X/Y from the DAQ.  They are the HAL's ``external control``
           function; they are written from software between streams.
-        * AI ``ai0`` = video, differential.
+        * AI ``ai0`` = video, single-ended (RSE) by default; DIFF needs AI0− wired.
         * ``aux0`` = AO2, ``aux1`` = AO3.  For a dummy-image test wire AO2 → AI0 and
           set ``phantom_output="aux0"``.
         """
@@ -158,7 +166,7 @@ class DAQConfig:
             external_control_lines={"PFI6": True, "PFI7": True},  # both HIGH = external scan
             static_lines={},
             ai_channels={"video": "ai0"},
-            ai_terminal="DIFF",
+            ai_terminal="RSE",  # switch to DIFF (Advanced… / --ai-terminal) when AI0− is wired
             aux_outputs={"aux0": "ao2", "aux1": "ao3"},
             max_ao_rate=2e6,  # 2 AO channels: 2.00 MS/s (2.86 MS/s is the 1-channel limit)
             ao_rate_limits={1: 2.857e6, 2: 2.0e6, 3: 1.54e6, 4: 1.25e6},

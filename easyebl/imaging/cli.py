@@ -184,6 +184,14 @@ class ImagingShell(cmd.Cmd):
         """airange <V> – AI input range ±V (restarts the stream)"""
         self.engine.set_options(ai_range_v=float(arg))
 
+    def do_aimode(self, arg):
+        """aimode [DIFF|RSE|NRSE|PSEUDO_DIFF] – video input mode (restarts scanning)"""
+        a = arg.strip()
+        if not a:
+            self.say(f"video input mode: {self.engine.handle.ai_terminal}")
+            return
+        self.say(f"video input mode {self.engine.set_ai_terminal(a)}")
+
     def do_set(self, arg):
         """set field=value … – any RasterConfig field, e.g. set flyback_s=60e-6 lag_comp_s=1e-6"""
         _, kw = _kv(shlex.split(arg))
@@ -267,6 +275,8 @@ class ImagingShell(cmd.Cmd):
             self.say(f"  last start → first sample: {s.start_latency_s * 1e3:.1f} ms")
         if s.last_error:
             self.say(f"  last error: {s.last_error}")
+        if s.saturation:
+            self.say(f"  video saturation: {s.saturation:.1%} of pixels at the input limit")
 
     def do_settings(self, arg):
         """settings – current scan settings"""

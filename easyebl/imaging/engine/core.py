@@ -63,7 +63,10 @@ from .program import CaptureRequest, Directive, StreamProgram
 from .settings import EngineOptions, ScanSpeed, speed_by_name
 from .source import FrameSource
 
-__all__ = ["ImagingEngine", "EngineStatus", "default_scan_config"]
+__all__ = ["ImagingEngine", "EngineStatus", "default_scan_config", "SATURATION_WARN"]
+
+#: Warn when more than this fraction of a frame's pixels sit at the video input limit.
+SATURATION_WARN = 0.02
 
 
 def _boost_thread_priority() -> None:
@@ -117,11 +120,14 @@ class EngineStatus:
     owner_busy: str | None = None
     connected: bool = True  # DAQ reachable
     disconnects: int = 0  # connection losses seen by the engine
+    saturation: float = 0.0  # fraction of pixels at the video input limit (last full frame)
 
     def summary(self) -> str:
         parts = [self.state.value, f"{self.rate / 1e6:g} MS/s", f"buf {self.latency_s * 1e3:.0f} ms"]
         if not self.connected:
             parts.append("DAQ DISCONNECTED")
+        if self.saturation > SATURATION_WARN:
+            parts.append(f"VIDEO SATURATED {self.saturation:.0%}")
         if self.fps_hw:
             parts.append(f"{self.fps_hw:.2f} fps")
         if self.margin_s is not None:
@@ -149,6 +155,8 @@ class _Run:
     last_hw_end: float | None = None
     fps_hw: float = 0.0
     pub_times: list = field(default_factory=list)
+    saturation: float = 0.0  # fraction of pixels at the AI range limit (last complete frame)
+    sat_warned: bool = False
     captures: dict = field(default_factory=dict)  # id -> (request, CaptureAccumulator)
 
 
@@ -330,6 +338,7 @@ class ImagingEngine:
             owner_busy=self.handle.manager.active_owner,
             connected=self.handle.manager.connected,
             disconnects=self._disconnects,
+            saturation=run.saturation if run else 0.0,
         )
 
     @property
@@ -549,19 +558,35 @@ class ImagingEngine:
             h.set_phantom(output, noise_v)
             self.events.emit("settings", f"phantom noise {h.phantom['noise_v']:g} V")
             return h.phantom
-        with self._lock:
-            self._check_open()
-            resume = self._mode == "live"
-        if self.is_scanning or self.state == EngineState.DISCONNECTED:
-            self.stop()
-            if not self.wait_idle(5.0):
-                raise RuntimeError("scanning did not stop – phantom not switched")
+        resume = self._pause_for_hardware_change("phantom")
         try:
             h.set_phantom(output, noise_v)
         except Exception:
             if resume:
                 self.run()
             raise
+        self._rederive_rate()
+        ph = h.phantom
+        state = (f"phantom on {ph['output']} ({ph['physical'] or 'dummy – no effect'})" if ph["output"]
+                 else "phantom off")
+        self.events.emit("settings", f"{state}; sample clock {self.rate / 1e6:.4g} MS/s", phantom=ph)
+        if resume:
+            self.run()
+        return ph
+
+    def _pause_for_hardware_change(self, what: str) -> bool:
+        """Stop scanning so the HAL may change the stream layout; True if live should resume."""
+        with self._lock:
+            self._check_open()
+            resume = self._mode == "live"
+        if self.is_scanning or self.state == EngineState.DISCONNECTED:
+            self.stop()
+            if not self.wait_idle(5.0):
+                raise RuntimeError(f"scanning did not stop – {what} not changed")
+        return resume
+
+    def _rederive_rate(self) -> None:
+        """The fastest clock depends on the stream layout: re-derive it after a HAL change."""
         with self._lock:
             n_ai = len(self._cfg.ai_channels)
             best = self.daq_config.max_scan_rate(n_ai)
@@ -571,13 +596,20 @@ class ImagingEngine:
             if rate != self._cfg.rate:
                 self._cfg = self._normalize(self._cfg.with_(rate=rate), self._cal)
                 self._gen += 1
-        ph = h.phantom
-        state = (f"phantom on {ph['output']} ({ph['physical'] or 'dummy – no effect'})" if ph["output"]
-                 else "phantom off")
-        self.events.emit("settings", f"{state}; sample clock {self.rate / 1e6:.4g} MS/s", phantom=ph)
-        if resume:
-            self.run()
-        return ph
+
+    def set_ai_terminal(self, mode: str) -> str:
+        """Video input mode (``"DIFF"``, ``"RSE"``, …).  Pauses scanning, switches, resumes."""
+        mode = str(mode).upper()
+        if mode == self.handle.ai_terminal:
+            return mode
+        resume = self._pause_for_hardware_change("AI input mode")
+        try:
+            self.handle.set_ai_terminal(mode)
+        finally:
+            if resume:
+                self.run()
+        self.events.emit("settings", f"video input mode {mode}", ai_terminal=mode)
+        return mode
 
     def capture(
         self,
@@ -861,6 +893,7 @@ class ImagingEngine:
                 run.fps_hw = inst if not run.fps_hw else 0.7 * run.fps_hw + 0.3 * inst
         run.last_hw_end = t_end
         f = self._publish(run, rec, complete=True)
+        self._check_saturation(run, f)
         run.pub_times.append(time.perf_counter())
         del run.pub_times[:-30]
         if rec.capture_id is not None and rec.capture_id in run.captures:
@@ -888,6 +921,27 @@ class ImagingEngine:
                 if not req.future.done():
                     req.future.set_result(photo)
                 self.events.emit("frame", "capture done", seq=photo.seq)
+
+    def _check_saturation(self, run: _Run, f: Frame) -> None:
+        """Pixels pinned at the AI range limit mean clipped video – usually wiring or range."""
+        rng = self._opts.ai_range_v or self.daq_config.ai_range_v
+        img = f.image
+        with np.errstate(invalid="ignore"):
+            frac = float(np.mean(np.abs(img) >= 0.98 * rng))
+        run.saturation = frac
+        if frac > SATURATION_WARN and not run.sat_warned:
+            run.sat_warned = True
+            mode = self.daq_config.ai_terminal
+            hint = (f"In {mode} mode both AI+ and AI− must be connected – an unconnected AI− floats and drifts "
+                    "into the rail. " if mode == "DIFF" else "")
+            self.events.emit(
+                "warning",
+                f"video input saturated: {frac:.0%} of pixels at the ±{rng:g} V limit. {hint}"
+                "Check the video wiring, or change the input mode / range (Advanced… → Hardware).",
+                saturation=frac,
+            )
+        elif frac < SATURATION_WARN / 4:
+            run.sat_warned = False
 
     def _publish(self, run: _Run, rec: FrameRecord, complete: bool) -> Frame:
         cfg = rec.source.cfg

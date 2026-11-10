@@ -1,6 +1,7 @@
 """Dummy-image test on the USB-6363: phantom test chart on AO2, looped back to AI0.
 
-Wiring: AO2 → AI0+ (and AO GND → AI0− for the differential video input).
+Wiring: AO2 → AI0+.  The default RSE input mode needs nothing else; with
+--ai-terminal DIFF also wire AO GND → AI0− (an open AI0− floats into the rail).
 The scan outputs (AO0/AO1) and the blanker run exactly as in live imaging;
 the SEM is not involved (external scan control stays OFF).
 
@@ -46,6 +47,8 @@ def main(argv=None) -> int:
     ap.add_argument("--output", default="aux0", choices=["aux0", "aux1"], help="aux output wired to AI0")
     ap.add_argument("--noise", type=float, default=0.0, help="synthetic white noise on the phantom (V rms)")
     ap.add_argument("--backend", default="nidaqmx", choices=["nidaqmx", "sim"])
+    ap.add_argument("--ai-terminal", dest="ai_terminal", default="RSE", choices=["RSE", "DIFF"],
+                    help="video input mode (default RSE)")
     args = ap.parse_args(argv)
 
     out_dir = Path(__file__).resolve().parent / "logs" / f"phantom_{_dt.datetime.now():%Y%m%d_%H%M%S}"
@@ -62,6 +65,7 @@ def main(argv=None) -> int:
     cfg = DAQConfig.usb6363(args.device)
     cfg.phantom_output = args.output
     cfg.phantom_noise_v = args.noise
+    cfg.ai_terminal = args.ai_terminal
     cfg.validate()
     if args.backend == "sim":
         from easyebl.hal import SimParams, SimulatedBackend

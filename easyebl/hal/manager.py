@@ -66,7 +66,7 @@ from .backend import (
     StreamResult,
     VoltageRangeError,
 )
-from .config import AUX_OUTPUTS
+from .config import AI_TERMINALS, AUX_OUTPUTS
 from .connection import ReconnectWatchdog
 
 __all__ = ["DAQManager", "DAQHandle", "BeamState", "EXTERNAL_CONTROL"]
@@ -582,6 +582,20 @@ class DAQManager:
         cfg = self.config
         return {"output": cfg.phantom_output, "physical": cfg.phantom_physical, "noise_v": cfg.phantom_noise_v}
 
+    def _set_ai_terminal(self, handle: "DAQHandle", mode: str) -> None:
+        mode = str(mode).upper()
+        if mode not in AI_TERMINALS:
+            raise HALError(f"unknown AI input mode '{mode}'; choose from {list(AI_TERMINALS)}")
+        if mode == self.config.ai_terminal:
+            return
+        if not self._op_lock.acquire(blocking=False):
+            raise DeviceBusyError(f"the AI input mode cannot change while a stream runs (owner '{self.active_owner}')")
+        try:
+            self.config.ai_terminal = mode  # used by every following stream (and the probe)
+        finally:
+            self._op_lock.release()
+        self._emit("ai_terminal", {"owner": handle.owner, "mode": mode})
+
     def _set_phantom(self, handle: "DAQHandle", output: str | None, noise_v: float | None) -> None:
         cfg = self.config
         if output is not None and output not in AUX_OUTPUTS:
@@ -842,6 +856,20 @@ class DAQHandle:
     def aux_outputs(self) -> dict:
         """{name: (physical AO channel or None if dummy, value in V)}."""
         return self._mgr.aux_state
+
+    # ------------------------------------------------------------ AI input mode
+    @property
+    def ai_terminal(self) -> str:
+        return self._mgr.config.ai_terminal
+
+    def set_ai_terminal(self, mode: str) -> None:
+        """Video input mode: ``"DIFF"`` (AI+ and AI− wired), ``"RSE"`` (AI+ vs AI GND), …
+
+        A property of the wiring, so it applies to every module's following
+        streams; refused while a stream runs.
+        """
+        self._check()
+        self._mgr._set_ai_terminal(self, mode)
 
     # ------------------------------------------------------------ phantom specimen
     @property

@@ -20,6 +20,9 @@ def add_hardware_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     p.add_argument("--rate", type=float, default=None, help="sample clock (S/s); default: device maximum")
     p.add_argument("--latency-ms", dest="latency_ms", type=float, default=100.0,
                    help="output buffer depth in ms (setting-change latency)")
+    p.add_argument("--ai-terminal", dest="ai_terminal", default=None,
+                   choices=["DIFF", "RSE", "NRSE", "PSEUDO_DIFF"],
+                   help="video input mode (default: the preset's; DIFF needs AI+ and AI- wired)")
     p.add_argument("--phantom", action="store_true",
                    help="dummy-image test: drive a test chart on an aux output (default aux0 = AO2); "
                         "wire it to the video input (AO2 -> AI0)")
@@ -40,6 +43,8 @@ def build_manager(args) -> tuple[DAQManager, FieldCalibration]:
         cfg = DAQConfig()
     if getattr(args, "device", None):
         cfg.device = args.device
+    if getattr(args, "ai_terminal", None):
+        cfg.ai_terminal = args.ai_terminal
     if getattr(args, "phantom", False):
         cfg.phantom_output = args.phantom_output
         cfg.phantom_noise_v = float(args.phantom_noise)

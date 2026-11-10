@@ -106,7 +106,7 @@ You can also start the GUI with `--console` to type commands next to it.
 **Dummy-image test (AO2 → AI0).** The HAL exposes AO2/AO3 as auxiliary outputs **`aux0`/`aux1`**
 (`handle.set_aux_output("aux1", 1.5)`). They are dummy channels on boards without them. With
 `phantom_output="aux0"` (`--phantom` on `run_sem.bat` / `run_sem_cli.bat`) every scan also drives a
-test chart on AO2, computed from the commanded beam position on the same sample clock. Wire AO2 → AI0 (AO GND → AI0−),
+test chart on AO2, computed from the commanded beam position on the same sample clock. Wire AO2 → AI0+ (the default RSE input mode needs nothing else; in DIFF mode also wire AO GND → AI0−),
 and the live image shows the chart. Zoom and beam shift move across it, and `--phantom-noise 0.2` adds white noise so
 averaging versus scan speed becomes visible. `run_phantom_test.bat` measures fidelity, registration (AI
 latency), field of view, beam shift and noise versus dwell against the expected image, and saves a report and PNGs.
@@ -209,7 +209,7 @@ alignment of AO/DO/AI, the clock routing, the start order, blanker polarity, the
 ## Hardware notes
 
 * Default `DAQConfig`: `ao0/ao1` = X/Y (±10 V), `port0/line0` = blanker (active high), AI `ai0`
-  = video (differential), `port1/line0` = external control. Save a config with
+  = video (single-ended RSE; switch to DIFF in Advanced… or with `--ai-terminal DIFF` when AI0− is wired), `port1/line0` = external control. Save a config with
   `DAQConfig(...).to_json()` and pass it with `--config`.
 * **External control** (SEM internal/external scan) is a HAL function. Applications call
   `handle.set_external_control(True/False)` and never see the wires. The wires and their polarity are set

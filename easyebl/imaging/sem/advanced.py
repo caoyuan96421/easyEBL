@@ -83,6 +83,15 @@ class AdvancedDialog(QtWidgets.QDialog):
         self.ai_range.setToolTip("Video input range: the smallest range that contains the signal uses the "
                                  "full 16-bit resolution.")
         f.addRow("Video input range", self.ai_range)
+        self.ai_mode = QtWidgets.QComboBox()
+        for mode, text in (("RSE", "RSE – single-ended, AI+ vs AI GND (default)"),
+                           ("DIFF", "DIFF – differential, AI+ and AI− both wired")):
+            self.ai_mode.addItem(text, mode)
+        if self.engine.handle.ai_terminal not in ("RSE", "DIFF"):  # set from config / console
+            self.ai_mode.addItem(self.engine.handle.ai_terminal, self.engine.handle.ai_terminal)
+        self.ai_mode.setToolTip("How the video input is wired. In DIFF mode an unconnected AI− floats and drives "
+                                "the reading into the ±range rail (saturated image). Applying restarts scanning.")
+        f.addRow("Video input mode", self.ai_mode)
         self.chunk = _dspin(0.5, 100, 1, " ms", 0.5)
         self.chunk.setToolTip("Lines are grouped into output blocks of about this length.")
         f.addRow("Output block", self.chunk)
@@ -95,8 +104,7 @@ class AdvancedDialog(QtWidgets.QDialog):
         f.addRow(self.recover)
         info = QtWidgets.QLabel(
             f"Device {dc.device}: AO ≤ {dc.max_ao_rate / 1e6:g} MS/s, AI ≤ {dc.max_ai_rate(1) / 1e6:g} MS/s "
-            f"(1 ch), blanker {dc.blank_line} (active {'high' if dc.blank_active_high else 'low'}), "
-            f"AI terminal {dc.ai_terminal}."
+            f"(1 ch), blanker {dc.blank_line} (active {'high' if dc.blank_active_high else 'low'})."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color:#9aa")
@@ -128,7 +136,8 @@ class AdvancedDialog(QtWidgets.QDialog):
         f.addRow("Synthetic noise", self.ph_noise)
         video = dc.ai_channels.get("video", "ai0")
         note = QtWidgets.QLabel(
-            f"Wire the chosen output to the video input ({video}{'+, AO GND → ' + video + '−' if dc.ai_terminal == 'DIFF' else ''}). "
+            f"Wire the chosen output to the video input ({video}+). In DIFF input mode also wire "
+            f"AO GND → {video}− (an open {video}− drifts into the rail); RSE needs only the one wire. "
             "Switching on/off briefly restarts scanning: the extra AO channel lowers the fastest clock "
             f"(here {dc.max_ao_rate_for(2) / 1e6:g} → {dc.max_ao_rate_for(3) / 1e6:g} MS/s). "
             "The chart is fixed to the DAQ field: zoom and beam shift move across it."
@@ -233,6 +242,7 @@ class AdvancedDialog(QtWidgets.QDialog):
         self.ph_noise.setValue(ph["noise_v"])
         self.latency.setValue(o.latency_s * 1e3)
         self.ai_range.setCurrentIndex(max(0, self.ai_range.findData(o.ai_range_v)))
+        self.ai_mode.setCurrentIndex(max(0, self.ai_mode.findData(e.handle.ai_terminal)))
         self.chunk.setValue(o.chunk_s * 1e3)
         self.publish.setValue(o.publish_hz)
         self.restart.setChecked(o.restart_on_change)
@@ -269,6 +279,8 @@ class AdvancedDialog(QtWidgets.QDialog):
                                        self.inv_x.isChecked(), self.inv_y.isChecked(), cal.name)
             if new_cal != cal:
                 e.set_calibration(new_cal)
+            if self.ai_mode.currentData() != e.handle.ai_terminal:
+                e.set_ai_terminal(self.ai_mode.currentData())
             # phantom first: it changes the AO channel count and with it the fastest clock
             want = self.ph_out.currentData() if self.ph_on.isChecked() else None
             ph = e.handle.phantom

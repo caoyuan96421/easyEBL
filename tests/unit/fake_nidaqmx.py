@@ -111,6 +111,8 @@ class _Chans:
 
     def add_ai_voltage_chan(self, phys, terminal_config=None, min_val=-10, max_val=10):
         self.task.channels.append(("ai", phys))
+        self.task.ai_terminal = terminal_config
+        self.task.ai_range = (min_val, max_val)
 
 
 class _Timing:

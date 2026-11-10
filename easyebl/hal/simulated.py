@@ -199,6 +199,12 @@ class SimParams:
     dose_extent_um: float = 110.0
     dose_pixel_um: float = 0.1
     realtime: bool = False  # sleep to emulate the real duration
+    # wiring fault: AI− unconnected while the input is DIFF.  The negative input floats
+    # and the reading drifts into the rail (offset → ai_minus_float_v with time
+    # constant ai_minus_float_tau_s from each stream start, as measured on a USB-6363)
+    ai_minus_floating: bool = False
+    ai_minus_float_v: float = -11.0
+    ai_minus_float_tau_s: float = 0.7
     seed: int | None = 0
 
 
@@ -242,6 +248,7 @@ class SimulatedBackend(DAQBackend):
         self._rng = np.random.default_rng(self.params.seed)
         self._lock = threading.Lock()
         self.present = True
+        self._stream_pos = 0
         self.fail_delay_s = 0.0
         self._unplug_at: int | None = None
         self.unplug_count = 0
@@ -395,9 +402,9 @@ class SimulatedBackend(DAQBackend):
                     vh = np.concatenate([np.zeros(n + d_v - len(vh)), vh])
                 sig = vh[len(vh) - n - d_v : len(vh) - d_v]
                 self._video_hist = vh[-d_v:]
-            out = np.repeat(sig[None, :], n_ai, axis=0)
+            out = np.repeat(sig[None, :], n_ai, axis=0) + self._float_offset(n, rate)[None, :]
             lim = self.config.ai_range_v if ai_range_v is None else ai_range_v
-            return np.clip(out, -lim, lim)
+            return np.clip(out, -lim * 1.0575, lim * 1.0575)  # X-series over-range limit
         sig = self.sample.intensity(pos[:, 0], pos[:, 1]) * p.video_gain_v
         sig = np.where(blank_eff, 0.0, sig)
         if p.video_tau_s > 0:
@@ -415,8 +422,17 @@ class SimulatedBackend(DAQBackend):
         for i in range(n_ai):
             s = sig if i == 0 else (p.video_gain_v * 0.5 - 0.5 * sig)
             out[i] = s + p.video_offset_v + self._rng.normal(0.0, p.noise_sigma, n)
+        out = out + self._float_offset(n, rate)[None, :]
         lim = self.config.ai_range_v if ai_range_v is None else ai_range_v
         return np.clip(out, -lim, lim)
+
+    def _float_offset(self, n: int, rate: float) -> np.ndarray:
+        """Offset of a floating AI− (DIFF mode only); zero when wired correctly."""
+        p = self.params
+        if not (p.ai_minus_floating and self.config.ai_terminal == "DIFF"):
+            return np.zeros(n)
+        t = (self._stream_pos + np.arange(n)) / rate
+        return p.ai_minus_float_v * (1.0 - 0.04 * np.exp(-t / p.ai_minus_float_tau_s))
 
     def run_stream(
         self,
@@ -440,6 +456,7 @@ class SimulatedBackend(DAQBackend):
         mon.buffer_samples = int((latency_s or 0.0) * rate)
         mon.running, mon.t_start, mon.t_update = True, t0, t0
         self._require_present("run_stream")
+        self._stream_pos = 0
         with self._lock:
             self._deposit_static()
             try:
@@ -455,6 +472,7 @@ class SimulatedBackend(DAQBackend):
                     if self.record:
                         self.recorded.append(c)
                     ai = self._process(c, rate, n_ai, ai_range_v)
+                    self._stream_pos += len(c)
                     written += len(c)
                     mon.written = mon.generated = mon.ai_read = written
                     mon.writes += 1

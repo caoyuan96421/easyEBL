@@ -176,3 +176,33 @@ def test_set_phantom_at_runtime():
     with pytest.raises(HALError):
         h.set_phantom("ao2")
     m.close()
+
+
+def test_ai_terminal_setting():
+    from easyebl.hal import AI_TERMINALS
+
+    assert "RSE" in AI_TERMINALS
+    with pytest.raises(ValueError):
+        DAQConfig(ai_terminal="SE").validate()
+    m = _mgr()
+    h = m.get_handle("x")
+    started, release = threading.Event(), threading.Event()
+
+    def chunks():
+        started.set()
+        while not release.is_set():
+            yield OutputChunk.constant(1000, 0, 0, True)
+
+    assert m.config.ai_terminal == "RSE"  # default: single-ended, no AI0− needed
+    t = threading.Thread(target=lambda: m.get_handle("s").run_stream(500e3, chunks()), daemon=True)
+    t.start()
+    try:
+        assert started.wait(2)
+        with pytest.raises(DeviceBusyError):
+            h.set_ai_terminal("DIFF")  # wiring setting: never under a running stream
+    finally:
+        release.set()
+        t.join(5)
+    h.set_ai_terminal("DIFF")
+    assert m.config.ai_terminal == "DIFF"
+    m.close()

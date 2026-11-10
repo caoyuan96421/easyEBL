@@ -160,3 +160,34 @@ def test_advanced_dialog_switches_phantom(qtbot, tmp_path):
     finally:
         w.close()
         mgr.close()
+
+
+def test_saturation_shown_and_input_mode_fix(qtbot):
+    from easyebl.imaging.sem.window import SEMWindow
+
+    cfg = DAQConfig.usb6363()
+    cfg.phantom_output = "aux0"
+    cfg.ai_terminal = "DIFF"  # the faulty setup: DIFF with AI0− unconnected
+    be = SimulatedBackend(cfg, SimParams(realtime=True, v_full_scale=5.0, ai_minus_floating=True))
+    mgr = DAQManager(be).open()
+    eng = ImagingEngine(mgr, FieldCalibration(100, 5.0), options=EngineOptions(rate=500e3))
+    eng.update(nx=128, ny=96, width_um=60.0, dwell_s=4e-6)
+    w = SEMWindow(eng, simulated=True)
+    qtbot.addWidget(w)
+    try:
+        w.scan.b_run.click()
+        qtbot.waitUntil(lambda: "VIDEO SATURATED" in w.l_buf.text(), timeout=10000)
+        assert "saturated" in w.log.toPlainText() and "AI−" in w.log.toPlainText()
+        w.open_advanced()
+        d = w._adv
+        assert d.ai_mode.currentData() == "DIFF"
+        d.ai_mode.setCurrentIndex(d.ai_mode.findData("RSE"))
+        d.apply()
+        assert "Applied" in d.msg.text(), d.msg.text()
+        assert eng.handle.ai_terminal == "RSE"
+        qtbot.waitUntil(lambda: eng.state == EngineState.LIVE, timeout=10000)
+        qtbot.waitUntil(lambda: "VIDEO SATURATED" not in w.l_buf.text(), timeout=10000)
+        d.close()
+    finally:
+        w.close()
+        mgr.close()

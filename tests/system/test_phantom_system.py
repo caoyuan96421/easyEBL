@@ -102,6 +102,7 @@ def test_noise_averages_with_dwell(phantom_engine):
 def test_phantom_on_dummy_output_does_nothing():
     cfg = DAQConfig()  # two-AO board: aux0 is a dummy
     cfg.phantom_output = "aux0"
+    cfg.ai_terminal = "DIFF"  # the faulty setup: DIFF with AI0− unconnected
     be = SimulatedBackend(cfg, SimParams())
     assert be.phantom_source() is None and cfg.stream_ao_channels == 2
 
@@ -128,6 +129,34 @@ def test_engine_switches_phantom_on_and_off():
         eng.set_phantom(None)
         assert eng.rate == 2e6 and be.phantom_source() is None
         assert frame(eng, 2) is not None and eng.state.value == "live"
+    finally:
+        eng.close()
+        mgr.close()
+
+
+def test_floating_ai_minus_is_detected_and_rse_fixes_it():
+    """Reproduces the bench fault: phantom loop on AI0+, AI0− unconnected, input in DIFF mode."""
+    cfg = DAQConfig.usb6363()
+    cfg.phantom_output = "aux0"
+    cfg.ai_terminal = "DIFF"  # the faulty setup: DIFF with AI0− unconnected
+    be = SimulatedBackend(cfg, SimParams(noise_sigma=0.0, v_full_scale=5.0, ai_minus_floating=True))
+    mgr = DAQManager(be).open()
+    eng = ImagingEngine(mgr, CAL, options=EngineOptions(rate=1e6, latency_s=0.05))
+    sub = eng.subscribe()
+    try:
+        eng.update(nx=128, ny=96, width_um=60.0, dwell_s=2e-6)
+        eng.run()
+        f = frame(eng, 4)
+        assert eng.status().saturation > 0.5  # most pixels pinned at the −10 V rail
+        warn = [e for e in sub.drain() if e.kind == "warning" and "saturated" in e.message]
+        assert len(warn) == 1 and "AI−" in warn[0].message  # one warning, with the wiring hint
+        assert "VIDEO SATURATED" in eng.status().summary()
+        eng.set_ai_terminal("RSE")  # AI+ against AI GND: the floating AI− no longer matters
+        assert eng.handle.ai_terminal == "RSE"
+        f = frame(eng, 3)
+        assert eng.state.value == "live"
+        np.testing.assert_allclose(f.image, be.phantom_source().expected_image(f.config, CAL), atol=1e-5)
+        assert eng.status().saturation == 0.0
     finally:
         eng.close()
         mgr.close()

@@ -6,7 +6,7 @@ import time
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..engine import EngineState, ImagingEngine
+from ..engine import SATURATION_WARN, EngineState, ImagingEngine
 from ..export import auto_levels, save_frame
 from .advanced import AdvancedDialog, SaveSettings
 from .display import ContrastBrightness, format_length
@@ -287,6 +287,8 @@ class SEMWindow(QtWidgets.QMainWindow):
         stall = " <b style='color:#f55'>STALLED</b>" if s.stalled else ""
         if not s.connected:
             stall += " <b style='color:#f55'>DAQ DISCONNECTED – reconnecting…</b>"
+        if s.saturation > SATURATION_WARN:
+            stall += f" <b style='color:#f55'>VIDEO SATURATED {s.saturation:.0%}</b>"
         if self._relay is not None or self.cb_ext.isChecked():
             ext = self.engine.handle.manager.external_control
             if bool(ext) != self.cb_ext.isChecked() and ext is not None:

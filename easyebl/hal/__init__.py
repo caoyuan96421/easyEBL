@@ -21,7 +21,7 @@ from .backend import (
     StreamUnderflowError,
     VoltageRangeError,
 )
-from .config import DAQConfig
+from .config import AI_TERMINALS, AUX_OUTPUTS, DAQConfig
 from .manager import EXTERNAL_CONTROL, BeamState, DAQHandle, DAQManager
 from .simulated import (
     DoseMap,
@@ -47,6 +47,8 @@ __all__ = [
     "StreamUnderflowError",
     "VoltageRangeError",
     "DAQConfig",
+    "AI_TERMINALS",
+    "AUX_OUTPUTS",
     "BeamState",
     "EXTERNAL_CONTROL",
     "DAQHandle",

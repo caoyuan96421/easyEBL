@@ -430,3 +430,19 @@ def test_phantom_stream_on_ao2_and_aux_static(fake):
         eng.close()
         mgr.close()
     assert fake.static_aux[-1] == ("Dev1/ao3", 0.0)  # back to 0 V on close
+
+
+def test_ai_terminal_mode_reaches_the_driver(fake):
+    mgr = DAQManager(NIDAQBackend(DAQConfig.usb6363())).open()
+    h = mgr.get_handle("t")
+    run = lambda: h.run_stream(500e3, [OutputChunk.constant(2000, 0, 0, True)], ai_channels=["video"])
+    ai_task = lambda: [t for t in fake.tasks if t.name == "easyebl_ai"][-1]
+    run()
+    assert ai_task().ai_terminal.name == "RSE"  # default
+    h.set_ai_terminal("diff")
+    assert h.ai_terminal == "DIFF" and mgr.config.ai_terminal == "DIFF"
+    run()
+    assert ai_task().ai_terminal.name == "DIFF"
+    with pytest.raises(HALError):
+        h.set_ai_terminal("single")
+    mgr.close()
