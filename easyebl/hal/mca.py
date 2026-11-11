@@ -84,14 +84,15 @@ class MCAReading:
 
     @property
     def dead_fraction(self) -> float:
-        return 1.0 - self.slow_count / self.fast_count if self.fast_count > 0 else 0.0
+        return max(0.0, 1.0 - self.slow_count / self.fast_count) if self.fast_count > 0 else 0.0
 
     @property
     def live_time(self) -> float:
-        """Real time × OCR/ICR: the time an ideal (dead-time-free) counter would need."""
+        """Real time × OCR/ICR (≤ real time: a fast channel that misses pulses – ICR < OCR, e.g. a
+        fast threshold set too high – must not make the live time longer than the real time)."""
         if self.fast_count <= 0:
             return self.real_time
-        return self.real_time * self.slow_count / self.fast_count
+        return self.real_time * min(1.0, self.slow_count / self.fast_count)
 
     @property
     def total(self) -> int:

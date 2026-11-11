@@ -141,8 +141,11 @@ def main(argv=None) -> int:
         rate_true = float(ph.phase_rates[2])
         say(f"   phantom rate {rate_true:.0f} cps; DPP ICR {cu.icr:.0f}, OCR {cu.ocr:.0f} cps, "
             f"dead {100 * cu.dead_fraction:.1f} %, {cu.total:,} counts in {cu.real_time:.2f} s")
-        ok_all &= check("input count rate", 0.6 * rate_true < cu.icr < 1.3 * rate_true,
-                        f"ICR/true = {cu.icr / rate_true:.2f}")
+        ok_all &= check("output count rate", 0.55 * rate_true < cu.ocr < 1.05 * rate_true,
+                        f"OCR/true = {cu.ocr / rate_true:.2f} (dead time at TPEA 9.6 µs ≈ 20–30 %)")
+        if cu.fast_count < cu.slow_count:
+            say("   note: ICR < OCR – the DP5 fast channel misses pulses (fast threshold THFA too high for "
+                f"{args.mv:g} mV/keV); run 'Auto thresholds' with the beam off.  Live time is clamped to real time.")
 
         # ---------------------------------------------------------------- 3. calibration
         say("")

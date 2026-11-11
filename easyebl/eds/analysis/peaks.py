@@ -186,6 +186,7 @@ def identify_elements(spectrum: Spectrum, min_significance: float = 5.0, detecto
         if not found:
             break
         fit = fit_spectrum(spectrum, list(found), e_range=(e_min_kev, None), detector=det, background=bg)
+        det = fit.extras.get("detector", det)  # the resolution refined on this spectrum
         rp = residual_peaks(y, fit.model, cal, det, z_min=max(6.0, min_significance + 1.0) * max(1.0, np.sqrt(fit.chi2_reduced)),
                             e_min_kev=e_min_kev, e_max_kev=kv)
         if not rp:

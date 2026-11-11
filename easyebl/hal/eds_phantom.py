@@ -204,13 +204,14 @@ class EDSPhantomSpecimen(PhantomSpecimen):
     ``beam_kv``      beam voltage of the X-ray model
     ``mv_per_kev``   SDD step height (6 mV/keV suits the DP5 on the NI simulator)
     ``leak_v_per_s``, ``noise_mv``, ``rise_s``  preamp details
+    ``fano``         Fano factor of the step heights on the SDD output (0 = ideal steps)
     ``n``            label map size
     """
 
     def __init__(self, extent_v: float = 5.0, noise_v: float = 0.0, cps: float = 20e3, beam_kv: float = 20.0,
                  mv_per_kev: float = 6.0, leak_v_per_s: float = 100.0, noise_mv: float = 0.2,
                  rise_s: float = 0.5e-6, n: int = 1024, phases=None, labels: np.ndarray | None = None,
-                 seed: int | None = 0, takeoff_deg: float = 35.0, **_ignored):
+                 seed: int | None = 0, takeoff_deg: float = 35.0, fano: float = 0.115, **_ignored):
         self.labels = np.ascontiguousarray(_default_labels(n) if labels is None else labels, dtype=np.uint8)
         self.phases = tuple(phases) if phases is not None else default_phases()
         if int(self.labels.max()) >= len(self.phases):
@@ -223,6 +224,7 @@ class EDSPhantomSpecimen(PhantomSpecimen):
         self.preamp = ResetPreamp(mv_per_kev=mv_per_kev, leak_v_per_s=leak_v_per_s, noise_mv=noise_mv,
                                   rise_s=rise_s, seed=None if seed is None else seed + 1)
         self._rng_x = np.random.default_rng(None if seed is None else seed + 2)
+        self.fano = float(fano)
         self._build_emission()
         self._listeners: list = []
         self._llock = threading.Lock()
@@ -362,4 +364,9 @@ class EDSPhantomSpecimen(PhantomSpecimen):
     def sdd_output(self, x_v: np.ndarray, y_v: np.ndarray, blank: np.ndarray, fs: float) -> np.ndarray:
         """Per-sample SDD preamp output (V) for one chunk (what goes to the SDD aux output)."""
         idx, e = self.photons(x_v, y_v, blank, fs)
+        if self.fano > 0 and e.size:
+            # charge statistics in the silicon: the step height (collected charge) fluctuates
+            # with the Fano factor, as on a real SDD.  (Photon listeners get the true energy –
+            # the simulated pulse processor applies the Fano + noise resolution itself.)
+            e = e + self._rng_x.normal(0.0, 1.0, e.size) * np.sqrt(self.fano * 3.85e-3 * e)
         return self.preamp.waveform(len(x_v), fs, idx, e)

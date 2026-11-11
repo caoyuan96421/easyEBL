@@ -108,7 +108,7 @@ class Spectrum:
 
     @property
     def dead_fraction(self) -> float:
-        return 1.0 - self.slow_count / self.fast_count if self.fast_count > 0 else 0.0
+        return max(0.0, 1.0 - self.slow_count / self.fast_count) if self.fast_count > 0 else 0.0
 
     def counts_in(self, e_lo: float, e_hi: float) -> int:
         k0 = int(np.ceil(self.calibration.channel(e_lo) - 0.5))

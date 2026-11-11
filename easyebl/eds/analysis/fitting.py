@@ -152,27 +152,39 @@ def fit_spectrum(spectrum: Spectrum, elements, e_range=(0.2, None), detector: ge
     bg = snip_background(y, cal, fwhm_kev=det.fwhm_kev) if background is None else np.asarray(background, float)
     background = bg
     if refine:
-        best = None
-        for ws in (0.94, 0.97, 1.0, 1.03, 1.06, 1.1):
-            r = fit_spectrum(spectrum, elements, e_range, detector, background, families, pileup, refine=False,
-                             _ws=ws, _shift=0.0)
-            if best is None or r.chi2_reduced < best[0].chi2_reduced:
-                best = (r, ws)
-        ws0 = best[1]
-        for ws in (ws0 - 0.01, ws0 + 0.01):
-            r = fit_spectrum(spectrum, elements, e_range, detector, background, families, pileup, refine=False,
-                             _ws=ws, _shift=0.0)
+        # the detector resolution (electronic noise ⊕ Fano) and a small calibration shift are
+        # refined against the spectrum: a wrong FWHM leaves flank residuals that look like peaks
+        from dataclasses import replace as _replace
+
+        def run(d, sh):
+            return fit_spectrum(spectrum, elements, e_range, d, background, families, pileup, refine=False,
+                                _ws=1.0, _shift=sh)
+
+        best = (run(det, 0.0), det)
+        f0 = det.fwhm_mn_ev
+        for fw in (0.85, 0.92, 1.0, 1.08, 1.16, 1.25):
+            for fano in (0.06, 0.115, 0.17):
+                d = _replace(det, fwhm_mn_ev=f0 * fw, fano=fano)
+                if d == det:
+                    continue
+                r = run(d, 0.0)
+                if r.chi2_reduced < best[0].chi2_reduced:
+                    best = (r, d)
+        d0 = best[1]
+        for fw in (0.97, 1.03):  # polish
+            d = _replace(d0, fwhm_mn_ev=d0.fwhm_mn_ev * fw)
+            r = run(d, 0.0)
             if r.chi2_reduced < best[0].chi2_reduced:
-                best = (r, ws)
-        ws0 = best[1]
+                best = (r, d)
+        d0 = best[1]
         sh0 = 0.0
         for sh in (-0.012, -0.008, -0.004, 0.004, 0.008, 0.012):
-            r = fit_spectrum(spectrum, elements, e_range, detector, background, families, pileup, refine=False,
-                             _ws=ws0, _shift=sh)
+            r = run(d0, sh)
             if r.chi2_reduced < best[0].chi2_reduced:
-                best, sh0 = (r, ws0), sh
+                best, sh0 = (r, d0), sh
         res = best[0]
-        res.extras.update(width_scale=ws0, shift_ev=sh0 * 1e3)
+        res.extras.update(detector=d0, fwhm_mn_ev=d0.fwhm_mn_ev, fano=d0.fano, shift_ev=sh0 * 1e3,
+                          width_scale=d0.fwhm_mn_ev / f0)
         return res
     fams = families or _families_for(elements, spectrum.beam_kv, e_lo)
     refs = []
