@@ -203,12 +203,44 @@ def auto_assign(spectrum: Spectrum, lines: list[tuple[str, float]], tolerance_ke
             out.append((lab, en, peaks[best[1]]))
     if len(out) >= min(2, len(lines)):
         return out
-    k = len(lines)
-    strongest = sorted(peaks[:max(k, 1)], key=lambda p: p.channel)
-    exp = sorted(lines, key=lambda t: t[1])
-    if len(strongest) < k:
+    return _pattern_assign(peaks, lines, spectrum.calibration)
+
+
+def _pattern_assign(peaks: list, lines: list, cal: EnergyCalibration) -> list:
+    """Assignment for a badly calibrated MCA: try every (line, peak) pair as an anchor of a
+    gain (offset ≈ 0, then refined with a second pair) and keep the hypothesis under which the
+    most expected lines – weighted by peak significance – land on found peaks."""
+    if len(peaks) == 0 or len(lines) == 0:
         return []
-    return [(lab, en, p) for (lab, en), p in zip(exp, strongest)]
+    exp = sorted(lines, key=lambda t: t[1])
+    best = (0.0, [])
+    cand = peaks[:12]
+    for a_lab, a_e in exp:
+        for pa in cand:
+            for b_lab, b_e in exp:
+                if b_e <= a_e:
+                    continue
+                for pb in cand:
+                    if pb.channel <= pa.channel:
+                        continue
+                    g = (b_e - a_e) / (pb.channel - pa.channel)
+                    off = a_e - g * pa.channel
+                    if not (0.2 * cal.gain_kev < g < 5 * cal.gain_kev) or abs(off) > 0.3:
+                        continue
+                    used, pairs, score = set(), [], 0.0
+                    for lab, e in exp:
+                        k = (e - off) / g
+                        tol = max(2.5, 0.06 / g)  # channels: ±60 eV or 2.5 ch
+                        near = [(abs(p.channel - k), n) for n, p in enumerate(cand)
+                                if n not in used and abs(p.channel - k) < tol]
+                        if near:
+                            n = min(near)[1]
+                            used.add(n)
+                            pairs.append((lab, e, cand[n]))
+                            score += np.log1p(cand[n].significance)
+                    if len(pairs) >= 2 and score > best[0]:
+                        best = (score, pairs)
+    return best[1]
 
 
 def fit_resolution(fit_points: list[tuple[float, float]]) -> tuple[float, float]:

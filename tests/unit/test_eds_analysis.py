@@ -162,3 +162,15 @@ def test_autoid_on_real_dp5_spectra(name):
     found = {i.element for i in A.identify_elements(sp, detector=Detector(fwhm_mn_ev=156))}
     truth = _DP5[name]
     assert found <= truth and truth - found <= {"Mn"}  # Mn (2 wt%) under Cr Kβ is optional
+
+
+def test_calibration_assignment_ignores_a_strong_spurious_peak():
+    """A large artefact peak at low energy (seen once on the DP5) must not be taken for Cu L."""
+    from pathlib import Path
+
+    sp = load_spectrum(Path(__file__).resolve().parents[1] / "data" / "dp5_phantom" / "3_cu_calibrated.msa")
+    k = np.arange(sp.n_channels)
+    c = sp.counts + 31000 * np.exp(-0.5 * ((k - 56.5) / 4) ** 2) / (4 * np.sqrt(2 * np.pi))
+    bad = Spectrum(np.random.default_rng(0).poisson(c), EnergyCalibration(0.0, 0.01), beam_kv=20.0)
+    pairs = A.auto_assign(bad, A.standard_lines("Cu (L + Kα)"))
+    assert [(lab, round(p.channel)) for lab, _, p in pairs] == [("Cu La1", 99), ("Cu Ka1", 849)]
