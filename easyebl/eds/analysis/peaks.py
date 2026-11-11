@@ -82,7 +82,7 @@ def residual_peaks(counts: np.ndarray, model: np.ndarray, cal, det: gen.Detector
 
 def identify_elements(spectrum: Spectrum, min_significance: float = 5.0, detector: gen.Detector | None = None,
                       allowed=None, exclude=(), always=(), max_elements: int = 15,
-                      e_min_kev: float = 0.25, passes: int = 3, min_fit_significance: float = 8.0
+                      e_min_kev: float = 0.25, passes: int = 3, min_fit_significance: float = 12.0
                       ) -> list[Identification]:
     """Elements present in *spectrum* (strongest first)."""
     det = detector or gen.Detector()
@@ -148,7 +148,9 @@ def identify_elements(spectrum: Spectrum, min_significance: float = 5.0, detecto
             # artefacts of strong peaks: Si escape (E − 1.74 keV) and sum peaks (E₁ + E₂)
             if any(abs(e2 - SI_KA - e_peak) < t and a2 > 15 * p.area for e2, a2 in strong):
                 continue
-            if any(abs(e1 + e2 - e_peak) < t and p.area < 0.05 * min(a1, a2)
+            # (sum peaks may sit up to ~0.25 keV below E1 + E2: incomplete pile-up in the shaper)
+            if any((-0.25 if min(e1, e2) > 1.0 else 0.0) - t < e_peak - (e1 + e2) < t
+                   and p.area < 0.08 * min(a1, a2)
                    for k1, (e1, a1) in enumerate(strong) for e2, a2 in strong[k1:]):
                 continue
             # the flank of a much stronger peak (a slightly wrong width leaves a residual there)

@@ -143,3 +143,20 @@ def test_msa_roundtrip_and_foreign_header(tmp_path, steel):
     s3 = Spectrum.from_msa(txt)
     assert list(s3.counts) == [5, 7, 9] and s3.calibration.gain_kev == pytest.approx(0.01)
     assert s3.calibration.offset_kev == pytest.approx(-0.02)
+
+
+# real DP5 spectra of the EDS phantom (USB-6363 AO3 → DP5, 2026-11-11, scripts/hw_eds_test.py)
+_DP5 = {"3_cu_calibrated.msa": {"Cu"}, "4_0_Si_substrate.msa": {"Si"}, "4_1_Al_pad.msa": {"Al"},
+        "4_2_Cu_grid.msa": {"Cu"}, "4_3_stainless.msa": {"Fe", "Cr", "Ni"}, "4_4_TiO2.msa": {"Ti", "O"},
+        "4_5_NaCl.msa": {"Na", "Cl"}, "4_6_Au.msa": {"Au"}}
+
+
+@pytest.mark.parametrize("name", sorted(_DP5))
+def test_autoid_on_real_dp5_spectra(name):
+    from pathlib import Path
+
+    from easyebl.xray.generation import Detector
+
+    sp = load_spectrum(Path(__file__).resolve().parents[1] / "data" / "dp5_phantom" / name)
+    found = {i.element for i in A.identify_elements(sp, detector=Detector(fwhm_mn_ev=156))}
+    assert found == _DP5[name]

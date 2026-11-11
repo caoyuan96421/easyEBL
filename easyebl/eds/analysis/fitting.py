@@ -116,7 +116,7 @@ def _families_for(elements, beam_kv: float, e_min: float) -> list[tuple[str, str
     return out
 
 
-def pileup_shape(net: np.ndarray, calibration: EnergyCalibration) -> np.ndarray:
+def pileup_shape(net: np.ndarray, calibration: EnergyCalibration, shift_kev: float = 0.0) -> np.ndarray:
     """Shape of the sum (pile-up) spectrum: the net spectrum convolved with itself, on the
     channel axis (E₁ + E₂ = channel k₁ + k₂ + offset/gain), normalised to unit area."""
     x = np.clip(np.asarray(net, float), 0, None)
@@ -125,7 +125,9 @@ def pileup_shape(net: np.ndarray, calibration: EnergyCalibration) -> np.ndarray:
         return np.zeros(n)
     m = 1 << int(np.ceil(np.log2(2 * n)))
     c = np.fft.irfft(np.fft.rfft(x, m) ** 2, m)[: 2 * n]
-    shift = calibration.offset_kev / calibration.gain_kev  # E(k1)+E(k2) = E(k1+k2) + offset
+    # E(k1)+E(k2) = E(k1+k2) + offset;  *shift_kev* < 0 models incomplete sums (pulses that pile
+    # up on the shaper's rising edge add less than their full energies – seen on the DP5)
+    shift = (calibration.offset_kev + shift_kev) / calibration.gain_kev
     k = np.arange(n)
     out = np.interp(k - shift, np.arange(c.size), np.clip(c, 0, None), left=0.0, right=0.0)
     s = out.sum()
@@ -195,13 +197,14 @@ def fit_spectrum(spectrum: Spectrum, elements, e_range=(0.2, None), detector: ge
             refs.append(r)
     sel = (e >= e_lo) & (e <= e_hi)
     shapes = [r.shape for r in refs]
-    pile = None
+    n_pile = 0
     if pileup and refs:
-        pile = pileup_shape(np.where(e >= e_lo, y - bg, 0.0), cal)
-        if pile[sel].sum() > 0.05:
-            shapes.append(pile)
-        else:
-            pile = None
+        netp = np.where(e >= e_lo, y - bg, 0.0)
+        for sh in (0.0, -0.08, -0.16):
+            pile = pileup_shape(netp, cal, sh)
+            if pile[sel].sum() > 0.05:
+                shapes.append(pile)
+                n_pile += 1
     n_lines = len(shapes)
     # background: the SNIP estimate times a smooth, piecewise-linear correction (knots ≥ 0.35 keV
     # apart – far wider than a peak), fitted with the lines.  SNIP alone sits a little low in the
@@ -257,7 +260,7 @@ def fit_spectrum(spectrum: Spectrum, elements, e_range=(0.2, None), detector: ge
     sig = np.sqrt(np.clip(np.diag(cov), 0, None)) * max(1.0, math.sqrt(chi2))
     nr = len(refs)
     extras = {"beam_kv": spectrum.beam_kv}
-    if pile is not None:
-        extras["pileup_counts"] = float(areas[nr])
+    if n_pile:
+        extras["pileup_counts"] = float(areas[nr:nr + n_pile].sum())
     bg = bg_fit
     return FitResult(refs, areas[:nr], sig[:nr], bg, model, chi2, (e_lo, e_hi), extras)
