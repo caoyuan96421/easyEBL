@@ -149,7 +149,7 @@ def test_advanced_dialog_switches_phantom(qtbot, tmp_path):
         d.ph_noise.setValue(0.05)
         d.apply()
         assert "Applied" in d.msg.text(), d.msg.text()
-        assert eng.handle.phantom == {"output": "aux0", "physical": "ao2", "noise_v": 0.05}
+        assert {k: eng.handle.phantom[k] for k in ("output", "physical", "noise_v")} == {"output": "aux0", "physical": "ao2", "noise_v": 0.05}
         assert w.view.info.get("detector", "").startswith("PHANTOM")
         qtbot.waitUntil(lambda: eng.state == EngineState.LIVE, timeout=10000)  # resumed
         d.ph_on.setChecked(False)

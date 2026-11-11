@@ -387,6 +387,10 @@ class SimulatedBackend(DAQBackend):
         if np.any(frac > 0):
             m = frac > 0
             self.dose.deposit(pos[m, 0], pos[m, 1], p.beam_current_a * dt * frac[m])
+        # X-ray photons of the EDS phantom (they reach photon listeners, e.g. a simulated DPP)
+        eds = self.eds_phantom()
+        if eds is not None:
+            eds.photons(c.x, c.y, c.blank, rate)
         # video
         if n_ai == 0:
             return np.zeros((0, n))

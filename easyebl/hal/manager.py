@@ -66,8 +66,10 @@ from .backend import (
     StreamResult,
     VoltageRangeError,
 )
-from .config import AI_TERMINALS, AUX_OUTPUTS
+from .config import AI_TERMINALS, AUX_OUTPUTS, PHANTOM_KINDS
 from .connection import ReconnectWatchdog
+
+_KEEP = object()  # "leave unchanged" marker for optional arguments
 
 __all__ = ["DAQManager", "DAQHandle", "BeamState", "EXTERNAL_CONTROL"]
 
@@ -148,8 +150,8 @@ class DAQManager:
         self._opened = True
         self._connected.set()
         self._register_atexit()
-        # build the phantom chart now (≈1–2 s once), not inside the first stream start
-        self.backend.phantom_source()
+        # build the phantom now (≈1–2 s once), not inside the first stream start
+        self.backend.prepare_phantom()
         self._emit("opened", {"connected": True})
         return self
 
@@ -174,7 +176,7 @@ class DAQManager:
         for name, value in lines.items():
             self.backend.set_static_line(name, value)
         for name, volts in aux.items():  # aux outputs: 0 V unless a handle holds a value
-            if name != self.config.phantom_output:
+            if name not in self.config.phantom_outputs:
                 self.backend.set_aux_output(name, volts)
 
     def _register_atexit(self) -> None:
@@ -208,7 +210,7 @@ class DAQManager:
                             self.backend.set_external_control(False)  # give the scan back to the SEM
                             self._external = False
                         for name, volts in list(self._aux_state.items()):
-                            if volts and name != self.config.phantom_output:
+                            if volts and name not in self.config.phantom_outputs:
                                 self.backend.set_aux_output(name, 0.0)
                                 self._aux_state[name] = 0.0
                 except Exception as e:  # noqa: BLE001 - closing must always complete
@@ -570,17 +572,23 @@ class DAQManager:
             raise HALError(f"unknown aux output '{name}'; available: {list(AUX_OUTPUTS)}")
         if not np.isfinite(volts) or abs(volts) > self.config.ao_limit_v:
             raise VoltageRangeError(f"{name}: {volts:g} V outside ±{self.config.ao_limit_v} V")
-        if name == self.config.phantom_output and self.config.phantom_physical:
-            raise ResourceConflictError(f"{name} is driven by the phantom specimen (DAQConfig.phantom_output)")
+        if name in self.config.phantom_outputs:
+            raise ResourceConflictError(f"{name} is driven by the phantom specimen (DAQConfig.phantom_output/sdd_output)")
         if not self._holds(handle, name):
             self._claim(handle, [name])  # exclusive, like the other resources
         self._write_aux(handle, name, volts)
 
     @property
     def phantom(self) -> dict:
-        """{"output": aux name or None, "physical": AO channel or None (dummy/off), "noise_v": V}."""
+        """{"output", "physical", "noise_v", "kind", "sdd_output", "sdd_physical", "eds"}.
+
+        ``output``/``physical``: image output (aux name / AO channel, None = off or dummy);
+        ``sdd_*``: the EDS phantom's SDD signal; ``eds``: EDS phantom parameters.
+        """
         cfg = self.config
-        return {"output": cfg.phantom_output, "physical": cfg.phantom_physical, "noise_v": cfg.phantom_noise_v}
+        return {"output": cfg.phantom_output, "physical": cfg.phantom_physical, "noise_v": cfg.phantom_noise_v,
+                "kind": cfg.phantom_kind, "sdd_output": cfg.sdd_output, "sdd_physical": cfg.sdd_physical,
+                "eds": dict(cfg.eds_phantom)}
 
     def _set_ai_terminal(self, handle: "DAQHandle", mode: str) -> None:
         mode = str(mode).upper()
@@ -596,42 +604,59 @@ class DAQManager:
             self._op_lock.release()
         self._emit("ai_terminal", {"owner": handle.owner, "mode": mode})
 
-    def _set_phantom(self, handle: "DAQHandle", output: str | None, noise_v: float | None) -> None:
+    def _set_phantom(self, handle: "DAQHandle", output, noise_v: float | None, kind: str | None = None,
+                     sdd_output=_KEEP, eds: dict | None = None) -> None:
         cfg = self.config
-        if output is not None and output not in AUX_OUTPUTS:
+        if output is not _KEEP and output is not None and output not in AUX_OUTPUTS:
             raise HALError(f"unknown aux output '{output}'; available: {list(AUX_OUTPUTS)} or None")
+        if sdd_output is not _KEEP and sdd_output is not None and sdd_output not in AUX_OUTPUTS:
+            raise HALError(f"unknown aux output '{sdd_output}'; available: {list(AUX_OUTPUTS)} or None")
+        if kind is not None and kind not in PHANTOM_KINDS:
+            raise HALError(f"unknown phantom kind '{kind}'; choose from {list(PHANTOM_KINDS)}")
         if noise_v is not None and not (np.isfinite(noise_v) and 0 <= noise_v <= cfg.ao_limit_v):
             raise VoltageRangeError(f"phantom noise must be 0…{cfg.ao_limit_v} V rms")
         noise = cfg.phantom_noise_v if noise_v is None else float(noise_v)
-        if output == cfg.phantom_output:
-            # same routing: only the noise changes – takes effect immediately, even mid-stream
+        new_out = cfg.phantom_output if output is _KEEP else output
+        new_kind = cfg.phantom_kind if kind is None else kind
+        new_sdd = cfg.sdd_output if sdd_output is _KEEP else sdd_output
+        new_eds = dict(cfg.eds_phantom)
+        if eds:
+            new_eds.update(eds)
+        live = {"cps"}  # parameters that may change while a stream runs
+        if (new_out, new_kind, new_sdd) == (cfg.phantom_output, cfg.phantom_kind, cfg.sdd_output) and all(
+                k in live or cfg.eds_phantom.get(k) == v for k, v in new_eds.items()):
+            # same routing and model: noise / photon rate change immediately, even mid-stream
             cfg.phantom_noise_v = noise
+            cfg.eds_phantom = new_eds
             if self.backend.phantom is not None:
-                self.backend.phantom.noise_v = noise
+                self.backend.prepare_phantom()
             self._emit("phantom", {"owner": handle.owner, **self.phantom})
             return
-        if output is not None:
-            holder = self.claims().get(output)
+        claims = self.claims()
+        for name in {new_out, new_sdd if new_kind == "eds" else None} - {None}:
+            holder = claims.get(name)
             if holder is not None:
-                raise ResourceConflictError(f"{output} is in use by '{holder}' (aux output)")
+                raise ResourceConflictError(f"{name} is in use by '{holder}' (aux output)")
         self._require_connected()
         if not self._op_lock.acquire(blocking=False):
             raise DeviceBusyError(
-                f"the phantom output cannot change while a stream runs (owner '{self.active_owner}')"
+                f"the phantom cannot change while a stream runs (owner '{self.active_owner}')"
             )
         try:
-            old = cfg.phantom_output
-            cfg.phantom_output = output
-            cfg.phantom_noise_v = noise
+            saved = (cfg.phantom_output, cfg.phantom_kind, cfg.sdd_output, cfg.eds_phantom, cfg.phantom_noise_v)
+            old_outputs = cfg.phantom_outputs
+            cfg.phantom_output, cfg.phantom_kind, cfg.sdd_output = new_out, new_kind, new_sdd
+            cfg.eds_phantom, cfg.phantom_noise_v = new_eds, noise
             try:
                 cfg.validate()
-            except ValueError:
-                cfg.phantom_output = old
+                self.backend.prepare_phantom()  # build it now, not at the next stream start
+            except Exception:
+                (cfg.phantom_output, cfg.phantom_kind, cfg.sdd_output, cfg.eds_phantom,
+                 cfg.phantom_noise_v) = saved
                 raise
-            if old is not None and cfg.aux_physical(old):
-                # the old phantom output goes back to its static value (0 V unless held)
-                self._call(self.backend.set_aux_output, old, self._aux_state.get(old, 0.0))
-            self.backend.phantom_source()  # build the chart now, not at the next stream start
+            for name in old_outputs - cfg.phantom_outputs:
+                # outputs the phantom no longer drives go back to their static value (0 V unless held)
+                self._call(self.backend.set_aux_output, name, self._aux_state.get(name, 0.0))
         finally:
             self._op_lock.release()
         self._emit("phantom", {"owner": handle.owner, **self.phantom})
@@ -877,16 +902,24 @@ class DAQHandle:
         """Current phantom routing: {"output", "physical", "noise_v"}."""
         return self._mgr.phantom
 
-    def set_phantom(self, output: str | None, noise_v: float | None = None) -> None:
-        """Route the phantom test chart to aux output *output* (``None`` = off).
+    def set_phantom(self, output=_KEEP, noise_v: float | None = None, *, kind: str | None = None,
+                    sdd_output=_KEEP, eds: dict | None = None) -> None:
+        """Route the phantom specimen's image to aux output *output* (``None`` = off).
 
-        Changing the routing is refused while a stream runs (the AO task layout
-        changes, and with it the maximum sample clock); changing only
-        *noise_v* is allowed at any time.  An output claimed by another handle
-        cannot be used.  On a dummy output the phantom has no effect.
+        *kind*: ``"chart"`` (test chart) or ``"eds"`` (multi-phase EDS specimen,
+        whose reset-type SDD preamp signal goes to *sdd_output*, e.g. ``"aux1"``);
+        *eds*: EDS phantom parameters to change (``cps``, ``beam_kv``,
+        ``mv_per_kev``, ``noise_mv``, ``leak_v_per_s``).  Omitted arguments keep
+        their current value.
+
+        Changing the routing or the model is refused while a stream runs (the AO
+        task layout changes, and with it the maximum sample clock); *noise_v*
+        and ``eds["cps"]`` (≈ beam current) change at any time.  An output
+        claimed by another handle cannot be used.  On a dummy output the
+        phantom has no effect.
         """
         self._check()
-        self._mgr._set_phantom(self, output, noise_v)
+        self._mgr._set_phantom(self, output, noise_v, kind=kind, sdd_output=sdd_output, eds=eds)
 
     # --------------------------------------------------------- external scan
     @property

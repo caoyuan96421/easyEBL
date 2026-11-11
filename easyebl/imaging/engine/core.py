@@ -56,6 +56,7 @@ from ...hal.backend import (
     StreamOverflowError,
     StreamUnderflowError,
 )
+from ...hal.manager import _KEEP
 from ..raster import RasterConfig, RasterPlan
 from .assembler import CaptureAccumulator, FrameRecord, ImageAccumulator, StreamAssembler
 from .frames import EngineState, EventBus, Frame, FrameSlot
@@ -544,31 +545,53 @@ class ImagingEngine:
                          changes=_jsonable(changes))
         return new
 
-    def set_phantom(self, output: str | None, noise_v: float | None = None) -> dict:
-        """Switch the phantom test chart (HAL dummy-image source) on an aux output, or off (None).
+    def set_phantom(self, output=_KEEP, noise_v: float | None = None, *, kind: str | None = None,
+                    sdd_output=_KEEP, eds: dict | None = None) -> dict:
+        """Switch the phantom (HAL dummy-image source) on an aux output, or off (None).
+
+        *kind* ``"chart"`` (test chart) or ``"eds"`` (EDS specimen: SE image on
+        *output*, SDD preamp signal on *sdd_output*); *eds* changes EDS phantom
+        parameters (see :meth:`DAQHandle.set_phantom`).  Omitted arguments keep
+        their value.
 
         Changing the routing pauses scanning, switches the HAL and resumes live
-        scanning if it was running: the AO task gains or loses a channel, so the
-        fastest sample clock changes (USB-6363: 2.0 ↔ 1.54 MS/s) and the clock
-        is re-derived.  A noise-only change applies on the fly.  Returns the new
-        routing ``{"output", "physical", "noise_v"}``.
+        scanning if it was running: the AO task gains or loses channels, so the
+        fastest sample clock changes (USB-6363: 2.0 / 1.54 / 1.25 MS/s for 2 / 3 /
+        4 channels) and the clock is re-derived.  A noise- or rate-only change
+        applies on the fly.  Returns the new routing (``DAQHandle.phantom``).
         """
         h = self.handle
-        if output == h.phantom["output"]:
-            h.set_phantom(output, noise_v)
-            self.events.emit("settings", f"phantom noise {h.phantom['noise_v']:g} V")
+        cur = h.phantom
+        kw = {"kind": kind, "eds": eds}
+        if output is not _KEEP:
+            kw["output"] = output
+        if sdd_output is not _KEEP:
+            kw["sdd_output"] = sdd_output
+        same = ((output is _KEEP or output == cur["output"]) and (kind is None or kind == cur["kind"])
+                and (sdd_output is _KEEP or sdd_output == cur["sdd_output"])
+                and all(k == "cps" or cur["eds"].get(k) == v for k, v in (eds or {}).items()))
+        if same:
+            h.set_phantom(noise_v=noise_v, **kw)
+            self.events.emit("settings", f"phantom noise {h.phantom['noise_v']:g} V", phantom=h.phantom)
             return h.phantom
         resume = self._pause_for_hardware_change("phantom")
         try:
-            h.set_phantom(output, noise_v)
+            h.set_phantom(noise_v=noise_v, **kw)
         except Exception:
             if resume:
                 self.run()
             raise
         self._rederive_rate()
         ph = h.phantom
-        state = (f"phantom on {ph['output']} ({ph['physical'] or 'dummy – no effect'})" if ph["output"]
-                 else "phantom off")
+        if ph["output"] or ph["sdd_output"]:
+            parts = []
+            if ph["output"]:
+                parts.append(f"image on {ph['output']} ({ph['physical'] or 'dummy – no effect'})")
+            if ph["kind"] == "eds" and ph["sdd_output"]:
+                parts.append(f"SDD on {ph['sdd_output']} ({ph['sdd_physical'] or 'dummy – no effect'})")
+            state = f"{ph['kind']} phantom: " + ", ".join(parts)
+        else:
+            state = "phantom off"
         self.events.emit("settings", f"{state}; sample clock {self.rate / 1e6:.4g} MS/s", phantom=ph)
         if resume:
             self.run()

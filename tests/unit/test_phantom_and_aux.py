@@ -143,10 +143,10 @@ def test_rate_validation_counts_the_phantom_channel():
 def test_set_phantom_at_runtime():
     m = _mgr()  # USB-6363 preset: aux0 = ao2, aux1 = ao3, phantom off
     h = m.get_handle("x")
-    assert h.phantom == {"output": None, "physical": None, "noise_v": 0.0}
+    assert {k: h.phantom[k] for k in ("output", "physical", "noise_v")} == {"output": None, "physical": None, "noise_v": 0.0}
     assert m.config.max_scan_rate() == 2e6
     h.set_phantom("aux0", 0.1)
-    assert h.phantom == {"output": "aux0", "physical": "ao2", "noise_v": 0.1}
+    assert {k: h.phantom[k] for k in ("output", "physical", "noise_v")} == {"output": "aux0", "physical": "ao2", "noise_v": 0.1}
     assert m.backend.phantom_source() is not None and m.config.max_scan_rate() == pytest.approx(100e6 / 65)
     with pytest.raises(ResourceConflictError):
         h.set_aux_output("aux0", 1.0)  # now owned by the phantom

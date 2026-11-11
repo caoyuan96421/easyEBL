@@ -146,7 +146,11 @@ class DAQBackend(ABC):
         config.validate()
         self.config = config
         self._open = False
-        self.phantom = None  # PhantomSpecimen driving config.phantom_output during streams
+        self.phantom = None  # PhantomSpecimen / EDSPhantomSpecimen driving the phantom outputs
+        self._phantom_key = None
+        # photon listeners of the EDS phantom live here, so they survive a phantom rebuild
+        self._photon_listeners: list = []
+        self._photon_lock = threading.Lock()
         self.aux_values: dict = {k: 0.0 for k in AUX_OUTPUTS}  # last value set per aux output
 
     # ---------------------------------------------------------------- lifecycle
@@ -223,16 +227,61 @@ class DAQBackend(ABC):
     def _write_aux(self, physical: str, volts: float) -> None:
         """Write one physical AO channel statically (backends with real aux outputs)."""
 
+    def _phantom_obj(self):
+        cfg = self.config
+        key = (cfg.phantom_kind, cfg.ao_limit_v,
+               tuple(sorted((k, v) for k, v in cfg.eds_phantom.items() if k != "cps")))
+        if self.phantom is None or self._phantom_key != key:
+            old = self.phantom
+            if cfg.phantom_kind == "eds":
+                from .eds_phantom import EDSPhantomSpecimen
+
+                ph = EDSPhantomSpecimen(extent_v=cfg.ao_limit_v, noise_v=cfg.phantom_noise_v, **cfg.eds_phantom)
+                ph._listeners = self._photon_listeners  # shared registry
+                ph._llock = self._photon_lock
+                if old is not None and hasattr(old, "clock_s"):
+                    ph.clock_s = old.clock_s  # the detector clock never runs backwards
+            else:
+                from .phantom import PhantomSpecimen
+
+                ph = PhantomSpecimen(extent_v=cfg.ao_limit_v, noise_v=cfg.phantom_noise_v)
+            self.phantom, self._phantom_key = ph, key
+        self.phantom.noise_v = float(cfg.phantom_noise_v)  # may change between/while streams
+        if cfg.phantom_kind == "eds" and "cps" in cfg.eds_phantom:
+            self.phantom.set_cps(float(cfg.eds_phantom["cps"]))
+        return self.phantom
+
     def phantom_source(self):
-        """The phantom specimen for streams, or None (no phantom / routed to a dummy output)."""
+        """The phantom image source for streams, or None (no phantom / routed to a dummy output)."""
         if not self.config.phantom_physical:
             return None
-        if self.phantom is None:
-            from .phantom import PhantomSpecimen
+        return self._phantom_obj()
 
-            self.phantom = PhantomSpecimen(extent_v=self.config.ao_limit_v, noise_v=self.config.phantom_noise_v)
-        self.phantom.noise_v = float(self.config.phantom_noise_v)  # may change between/while streams
-        return self.phantom
+    def eds_phantom(self):
+        """The EDS phantom specimen (photons + SDD signal) when ``phantom_kind == "eds"``, else None.
+
+        Streams generate its photons whether or not the SDD output is physical, so a
+        simulated pulse processor works with any backend.
+        """
+        if self.config.phantom_kind != "eds":
+            return None
+        return self._phantom_obj()
+
+    def prepare_phantom(self) -> None:
+        """Build the phantom now (≈0.5–2 s once) rather than inside a stream start."""
+        if self.config.phantom_physical or self.config.phantom_kind == "eds":
+            self._phantom_obj()
+
+    # photon listeners: fn(t0_s, dt_s, sample_idx, energies_kev, n_samples) per stream chunk
+    def add_photon_listener(self, fn) -> None:
+        with self._photon_lock:
+            if fn not in self._photon_listeners:
+                self._photon_listeners.append(fn)
+
+    def remove_photon_listener(self, fn) -> None:
+        with self._photon_lock:
+            if fn in self._photon_listeners:
+                self._photon_listeners.remove(fn)
 
     # ------------------------------------------------------- connection health
     def probe(self) -> bool:

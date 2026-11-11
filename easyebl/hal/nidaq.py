@@ -320,6 +320,8 @@ class NIDAQBackend(DAQBackend):
         cfg = self.config
         dev = cfg.device
         phantom = self.phantom_source()
+        eds = self.eds_phantom()  # photons (+ SDD preamp signal when sdd_physical)
+        sdd_phys = cfg.sdd_physical if eds is not None else None
         buf = self.buffer_samples(rate, latency_s)
         # write granularity: small pieces keep the buffer topped up (≥ 7/8 full), so the
         # latency stays ≈ buf / rate while the margin against host stalls stays large,
@@ -365,6 +367,8 @@ class NIDAQBackend(DAQBackend):
             ao.ao_channels.add_ao_voltage_chan(self._phys(cfg.ao_y), min_val=-lim, max_val=lim)
             if phantom is not None:  # synthetic video on an aux output, same clock as X/Y
                 ao.ao_channels.add_ao_voltage_chan(self._phys(cfg.phantom_physical), min_val=-lim, max_val=lim)
+            if sdd_phys:  # simulated SDD preamp output on the other aux output
+                ao.ao_channels.add_ao_voltage_chan(self._phys(sdd_phys), min_val=-lim, max_val=lim)
             ao.timing.cfg_samp_clk_timing(rate, sample_mode=AcquisitionType.CONTINUOUS, samps_per_chan=buf)
             ao.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
             ao.out_stream.output_buf_size = buf
@@ -427,10 +431,14 @@ class NIDAQBackend(DAQBackend):
                 # write into a full, stopped buffer could only end in a timeout
                 if not st["started"] and st["queued"] + n > buf:
                     start_tasks()
+                rows = [c.x, c.y]
                 if phantom is not None:
-                    xy = np.vstack([c.x, c.y, phantom.output(c.x, c.y, c.blank)])
-                else:
-                    xy = np.vstack([c.x, c.y])
+                    rows.append(phantom.output(c.x, c.y, c.blank))
+                if sdd_phys:
+                    rows.append(eds.sdd_output(c.x, c.y, c.blank, rate))
+                elif eds is not None:
+                    eds.photons(c.x, c.y, c.blank, rate)  # simulated pulse processor only
+                xy = np.vstack(rows)
                 # the manager has rejected anything beyond ±limit (1e-9 relative tolerance); clip the
                 # rounding residue so DAQmx (which checks its range exactly) never sees it
                 np.clip(xy, -lim, lim, out=xy)

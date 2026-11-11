@@ -23,13 +23,23 @@ def add_hardware_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     p.add_argument("--ai-terminal", dest="ai_terminal", default=None,
                    choices=["DIFF", "RSE", "NRSE", "PSEUDO_DIFF"],
                    help="video input mode (default: the preset's; DIFF needs AI+ and AI- wired)")
-    p.add_argument("--phantom", action="store_true",
-                   help="dummy-image test: drive a test chart on an aux output (default aux0 = AO2); "
-                        "wire it to the video input (AO2 -> AI0)")
+    p.add_argument("--phantom", nargs="?", const="chart", default=None, choices=["chart", "eds"],
+                   help="dummy-image test: drive a phantom on an aux output (default aux0 = AO2), "
+                        "wired to the video input (AO2 -> AI0).  'chart' (default) = test chart; "
+                        "'eds' = multi-phase EDS specimen, plus a reset-type SDD preamp signal on "
+                        "--sdd-output (default aux1 = AO3 -> DP5 input)")
     p.add_argument("--phantom-output", dest="phantom_output", default="aux0", choices=["aux0", "aux1"],
                    help="aux output for the phantom (default aux0)")
     p.add_argument("--phantom-noise", dest="phantom_noise", type=float, default=0.0, metavar="V",
                    help="rms white noise added to the phantom signal (V), e.g. 0.2")
+    p.add_argument("--sdd-output", dest="sdd_output", default="aux1", choices=["aux0", "aux1"],
+                   help="EDS phantom: aux output for the SDD preamp signal (default aux1 = AO3)")
+    p.add_argument("--sdd-cps", dest="sdd_cps", type=float, default=None,
+                   help="EDS phantom: photon rate on the brightest phase (default 20000 /s)")
+    p.add_argument("--sdd-mv-per-kev", dest="sdd_mv_per_kev", type=float, default=None,
+                   help="EDS phantom: SDD preamp step height (default 6 mV/keV)")
+    p.add_argument("--phantom-kv", dest="phantom_kv", type=float, default=None,
+                   help="EDS phantom: beam voltage of the X-ray model (default 20 kV)")
     return p
 
 
@@ -45,9 +55,19 @@ def build_manager(args) -> tuple[DAQManager, FieldCalibration]:
         cfg.device = args.device
     if getattr(args, "ai_terminal", None):
         cfg.ai_terminal = args.ai_terminal
-    if getattr(args, "phantom", False):
+    kind = getattr(args, "phantom", None)
+    if kind is True:  # programmatic callers may still pass a bool
+        kind = "chart"
+    if kind:
         cfg.phantom_output = args.phantom_output
         cfg.phantom_noise_v = float(args.phantom_noise)
+        cfg.phantom_kind = kind
+        if kind == "eds":
+            cfg.sdd_output = getattr(args, "sdd_output", "aux1")
+            for key, attr in (("cps", "sdd_cps"), ("mv_per_kev", "sdd_mv_per_kev"), ("beam_kv", "phantom_kv")):
+                val = getattr(args, attr, None)
+                if val is not None:
+                    cfg.eds_phantom[key] = float(val)
         cfg.validate()
         if cfg.phantom_physical is None:
             print(f"note: {args.phantom_output} is a dummy output on this configuration – no phantom signal")
