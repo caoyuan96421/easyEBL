@@ -60,7 +60,7 @@ def test_point_spectra_identify_phases(rig):
     al = ctrl.acquire_spectrum(0.4, at_um=_um_of_phase(mgr, ctrl, 1)).result(30)
     assert cu.real_time == pytest.approx(0.4, abs=1e-6) and cu.icr > 5e3
     assert _peak(cu, 8.04) > 10 and _peak(cu, 1.487) < 2
-    assert _peak(al, 1.487) > 10 and _peak(al, 8.04) < 2
+    assert _peak(al, 1.487) > 10 and al.counts_in(7.96, 8.12) < 0.01 * al.counts_in(1.41, 1.57)
     assert cu.metadata["se_v"] > al.metadata["se_v"]  # Cu is brighter in SE
     # live-time preset
     lt = ctrl.acquire_spectrum(0.2, at_um=(0.0, 0.0), live_time=True).result(30)

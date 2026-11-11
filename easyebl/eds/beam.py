@@ -16,6 +16,7 @@ spectrum on the same clock.
 """
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass
 import threading
 import time
@@ -76,6 +77,13 @@ class BeamProgram:
         self._phase = 0
         self.produced = 0
         self.started = threading.Event()  # the first chunk has been generated
+        # scheduled slots (step scans planned ahead on the sample clock, see schedule())
+        self._queue: collections.deque = collections.deque()
+        self._slot_n = 0
+        self._slot_left = 0
+        self._slot_pos = None
+        self.slots: list = []  # [(key, start sample index)] in stream order
+        self._slot_cv = threading.Condition(self._lock)
 
     # ------------------------------------------------------------- commands
     def _submit(self, cmd: _Cmd) -> Ticket:
@@ -104,9 +112,29 @@ class BeamProgram:
             raise ValueError("pattern x and y must be equal-length 1-D arrays")
         return self._submit(_Cmd("pattern", x, y, bool(blank), Ticket()))
 
+    def schedule(self, items, slot_n: int) -> None:
+        """Queue step-scan pixels: each item (key, x_v, y_v) gets *slot_n* samples at its
+        position, back to back on the sample clock, unblanked.  May be called again to append
+        (e.g. pixels to redo; a new *slot_n* applies to every slot not yet started).  ``slots``
+        records (key, start index, length) as they are generated;
+        :meth:`slot` waits for one.  With the queue empty the beam is blanked in place."""
+        with self._lock:
+            self._slot_n = int(slot_n)
+            self._queue.extend((k, float(x), float(y)) for k, x, y in items)
+
+    def slot(self, i: int, timeout: float | None = None):
+        """(key, start index, length) of the *i*-th generated slot (waits until it is generated)."""
+        with self._slot_cv:
+            ok = self._slot_cv.wait_for(lambda: len(self.slots) > i or self._stop.is_set(), timeout)
+            if not ok or len(self.slots) <= i:
+                raise TimeoutError("slot not generated")
+            return self.slots[i]
+
     def stop(self) -> None:
         """End the stream after the current chunk (the HAL then blanks and parks)."""
         self._stop.set()
+        with self._slot_cv:
+            self._slot_cv.notify_all()
 
     @property
     def stopped(self) -> bool:
@@ -119,16 +147,47 @@ class BeamProgram:
         return float(c.x[0]), float(c.y[0]), bool(c.blank)
 
     # ------------------------------------------------------------- generator
+    def _slot_chunk(self, n: int):
+        """n samples of scheduled slots (lock held); None when nothing is scheduled."""
+        if self._slot_left <= 0 and not self._queue:
+            return None
+        xs = np.empty(n)
+        ys = np.empty(n)
+        bl = np.zeros(n, bool)
+        i = 0
+        while i < n:
+            if self._slot_left <= 0:
+                if not self._queue:
+                    x, y = self._slot_pos if self._slot_pos else (float(self._cur.x[0]), float(self._cur.y[0]))
+                    xs[i:], ys[i:], bl[i:] = x, y, True  # nothing left: blank where we are
+                    self._cur = _Cmd("hold", np.array([x]), np.array([y]), True, self._cur.ticket)
+                    break
+                key, x, y = self._queue.popleft()
+                self._slot_pos = (x, y)
+                self._slot_left = self._slot_n
+                self.slots.append((key, self.produced + i, self._slot_n))
+                self._slot_cv.notify_all()
+            k = min(n - i, self._slot_left)
+            xs[i:i + k], ys[i:i + k] = self._slot_pos
+            self._slot_left -= k
+            i += k
+        return OutputChunk(xs, ys, bl)
+
     def chunks(self):
         n = self.chunk_n
         while not self._stop.is_set():
             with self._lock:
                 cmd, self._pending = self._pending, None
-            if cmd is not None:
-                self._cur, self._phase = cmd, 0
-                cmd.ticket._set(self.produced)
+                if cmd is not None:
+                    self._cur, self._phase = cmd, 0
+                    self._queue.clear()
+                    self._slot_left = 0
+                    cmd.ticket._set(self.produced)
+                chunk = self._slot_chunk(n)
             c = self._cur
-            if c.kind == "hold":
+            if chunk is not None:
+                pass
+            elif c.kind == "hold":
                 chunk = OutputChunk.constant(n, float(c.x[0]), float(c.y[0]), blank=c.blank)
             else:
                 idx = (self._phase + np.arange(n)) % c.x.size

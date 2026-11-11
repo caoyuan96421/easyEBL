@@ -53,8 +53,13 @@ class JobCancelled(RuntimeError):
 class EDSOptions:
     rate: float | None = None  # stream sample clock (S/s); None = the device maximum for the layout
     max_rate: float = 1.25e6  # …but not above this (plenty for SE averaging; light on USB)
-    latency_s: float = 0.01  # output buffer: beam-move latency (the HAL enforces a floor)
-    chunk_n: int = 2048
+    # Output buffer.  Deep, like the DP5 simulator scripts (1 s buffer, 50 ms writes): the EDS
+    # phantom generates its SDD waveform in Python, and a shallow buffer underflows on Windows.
+    # Maps do not wait for it – their pixels are scheduled ahead on the sample clock.
+    latency_s: float = 0.4
+    chunk_n: int = 8192
+    pixel_slack_s: float = 0.015  # map slot = settle + dwell + slack (DP5 read-out and clear)
+    enable_guard_s: float = 0.003  # latest MCA enable: slot end − dwell − guard
     settle_s: float = 100e-6  # after a move before counting starts
     row_settle_s: float = 1e-3  # after the jump to the next row
     video_channel: str | None = "video"  # AI channel co-acquired as the SE signal (None: none)
@@ -139,6 +144,23 @@ class _Beam:
             raise RuntimeError("the EDS beam stream ended unexpectedly")
         if self.job.cancelled:
             raise JobCancelled()
+
+    def now_index(self) -> int:
+        """Best estimate of the sample the device is generating now (between monitor polls)."""
+        m = self.mon
+        est = m.generated + (time.perf_counter() - m.t_update) * self.rate if m.running else m.generated
+        return int(min(est, m.written)) if m.written else int(est)
+
+    def wait_index(self, index: int, timeout: float = 5.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            now = self.now_index()
+            if now >= index:
+                return now
+            self.check()
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"beam stream stalled (at {now} < {index})")
+            time.sleep(min(max((index - now) / self.rate - 0.0005, 0.0002), 0.005))
 
     def wait_generated(self, index: int, timeout: float = 5.0):
         deadline = time.monotonic() + timeout
@@ -412,10 +434,11 @@ class EDSController:
         r = mca.read()
         if beam is not None and beam.ai is not None and i0 is not None:
             d = o.ai_delay_samples
-            stop = max(i0 + 1, beam.mon.generated)
+            stop = max(i0 + 1, beam.now_index())
             beam.ai.request("se", i0 + d, stop + d)
             try:
-                beam.wait_generated(stop + d + 2 * o.chunk_n, timeout=2.0)
+                beam.wait_index(stop + d + o.chunk_n, timeout=2.0)
+                time.sleep(0.02)
                 meta = dict(meta, se_v=float(beam.ai.result("se", timeout=2.0)[0]))
             except (TimeoutError, JobCancelled):
                 pass
@@ -535,6 +558,16 @@ class EDSController:
                             "points_um": pts.tolist()})
 
     def _job_points(self, job, volts, shape, dwell, region, title, meta):
+        """Step scan with pixels scheduled ahead on the sample clock.
+
+        Every pixel gets a slot of settle + dwell + slack samples, queued in the beam
+        program long before the beam gets there, so the deep output buffer costs nothing
+        per pixel.  When the beam reaches a slot (estimated from the stream monitor) the
+        MCA is enabled with a preset real time = dwell; it stops itself inside the slot, is
+        read and cleared while the beam already moves on.  A slot the host reached too late
+        is rescheduled at the end (and the slack grows), so no pixel is ever counted at the
+        wrong position.
+        """
         o = self.options
         mca = self.mca
         ny, nx = shape
@@ -542,60 +575,82 @@ class EDSController:
         nch = self.cube_channels()
         sm = SpectrumMap.empty(nx, ny, nch, self._ecal, region, dwell, dtype=np.dtype(o.cube_dtype),
                                beam_kv=self.beam_kv, takeoff_deg=self.takeoff_deg, metadata=dict(meta))
-        sm.metadata.update(rate=0.0, overhead_s=0.0)
+        sm.metadata.update(rate=0.0, overhead_s=0.0, rescheduled=0)
         job.partial = sm
         mca.set_preset_real_time(dwell)
         cap = np.iinfo(sm.cube.dtype).max
         t_job = time.monotonic()
         with self._beam(job, title, start_v=tuple(volts[0])) as beam:
-            sm.metadata["rate"] = beam.rate
+            R = beam.rate
+            sm.metadata["rate"] = R
             mca.clear()
-            dwell_n = int(round(dwell * beam.rate))
+            dwell_n = int(round(dwell * R))
+            settle_n = int(round(o.settle_s * R))
+            row_n = int(round(o.row_settle_s * R))
+            guard_n = int(round(o.enable_guard_s * R))
+            slack = o.pixel_slack_s
+            slot_n = row_n + dwell_n + int(round(slack * R))
             d = o.ai_delay_samples
-            ticket = beam.issue(*volts[0])
-            settle = o.row_settle_s
+            prog = beam.prog
+            prog.schedule([(i, volts[i, 0], volts[i, 1]) for i in range(n)], slot_n)
+            remaining = n
+            late = 0
+            k = 0
             t_last = time.monotonic()
             try:
-                for i in range(n):
-                    i0 = beam.arrive(ticket, settle)
+                while remaining:
+                    beam.check()
+                    key, start, length = prog.slot(k, timeout=10.0)
+                    k += 1
+                    row, col = divmod(key, nx)
+                    if sm.done[row, col]:
+                        continue
+                    t_en = start + (row_n if col == 0 or key == 0 else settle_n)
+                    now = beam.wait_index(t_en, timeout=10.0)
+                    if now > start + length - dwell_n - guard_n:
+                        # too late for this slot: redo the pixel at the end, with more slack
+                        late += 1
+                        slack = min(slack * 1.25 + 0.002, 0.25)
+                        slot_n = row_n + dwell_n + int(round(slack * R))
+                        prog.schedule([(key, volts[key, 0], volts[key, 1])], slot_n)
+                        continue
                     mca.enable()
                     if beam.ai is not None:
-                        beam.ai.request(i, i0 + d, i0 + d + max(1, dwell_n))
+                        beam.ai.request(key, t_en + d, t_en + d + max(1, dwell_n))
                     mca.wait_done(timeout=dwell + 5.0, expected_s=dwell)
-                    if i + 1 < n:  # move on while the spectrum is read out
-                        ticket = beam.issue(*volts[i + 1])
-                        settle = o.row_settle_s if (i + 1) % nx == 0 else o.settle_s
                     r = mca.read(clear=True)
-                    row, col = divmod(i, nx)
                     c = r.counts[:nch]
                     sm.cube[row, col] = np.minimum(c, cap)
                     sm.real_time[row, col] = r.real_time
                     sm.live_time[row, col] = r.live_time
                     sm.fast_count[row, col] = r.fast_count
                     sm.done[row, col] = True
+                    remaining -= 1
                     if beam.ai is not None:
-                        for k, v in beam.ai.ready().items():
-                            rr, cc = divmod(k, nx)
+                        for kk, v in beam.ai.ready().items():
+                            rr, cc = divmod(kk, nx)
                             sm.se[rr, cc] = v[0]
-                    now = time.monotonic()
-                    if now - t_last >= o.update_s or i + 1 == n:
-                        t_last = now
-                        el = now - t_job
-                        per = el / (i + 1)
-                        sm.metadata["overhead_s"] = max(0.0, per - dwell)
-                        self._progress(job, (i + 1) / n,
-                                       f"{title}: {i + 1}/{n} px, {per * 1e3:.0f} ms/px, "
-                                       f"{(n - i - 1) * per:.0f} s left", kind="pixel", map=sm, index=i)
-                    beam.check()
+                    now_t = time.monotonic()
+                    if now_t - t_last >= o.update_s or remaining == 0:
+                        t_last = now_t
+                        nd = n - remaining
+                        per = (now_t - t_job) / nd
+                        sm.metadata.update(overhead_s=max(0.0, per - dwell), rescheduled=late,
+                                           slot_s=slot_n / R)
+                        self._progress(job, nd / n,
+                                       f"{title}: {nd}/{n} px, {per * 1e3:.0f} ms/px, "
+                                       f"{remaining * per:.0f} s left" + (f", {late} redone" if late else ""),
+                                       kind="pixel", map=sm, index=key)
             finally:
                 mca.disable()
                 if beam.ai is not None:  # SE of the last pixels
                     try:
-                        beam.wait_generated(beam.mon.generated + 2 * o.chunk_n + d, timeout=1.0)
+                        beam.wait_index(beam.now_index() + int(0.05 * R) + d, timeout=2.0)
+                        time.sleep(0.05)
                     except Exception:  # noqa: BLE001
                         pass
-                    for k, v in beam.ai.ready().items():
-                        rr, cc = divmod(k, nx)
+                    for kk, v in beam.ai.ready().items():
+                        rr, cc = divmod(kk, nx)
                         sm.se[rr, cc] = v[0]
                 sm.metadata["elapsed_s"] = time.monotonic() - t_job
         return sm

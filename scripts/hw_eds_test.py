@@ -207,6 +207,10 @@ def main(argv=None) -> int:
                 f"truth {truth}; wt% " + ", ".join(f"{e} {w:.1f}" for e, w in wt.items()))
             results["phases"][phase.name] = {"found": found, "truth": truth, "wt": wt, "counts": sp.total}
             extra, missing = sorted(set(found) - set(truth)), sorted(set(major) - set(found))
+            light = [e for e in missing if e in ("B", "C", "N", "O", "F")]
+            if light:
+                say(f"   (light element(s) {light} not identified – weak behind the window; not counted)")
+                missing = [e for e in missing if e not in light]
             ok_all &= check(f"AutoID {phase.name}", not extra and not missing,
                             (f"extra {extra} " if extra else "") + (f"missing {missing}" if missing else ""))
         # ---------------------------------------------------------------- 5. map
