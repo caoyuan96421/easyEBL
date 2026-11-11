@@ -414,7 +414,7 @@ class EDSController:
                     beam.check()
                 time.sleep(0.005)
                 st = mca.status()
-                done = (not st.mca_enabled) or (live and st.live_time >= t_s)
+                done = (not st.mca_enabled) or st.preset_done or (live and st.live_time >= t_s)
                 if done:
                     mca.disable()
                     break

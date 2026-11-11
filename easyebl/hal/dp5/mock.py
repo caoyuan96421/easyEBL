@@ -48,7 +48,7 @@ class MockTransport:
         now = time.monotonic()
         dt = now - self._t_last
         self._t_last = now
-        if not self.mca_on or dt <= 0:
+        if not self.mca_on or self.prer_done or dt <= 0:
             return
         pret = self.cfg.get("PRET", "OFF")
         if pret not in ("OFF", "OF", "") and self.acc >= float(pret):
@@ -56,14 +56,14 @@ class MockTransport:
             return
         prer = self.cfg.get("PRER", "OFF")
         if prer not in ("OFF", "OF", ""):
+            # like the DP5 (FW 6.10.02, measured): counting stops exactly at the preset and the
+            # "preset real time done" bit is set, but the "MCA enabled" bit stays set
             left = float(prer) - self.real
             if left <= 0:
-                self.mca_on = False
                 self.prer_done = True
                 return
-            if dt > left:  # stop exactly at the preset, like the DP5
+            if dt > left:
                 dt = left
-                self.mca_on = False
                 self.prer_done = True
         nch = int(self.cfg.get("MCAC", "1024"))
         gain = float(self.cfg.get("GAIN", "20"))
@@ -135,7 +135,7 @@ class MockTransport:
             if pid1 == 0x02 and pid2 in (1, 2, 3, 4):
                 return self._spectrum(with_status=pid2 in (3, 4), clear=pid2 in (2, 4))
             if req == P.REQ_ENABLE_MCA:
-                self.mca_on = not self.prer_done
+                self.mca_on = True
                 self._t_last = time.monotonic()
                 return ack()
             if req == P.REQ_DISABLE_MCA:

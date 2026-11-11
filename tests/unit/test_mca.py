@@ -41,7 +41,8 @@ def test_dp5_preset_real_time_stops_the_mca(dp5):
     dp5.clear()
     dp5.enable()
     st = dp5.wait_done(timeout=3.0, expected_s=0.05)
-    assert not st.mca_enabled and st.preset_done
+    assert st.preset_done  # like the real DP5, PRER leaves "MCA enabled" set …
+    assert not dp5.status().mca_enabled  # … so wait_done disabled it
     r = dp5.read(clear=True)
     assert r.real_time == pytest.approx(0.05, abs=2e-3)
     assert r.counts.size == dp5.channels and r.total > 0

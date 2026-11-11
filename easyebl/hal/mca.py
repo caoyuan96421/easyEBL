@@ -183,13 +183,19 @@ class PulseProcessor(ABC):
         self.read(clear=True)
 
     def wait_done(self, timeout: float, poll_s: float = 0.002, expected_s: float | None = None) -> MCAReading:
-        """Wait until the MCA stopped (preset reached).  Returns the last status."""
+        """Wait until the MCA stopped (preset reached).  Returns the last status.
+
+        A DP5 that reaches PRER stops counting and sets "preset real time done" but keeps
+        "MCA enabled" set (FW 6.10.02); the MCA is then disabled here, so a following
+        read-and-clear does not restart counting."""
         deadline = time.monotonic() + timeout
         if expected_s:
             time.sleep(max(0.0, expected_s - 0.004))
         while True:
             st = self.status()
-            if not st.mca_enabled:
+            if st.preset_done or not st.mca_enabled:
+                if st.mca_enabled:
+                    self.disable()
                 return st
             if time.monotonic() > deadline:
                 raise MCAError(f"{self.name}: preset not reached within {timeout:.1f} s")
@@ -217,7 +223,8 @@ class PulseProcessor(ABC):
                     break
                 time.sleep(min(0.01, max(0.0, t_next - time.monotonic())))
                 st = self.status()
-                if not st.mca_enabled:
+                if st.preset_done or not st.mca_enabled:
+                    self.disable()
                     break
                 if on_update is not None and time.monotonic() >= t_next:
                     on_update(self.read())
