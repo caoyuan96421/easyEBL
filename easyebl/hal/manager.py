@@ -23,6 +23,14 @@ Rules enforced here (not in the backends):
   be driven by the handle that claimed them.  Arbitrary named resources
   (``"stage"``, ``"sem_serial"`` …) can be claimed too, so the same mechanism
   coordinates future subsystems.
+* **Exclusive lease.**  ``with handle.exclusive("EDS map"):`` gives one handle
+  the device for a whole job (EDS spectra, maps): streams, static writes and
+  switches of every other handle are refused with :class:`LeaseHeldError`
+  meanwhile.  Handles registered with :meth:`DAQHandle.set_preemptible` (the
+  live SEM image) are asked to stop and are told when the lease ends, so they
+  can resume; a handle that is not preemptible (an exposure) is waited for.
+  The lease can switch the SEM to external scan for its duration and restores
+  the previous state afterwards.
 * **Safe state.**  After every stream – normal end, abort or exception – the
   beam is blanked and parked.  Static writes are rejected while a stream is
   running.
@@ -46,6 +54,7 @@ thread that may itself be waiting for the device (e.g. a GUI thread calling
 from __future__ import annotations
 
 import atexit
+import contextlib
 from dataclasses import dataclass
 import itertools
 import threading
@@ -71,7 +80,18 @@ from .connection import ReconnectWatchdog
 
 _KEEP = object()  # "leave unchanged" marker for optional arguments
 
-__all__ = ["DAQManager", "DAQHandle", "BeamState", "EXTERNAL_CONTROL"]
+__all__ = ["DAQManager", "DAQHandle", "BeamState", "EXTERNAL_CONTROL", "LeaseHeldError", "Lease"]
+
+
+class LeaseHeldError(DeviceBusyError):
+    """Another handle holds the device's exclusive lease (see :meth:`DAQHandle.exclusive`)."""
+
+
+@dataclass(frozen=True)
+class Lease:
+    owner: str
+    reason: str
+    t_start: float
 
 #: Resource name of the SEM internal/external scan switch.
 EXTERNAL_CONTROL = "external_control"
@@ -120,6 +140,13 @@ class DAQManager:
         self.reconnects = 0
         self._watchdog = ReconnectWatchdog(self, reconnect_interval_s)
         self._atexit = None
+        # exclusive lease
+        self._lease_handle: DAQHandle | None = None
+        self._lease: Lease | None = None
+        self._lease_depth = 0
+        self._lease_cv = threading.Condition(self._state)
+        self._lease_restore_external: bool | None = None
+        self._preemptible: "weakref.WeakKeyDictionary[DAQHandle, tuple]" = weakref.WeakKeyDictionary()
 
     # ------------------------------------------------------------------ lifecycle
     def open(self, allow_missing: bool = False) -> "DAQManager":
@@ -426,6 +453,118 @@ class DAQManager:
             except Exception:  # listeners must never break hardware control
                 pass
 
+    # -------------------------------------------------------------- lease
+    @property
+    def lease(self) -> Lease | None:
+        """The current exclusive lease (owner, reason, start time) or None."""
+        with self._state:
+            return self._lease
+
+    def wait_lease_free(self, timeout: float | None = None, owner: str | None = None) -> bool:
+        """Wait until no lease is held (or it is held by *owner*); True if so."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lease_cv:
+            while self._lease_handle is not None and self._lease_handle.owner != owner:
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    return False
+                self._lease_cv.wait(left)
+            return True
+
+    def _check_lease(self, handle: "DAQHandle") -> None:
+        with self._state:
+            h = self._lease_handle
+            if h is not None and h is not handle:
+                raise LeaseHeldError(f"the DAQ is reserved by '{h.owner}' ({self._lease.reason})")
+
+    def _set_preemptible(self, handle: "DAQHandle", on_preempt, on_resume) -> None:
+        with self._state:
+            if on_preempt is None:
+                self._preemptible.pop(handle, None)
+            else:
+                self._preemptible[handle] = (on_preempt, on_resume)
+
+    def _acquire_lease(self, handle: "DAQHandle", reason: str, timeout: float, external_control) -> None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._lease_cv:
+            if self._lease_handle is handle:  # re-entrant
+                self._lease_depth += 1
+                return
+            while self._lease_handle is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise LeaseHeldError(f"the DAQ is reserved by '{self._lease_handle.owner}' ({self._lease.reason})")
+                self._lease_cv.wait(left)
+            self._lease_handle = handle
+            self._lease = Lease(handle.owner, str(reason), time.time())
+            self._lease_depth = 1
+            self._lease_restore_external = None
+            active = self._active
+            others = [(h, cb) for h, cb in self._preemptible.items() if h is not handle]
+        ok = False
+        try:
+            self._require_connected()
+            self._emit("lease", {"owner": handle.owner, "reason": str(reason), "active": True})
+            # ask preemptible handles to give the device up (they resume when the lease ends)
+            for h, (pre, _res) in others:
+                try:
+                    pre(self._lease)
+                except Exception as e:  # noqa: BLE001
+                    self._emit("error", {"owner": h.owner, "message": f"preempt callback failed: {e}"})
+            if active is not None and active is not handle and active not in dict(others):
+                self._emit("info", {"owner": handle.owner, "message": f"waiting for '{active.owner}' to finish"})
+            # the device is ours once the running stream (if any) has ended
+            left = max(0.0, deadline - time.monotonic())
+            if not self._op_lock.acquire(timeout=left if left > 0 else 0.001):
+                raise LeaseHeldError(
+                    f"'{self.active_owner}' did not release the DAQ within {timeout:.1f} s – lease not granted")
+            self._op_lock.release()
+            if external_control and self.has_external_control and self._external is not True:
+                self._lease_restore_external = bool(self._external)
+                self._switch_external(handle, True, wait=2.0)
+            ok = True
+        finally:
+            if not ok:
+                self._end_lease(handle)
+
+    def _release_lease(self, handle: "DAQHandle") -> None:
+        with self._state:
+            if self._lease_handle is not handle:
+                return
+            self._lease_depth -= 1
+            if self._lease_depth > 0:
+                return
+        self._end_lease(handle)
+
+    def _end_lease(self, handle: "DAQHandle") -> None:
+        restore = self._lease_restore_external
+        try:
+            if restore is not None and self._connected.is_set():
+                with self._state:
+                    want = self._external_wanted and EXTERNAL_CONTROL in self._claims
+                if self._external != want:
+                    try:
+                        self._switch_external(handle, want, wait=5.0)
+                    except Exception as e:  # noqa: BLE001 - ending the lease must not fail
+                        self._emit("error", {"owner": handle.owner, "message": f"could not restore the scan source: {e}"})
+        finally:
+            with self._lease_cv:
+                lease = self._lease
+                self._lease_handle = None
+                self._lease = None
+                self._lease_depth = 0
+                self._lease_restore_external = None
+                others = [(h, cb) for h, cb in self._preemptible.items() if h is not handle]
+                self._lease_cv.notify_all()
+            self._emit("lease", {"owner": handle.owner, "reason": lease.reason if lease else "", "active": False})
+            for h, (_pre, res) in others:
+                if res is None:
+                    continue
+                try:
+                    res()
+                except Exception as e:  # noqa: BLE001
+                    self._emit("error", {"owner": h.owner, "message": f"resume callback failed: {e}"})
+
     # -------------------------------------------------------------- internals
     def _claim(self, handle: "DAQHandle", resources: Sequence[str]) -> None:
         with self._state:
@@ -446,7 +585,12 @@ class DAQManager:
         if give_back:
             with self._state:
                 self._external_wanted = False
-            if self._external is not False:
+                leased_by_other = self._lease_handle is not None and self._lease_handle is not handle
+                if leased_by_other and self._lease_restore_external is None:
+                    self._lease_restore_external = bool(self._external)  # restored when the lease ends
+            if leased_by_other:
+                pass  # the lease holder uses the external scan; it is handed back when the lease ends
+            elif self._external is not False:
                 try:
                     self._switch_external(handle, False, wait=5.0)
                 except DeviceLostError:
@@ -456,7 +600,7 @@ class DAQManager:
         for r in resources:
             if r in AUX_OUTPUTS and self._claims.get(r) is handle and self._aux_state.get(r):
                 try:  # a released aux output goes back to 0 V
-                    self._write_aux(handle, r, 0.0, wait=5.0)
+                    self._write_aux(handle, r, 0.0, wait=5.0, check_lease=False)
                 except DeviceLostError:
                     with self._state:
                         self._aux_state[r] = 0.0
@@ -478,6 +622,7 @@ class DAQManager:
             raise VoltageRangeError("static position must be finite")
         if abs(x_v) > lim or abs(y_v) > lim:
             raise VoltageRangeError(f"static position ({x_v:.4g}, {y_v:.4g}) V exceeds ±{lim} V")
+        self._check_lease(handle)
         self._require_connected()
         if not self._op_lock.acquire(blocking=False):
             raise DeviceBusyError(f"device busy (stream owned by '{self.active_owner}')")
@@ -506,6 +651,7 @@ class DAQManager:
             raise ResourceConflictError(
                 f"line '{name}' must be claimed first" + (f" (held by '{holder}')" if holder else "")
             )
+        self._check_lease(handle)
         self._require_connected()
         if not self._op_lock.acquire(blocking=False):
             raise DeviceBusyError("cannot switch static lines while a stream is running")
@@ -522,6 +668,7 @@ class DAQManager:
     def _switch_external(self, handle: "DAQHandle", on: bool, wait: float = 0.0) -> None:
         if not self.has_external_control:
             raise HALError("this DAQ configuration has no external-control lines")
+        self._check_lease(handle)
         self._require_connected()
         ok = self._op_lock.acquire(timeout=wait) if wait > 0 else self._op_lock.acquire(blocking=False)
         if not ok:
@@ -543,6 +690,7 @@ class DAQManager:
     def _set_external(self, handle: "DAQHandle", on: bool) -> None:
         if not self.has_external_control:
             raise HALError("this DAQ configuration has no external-control lines")
+        self._check_lease(handle)
         if on and not self._holds(handle, EXTERNAL_CONTROL):
             self._claim(handle, [EXTERNAL_CONTROL])  # raises if another handle holds it
         elif not on and not self._holds(handle, EXTERNAL_CONTROL):
@@ -553,7 +701,10 @@ class DAQManager:
             self._external_wanted = bool(on)
         self._switch_external(handle, on)
 
-    def _write_aux(self, handle: "DAQHandle", name: str, volts: float, wait: float = 0.0) -> None:
+    def _write_aux(self, handle: "DAQHandle", name: str, volts: float, wait: float = 0.0,
+                   check_lease: bool = True) -> None:
+        if check_lease:
+            self._check_lease(handle)
         self._require_connected()
         ok = self._op_lock.acquire(timeout=wait) if wait > 0 else self._op_lock.acquire(blocking=False)
         if not ok:
@@ -596,6 +747,7 @@ class DAQManager:
             raise HALError(f"unknown AI input mode '{mode}'; choose from {list(AI_TERMINALS)}")
         if mode == self.config.ai_terminal:
             return
+        self._check_lease(handle)
         if not self._op_lock.acquire(blocking=False):
             raise DeviceBusyError(f"the AI input mode cannot change while a stream runs (owner '{self.active_owner}')")
         try:
@@ -637,6 +789,7 @@ class DAQManager:
             holder = claims.get(name)
             if holder is not None:
                 raise ResourceConflictError(f"{name} is in use by '{holder}' (aux output)")
+        self._check_lease(handle)
         self._require_connected()
         if not self._op_lock.acquire(blocking=False):
             raise DeviceBusyError(
@@ -714,6 +867,7 @@ class DAQManager:
             raise ValueError("ai_range_v must be a positive number")
         if self._active is handle:
             raise DeviceBusyError("handle already running a stream (re-entrant call)")
+        self._check_lease(handle)
         self._require_connected()
         if timeout is None or timeout < 0:
             ok = self._op_lock.acquire()
@@ -721,6 +875,11 @@ class DAQManager:
             ok = self._op_lock.acquire(timeout=timeout) if timeout > 0 else self._op_lock.acquire(False)
         if not ok:
             raise DeviceBusyError(f"device busy (stream owned by '{self.active_owner}')")
+        try:
+            self._check_lease(handle)  # a lease may have started while we waited
+        except LeaseHeldError:
+            self._op_lock.release()
+            raise
         if not self._connected.is_set():  # lost while we waited for the lock
             self._op_lock.release()
             self._require_connected()
@@ -975,10 +1134,54 @@ class DAQHandle:
         """Abort this handle's running stream.  Returns True if one was running."""
         return self._mgr._abort(self)
 
+    # ----------------------------------------------------------- exclusive lease
+    @contextlib.contextmanager
+    def exclusive(self, reason: str = "", timeout: float = 10.0, external_control: bool | None = None):
+        """Reserve the DAQ for this handle (context manager, re-entrant).
+
+        Every other handle's streams, static writes and switches are refused
+        (:class:`LeaseHeldError`) until the block ends.  Preemptible handles
+        (:meth:`set_preemptible`) are asked to stop first and are told when the
+        lease ends; a running non-preemptible stream is waited for up to
+        *timeout* s.  ``external_control=True`` switches the SEM to external
+        scan for the lease and restores the previous scan source afterwards.
+        """
+        self._check()
+        self._mgr._acquire_lease(self, reason, timeout, external_control)
+        try:
+            yield self._mgr.lease
+        finally:
+            self._mgr._release_lease(self)
+
+    @property
+    def lease(self) -> Lease | None:
+        return self._mgr.lease
+
+    @property
+    def holds_lease(self) -> bool:
+        lease = self._mgr.lease
+        return lease is not None and self._mgr._lease_handle is self
+
+    def set_preemptible(self, on_preempt: Callable | None, on_resume: Callable | None = None) -> None:
+        """Let other handles' leases interrupt this one.
+
+        ``on_preempt(lease)`` runs in the requesting thread when a lease starts:
+        stop streaming promptly (e.g. abort the live scan) and do not start a new
+        stream until ``on_resume()`` is called at the end of the lease.  Pass
+        ``None`` to unregister.
+        """
+        self._check()
+        self._mgr._set_preemptible(self, on_preempt, on_resume)
+
     # --------------------------------------------------------------- lifecycle
     def close(self) -> None:
         if not self.closed:
             self.abort()
+            if self.holds_lease:
+                with self._mgr._state:
+                    self._mgr._lease_depth = 1
+                self._mgr._release_lease(self)
+            self._mgr._set_preemptible(self, None, None)
             self.release()
             self.closed = True
 

@@ -22,7 +22,7 @@ from .backend import (
     VoltageRangeError,
 )
 from .config import AI_TERMINALS, AUX_OUTPUTS, DAQConfig
-from .manager import EXTERNAL_CONTROL, BeamState, DAQHandle, DAQManager
+from .manager import EXTERNAL_CONTROL, BeamState, DAQHandle, DAQManager, Lease, LeaseHeldError
 from .simulated import (
     DoseMap,
     FunctionSample,
@@ -53,6 +53,8 @@ __all__ = [
     "EXTERNAL_CONTROL",
     "DAQHandle",
     "DAQManager",
+    "Lease",
+    "LeaseHeldError",
     "DoseMap",
     "FunctionSample",
     "ImageSample",

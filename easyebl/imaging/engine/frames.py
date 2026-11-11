@@ -36,6 +36,7 @@ class EngineState(str, enum.Enum):
     CAPTURE = "capture"  # photo scan (integrated frames), then freeze
     FROZEN = "frozen"  # scanning stopped, last image kept
     DISCONNECTED = "disconnected"  # DAQ connection lost: waiting for it, then scanning resumes
+    PAUSED = "paused"  # another module holds the DAQ lease (e.g. an EDS map): resumes when it ends
     ERROR = "error"  # last run failed (see status().last_error)
     CLOSED = "closed"
 

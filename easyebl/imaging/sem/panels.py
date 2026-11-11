@@ -137,7 +137,7 @@ class ScanPanel(QtWidgets.QGroupBox):
         elif st in (EngineState.LIVE, EngineState.STARTING):
             self.b_run.setText("Freeze")
             self.b_run.setStyleSheet(FREEZE_STYLE)
-        elif st in (EngineState.SINGLE, EngineState.CAPTURE, EngineState.DISCONNECTED):
+        elif st in (EngineState.SINGLE, EngineState.CAPTURE, EngineState.DISCONNECTED, EngineState.PAUSED):
             self.b_run.setText("Stop")
             self.b_run.setStyleSheet(FREEZING_STYLE)
         else:

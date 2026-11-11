@@ -33,6 +33,11 @@ Robustness
   ``max_latency_s``) and restarts the stream automatically, at most
   ``max_recoveries`` times in a row.
 * Every wait has a timeout; :meth:`close` aborts and joins the thread.
+* Sharing the DAQ: the engine's handle is *preemptible*.  When another module
+  takes the HAL lease (``handle.exclusive``, e.g. an EDS spectrum or map),
+  live scanning stops, the engine shows ``PAUSED`` and resumes by itself when
+  the lease ends.  A capture in progress is not interrupted: the lease waits
+  for it.
 """
 from __future__ import annotations
 
@@ -56,7 +61,7 @@ from ...hal.backend import (
     StreamOverflowError,
     StreamUnderflowError,
 )
-from ...hal.manager import _KEEP
+from ...hal.manager import _KEEP, LeaseHeldError
 from ..raster import RasterConfig, RasterPlan
 from .assembler import CaptureAccumulator, FrameRecord, ImageAccumulator, StreamAssembler
 from .frames import EngineState, EventBus, Frame, FrameSlot
@@ -212,6 +217,8 @@ class ImagingEngine:
         self._closing = False
         self.frames = FrameSlot()
         self.events = EventBus()
+        self._preempted = 0
+        self.handle.set_preemptible(self._on_preempt, self._on_resume)
         self._thread = threading.Thread(target=self._main, name="easyebl-imaging", daemon=True)
         if start_thread:
             self._thread.start()
@@ -406,7 +413,7 @@ class ImagingEngine:
             self.freeze()
         elif self.state == EngineState.FREEZING:
             self.freeze(immediate=True)
-        elif self.state in (EngineState.SINGLE, EngineState.CAPTURE, EngineState.DISCONNECTED):
+        elif self.state in (EngineState.SINGLE, EngineState.CAPTURE, EngineState.DISCONNECTED, EngineState.PAUSED):
             self.stop()  # also cancels the automatic resume after a lost connection
         else:
             self.run()
@@ -602,7 +609,7 @@ class ImagingEngine:
         with self._lock:
             self._check_open()
             resume = self._mode == "live"
-        if self.is_scanning or self.state == EngineState.DISCONNECTED:
+        if self.is_scanning or self.state in (EngineState.DISCONNECTED, EngineState.PAUSED):
             self.stop()
             if not self.wait_idle(5.0):
                 raise RuntimeError(f"scanning did not stop – {what} not changed")
@@ -736,6 +743,9 @@ class ImagingEngine:
                     self._cv.wait(0.5)
                 if self._closing:
                     break
+            if self._lease_blocked():
+                self._wait_for_lease()
+                continue
             try:
                 good = self._stream_once()
                 failures = 0 if good else failures
@@ -759,12 +769,50 @@ class ImagingEngine:
                     )
                     continue
                 self._fail(e)
+            except LeaseHeldError:
+                continue  # a lease started just now: wait for it at the top of the loop
             except DeviceBusyError as e:
                 self._fail(e, f"device busy: {e}")
             except Exception as e:  # noqa: BLE001 - never let the scan thread die
                 failures += 1
                 self._fail(e, tb=traceback.format_exc())
         self._finish_captures("engine closed")
+
+    # ------------------------------------------------------------ DAQ lease
+    def _on_preempt(self, lease) -> None:
+        """Another handle takes the DAQ lease (called in its thread): stop the live scan."""
+        with self._lock:
+            mode = self._mode
+            self._preempted += 1
+            self._wake()
+        if mode in ("live", "single"):
+            # a single frame is restarted after the lease; a capture is never interrupted:
+            # the lease waits for it (the HAL refuses new streams meanwhile)
+            self.handle.abort()
+        self.events.emit("warning" if mode == "capture" else "info",
+                         f"DAQ reserved by '{lease.owner}' ({lease.reason})"
+                         + ("; waiting for the capture to finish" if mode == "capture" else "; scanning paused"))
+
+    def _on_resume(self) -> None:
+        with self._lock:
+            self._wake()
+        self.events.emit("info", "DAQ lease ended – resuming")
+
+    def _lease_blocked(self) -> bool:
+        lease = self.handle.manager.lease
+        return lease is not None and lease.owner != self.handle.owner
+
+    def _wait_for_lease(self) -> None:
+        """Stay PAUSED until the lease ends (or the mode becomes idle / the engine closes)."""
+        while True:
+            with self._cv:
+                if self._closing or self._mode == "idle" or not self._lease_blocked():
+                    break
+                self._set_state(EngineState.PAUSED, "paused – " + (
+                    f"DAQ reserved by '{self.handle.manager.lease.owner}'" if self._lease_blocked() else "DAQ busy"))
+                self._cv.wait(0.2)
+        if not self._closing and self._mode == "idle":
+            self._set_state(EngineState.FROZEN if self.frames.latest() is not None else EngineState.IDLE)
 
     def _wait_for_device(self, e: Exception) -> None:
         """DAQ connection lost: keep the requested mode, wait for the HAL to reconnect."""

@@ -106,9 +106,13 @@ def _port_of(line: str) -> str:
 
 
 class NIDAQBackend(DAQBackend):
-    def __init__(self, config: DAQConfig):
+    def __init__(self, config: DAQConfig, process_lock: bool = True):
         super().__init__(config)
         self._nidaqmx = None
+        from .devlock import DeviceLock
+
+        # one process per device (see easyebl.hal.devlock); inside the process the manager arbitrates
+        self._devlock = DeviceLock(f"NI-{config.device}") if process_lock else None
 
     # -------------------------------------------------------------- lifecycle
     def open(self) -> None:
@@ -118,6 +122,8 @@ class NIDAQBackend(DAQBackend):
         except ImportError as e:  # pragma: no cover - depends on install
             raise HALError("nidaqmx package not installed (pip install nidaqmx)") from e
         self._nidaqmx = nidaqmx
+        if self._devlock is not None:
+            self._devlock.acquire()  # DeviceBusyError if another easyEBL process drives this device
         names = [d.name for d in nidaqmx.system.System.local().devices]
         if self.config.device not in names:
             raise DeviceLostError(f"device '{self.config.device}' not found; available: {names}")
@@ -138,6 +144,8 @@ class NIDAQBackend(DAQBackend):
                     raise
             finally:
                 self._open = False
+        if self._devlock is not None:
+            self._devlock.release()
 
     # ------------------------------------------------------- connection health
     def is_device_lost(self, exc: BaseException) -> bool:

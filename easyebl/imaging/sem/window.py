@@ -26,6 +26,7 @@ STATE_COLORS = {
     EngineState.FROZEN: "#6af",
     EngineState.ERROR: "#f55",
     EngineState.DISCONNECTED: "#f55",
+    EngineState.PAUSED: "#fb4",
     EngineState.CLOSED: "#888",
 }
 
