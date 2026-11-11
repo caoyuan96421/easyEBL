@@ -389,7 +389,7 @@ class SimMCAParams:
     tfla_us: float = 0.2
     fast_resolving_us: float = 0.3  # photons closer than this are one fast trigger (true pile-up)
     lld_kev: float = 0.12
-    escape_fraction: float = 0.012  # Si Kα escape probability for E > 1.84 keV
+    escape_fraction: float | None = None  # Si Kα escape probability (None = physical, Reed & Ware)
     seed: int | None = 0
 
 
@@ -586,7 +586,13 @@ class SimulatedPulseProcessor(PulseProcessor):
         if ee.size == 0:
             return
         # Si escape peaks
-        esc = (ee > 1.84) & (self._rng.random(ee.size) < p.escape_fraction)
+        if p.escape_fraction is None:  # physical (Reed & Ware), energy dependent
+            from ..xray.generation import escape_fraction
+
+            pe = escape_fraction(ee)
+        else:
+            pe = np.where(ee > 1.84, p.escape_fraction, 0.0)
+        esc = self._rng.random(ee.size) < pe
         ee = np.where(esc, ee - 1.74, ee)
         # resolution: electronic noise ⊕ Fano
         eps = 3.85e-3

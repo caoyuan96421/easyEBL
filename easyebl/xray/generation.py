@@ -32,7 +32,10 @@ import numpy as np
 from . import XrayLine, atomic_mass, lines, mac, mac_line, normalize_composition, z_of
 
 __all__ = ["Detector", "Conditions", "characteristic", "continuum", "efficiency", "family_intensity",
-           "generation_factors", "K_CHAR", "K_CONT"]
+           "generation_factors", "escape_fraction", "K_CHAR", "K_CONT", "SI_KA", "SI_K_EDGE"]
+
+SI_KA = 1.740  # keV, Si Kα (escape peaks appear this much below the parent line)
+SI_K_EDGE = 1.839
 
 K_CHAR = 0.0356  # pure Cu Kα at 20 kV ≈ 1e-4 photons / electron / sr
 K_CONT = 3.0e-7  # Kramers constant in the same units (gives P/B ≈ 50 for Cu Kα at 20 kV)
@@ -182,3 +185,18 @@ def continuum(energy, comp: dict, cond: Conditions | None = None) -> np.ndarray:
     f = _philibert(chi, e0, ee, a_mean, z_mean)
     out[ok] = K_CONT * z_mean * (e0 - ee) / ee * f * efficiency(ee, cond.detector)
     return out
+
+
+def escape_fraction(energy_kev) -> np.ndarray:
+    """Fraction of photons of *energy* that lose a Si Kα photon (escape peak), Reed & Ware (1972)."""
+    e = np.asarray(energy_kev, dtype=float)
+    out = np.zeros_like(e)
+    m = e > SI_K_EDGE
+    if not m.any():
+        return out if np.ndim(e) else float(out)
+    w_k = 0.047  # Si K fluorescence yield
+    r = 10.8  # Si K jump ratio
+    mu_k = mac(SI_KA, 14)
+    mu_e = mac(e[m], 14)
+    out[m] = 0.5 * w_k * (1 - 1 / r) * (1 - mu_k / mu_e * np.log(1 + mu_e / mu_k))
+    return out if np.ndim(e) else float(out)
