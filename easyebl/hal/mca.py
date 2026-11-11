@@ -232,6 +232,31 @@ class PulseProcessor(ABC):
             on_update(r)
         return r
 
+    # -------------------------------------------------------------- shaping
+    def speeds(self) -> dict:
+        """Shaping presets {n: description} (1 = fastest … 5 = best resolution)."""
+        from .dp5.presets import SPEEDS, pulse_width_us
+
+        return {k: f"{k}: peaking {float(v['config']['TPEA']):g} µs, pulse ≈ {pulse_width_us(k):.1f} µs"
+                for k, v in SPEEDS.items()}
+
+    def apply_speed(self, speed: int) -> None:
+        from .dp5.presets import speed_config
+
+        self.configure({k: v for k, v in speed_config(speed).items() if k in ("TPEA", "TFLA")})
+
+    def current_speed(self) -> int | None:
+        from .dp5.presets import SPEEDS
+
+        try:
+            tpea = float(self.get_settings(["TPEA"])["TPEA"])
+        except (KeyError, ValueError, MCAError):
+            return None
+        for k, v in SPEEDS.items():
+            if abs(float(v["config"]["TPEA"]) - tpea) < 0.05:
+                return k
+        return None
+
     # -------------------------------------------------------------- sharing
     @contextlib.contextmanager
     def session(self, owner: str):
@@ -335,6 +360,20 @@ class DP5PulseProcessor(PulseProcessor):
     def get_settings(self, names) -> dict:
         self._require()
         return self._dev.read_config(list(names))
+
+    def apply_speed(self, speed: int) -> None:
+        self._require()
+        self._stop_polling()
+        try:
+            self._dev.apply_speed(speed)
+        except Exception as e:  # noqa: BLE001
+            raise MCAError(f"DP5 speed preset failed: {e}") from e
+
+    def auto_threshold(self) -> dict:
+        """Fast/slow thresholds from the noise – beam OFF (blanked), no X-rays."""
+        self._require()
+        self._stop_polling()
+        return self._dev.auto_threshold()
 
     def _write_preset(self, seconds):
         self._require()

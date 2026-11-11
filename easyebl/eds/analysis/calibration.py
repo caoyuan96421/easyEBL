@@ -36,7 +36,7 @@ STANDARDS = {
     "Ti (L + Kα + Kβ)": ["Ti La1", "Ti Ka1", "Ti Kb1"],
     "Ni (L + Kα)": ["Ni La1", "Ni Ka1"],
     "Au (M + Lα)": ["Au Ma", "Au La1"],
-    "Phantom specimen (Al, Si, Cu, Au)": ["Al Ka1", "Si Ka1", "Au Ma", "Cu Ka1"],
+    "Phantom specimen (Al, Si, Cu)": ["Cu La1", "Al Ka1", "Si Ka1", "Cu Ka1"],
 }
 
 

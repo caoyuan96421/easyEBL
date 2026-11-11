@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "easyebl"
 version = "0.1.0"
-description = "DIY SEM imaging and e-beam lithography control over NI-DAQmx (prototype)"
+description = "DIY SEM imaging, EDS and e-beam lithography control over NI-DAQmx (prototype)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "scipy>=1.10"]
@@ -14,16 +14,22 @@ dependencies = ["numpy>=1.24", "scipy>=1.10"]
 gds = ["gdstk>=0.9"]
 gui = ["PySide6>=6.5", "pyqtgraph>=0.13"]
 ni = ["nidaqmx>=0.9"]
+eds = ["pyusb>=1.2", "libusb-package>=1.0"]
 test = ["pytest>=7", "pytest-qt>=4", "gdstk>=0.9", "PySide6>=6.5", "pyqtgraph>=0.13"]
-all = ["gdstk>=0.9", "PySide6>=6.5", "pyqtgraph>=0.13", "nidaqmx>=0.9"]
+all = ["gdstk>=0.9", "PySide6>=6.5", "pyqtgraph>=0.13", "nidaqmx>=0.9", "pyusb>=1.2", "libusb-package>=1.0"]
 
 [project.scripts]
 easyebl-demo = "easyebl.gui.launcher:main"
 easyebl-sem = "easyebl.imaging.sem:main"
 easyebl-sem-cli = "easyebl.imaging.cli:main"
+easyebl-eds = "easyebl.eds.gui:main"
+easyebl-suite = "easyebl.eds.gui:suite_main"
 
 [tool.setuptools.packages.find]
 include = ["easyebl*"]
+
+[tool.setuptools.package-data]
+"easyebl.xray" = ["data/*.npz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
