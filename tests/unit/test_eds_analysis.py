@@ -146,9 +146,10 @@ def test_msa_roundtrip_and_foreign_header(tmp_path, steel):
 
 
 # real DP5 spectra of the EDS phantom (USB-6363 AO3 → DP5, 2026-11-11, scripts/hw_eds_test.py)
+_STEEL = {"Fe", "Cr", "Ni", "Mn"}
 _DP5 = {"3_cu_calibrated.msa": {"Cu"}, "4_0_Si_substrate.msa": {"Si"}, "4_1_Al_pad.msa": {"Al"},
-        "4_2_Cu_grid.msa": {"Cu"}, "4_3_stainless.msa": {"Fe", "Cr", "Ni"}, "4_4_TiO2.msa": {"Ti", "O"},
-        "4_5_NaCl.msa": {"Na", "Cl"}, "4_6_Au.msa": {"Au"}}
+        "4_2_Cu_grid.msa": {"Cu"}, "4_3_stainless.msa": _STEEL, "4_3_stainless_run2.msa": _STEEL,
+        "4_4_TiO2.msa": {"Ti", "O"}, "4_5_NaCl.msa": {"Na", "Cl"}, "4_6_Au.msa": {"Au"}}
 
 
 @pytest.mark.parametrize("name", sorted(_DP5))
@@ -159,4 +160,5 @@ def test_autoid_on_real_dp5_spectra(name):
 
     sp = load_spectrum(Path(__file__).resolve().parents[1] / "data" / "dp5_phantom" / name)
     found = {i.element for i in A.identify_elements(sp, detector=Detector(fwhm_mn_ev=156))}
-    assert found == _DP5[name]
+    truth = _DP5[name]
+    assert found <= truth and truth - found <= {"Mn"}  # Mn (2 wt%) under Cr Kβ is optional

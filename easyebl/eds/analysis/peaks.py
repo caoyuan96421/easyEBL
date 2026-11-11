@@ -132,7 +132,9 @@ def identify_elements(spectrum: Spectrum, min_significance: float = 5.0, detecto
             if expected > 4 * sd:  # a line that must be visible
                 ratio = obs / expected
                 sc += 1.0 if 0.4 < ratio < 2.5 else (-3.0 if ratio < 0.15 else -1.0)
-        return sc + (0.6 if el in COMMON_ELEMENTS else 0.0)
+        z = xray.z_of(el)
+        prior = 1.0 if el in COMMON_ELEMENTS else (-1.0 if 59 <= z <= 71 or z >= 89 else 0.0)
+        return sc + prior  # common elements first; lanthanides/actinides need clear evidence
 
     def explain(pk, net, strong, residual=False):
         """One identification pass over peaks *pk* [(E, Peak)]."""

@@ -9,6 +9,10 @@ simple **e‑beam lithography** and **imaging** tool, driven by an NI‑DAQmx mu
 * AI → SEM video signal, sampled on the **same clock** as the deflection
 * software‑timed DO → internal/external scan switch (the HAL's *external control* function)
 
+It also does **EDS** (energy-dispersive X-ray spectroscopy) with an Amptek **DP5** pulse
+processor: spectra, AutoID, standardless quantification, line scans and spectrum maps, in an
+Oxford-AZtec-like window that shares the DAQ with SEM imaging (see [EDS](#eds-amptek-dp5)).
+
 Everything is written on top of a **hardware abstraction layer (HAL)** and ships with a
 physics‑flavoured **SEM simulator**, so all subsystems, tests and GUIs run without hardware.
 
@@ -141,6 +145,51 @@ Double-click `run_imaging.bat`, or run
 * `run_hw_test.bat` is a headless check of the board: static lines, single scans and live
   streaming at several rates. It logs to `scripts/logs/console.txt`.
 
+## EDS (Amptek DP5)
+
+```bash
+run_suite.bat                    # SEM + EDS windows in one program, sharing the USB-6363
+run_eds.bat                      # EDS window only        (add --backend sim for the simulator)
+run_eds_hw_test.bat              # end-to-end hardware test with the EDS phantom (see below)
+python -m easyebl.eds --backend sim      # same as easyebl-eds; easyebl-suite for both windows
+```
+
+**Workflow (Point & ID / mapping):** acquire an electron image (or take the SEM's latest
+frame), then click a point or drag a rectangle/ellipse – the spectrum is acquired there,
+elements are identified (AutoID, or pick them on the periodic table) and quantified
+(standardless ZA, optional oxygen by stoichiometry).  Draw a map area or a line for spectrum
+maps and line scans; maps can be shown as window, fitted (deconvolved) or quantitative
+(wt %) maps and clustered into phases.  Spectra save as EMSA `.msa`, maps as `.npz`.
+**Tools → Energy calibration** fits channel → keV from the peaks of a standard (Cu L + Cu Kα,
+Al + Cu, Mn Kα/Kβ …; auto-assigned or clicked), reports residuals and the detector FWHM, and
+stores the result per user.  **Tools → Pulse processor** sets the DP5 shaping preset and
+parameters.
+
+**Sharing the DAQ:** every EDS job takes the HAL's *exclusive lease*: the live SEM image pauses
+(state `PAUSED`), the SEM is switched to external scan for the job, and imaging resumes by
+itself afterwards; a capture or an exposure is never interrupted (the lease waits).  Two
+separate programs cannot drive the same NI device (an OS lock gives a clear "in use" error),
+so use `run_suite.bat` for SEM + EDS.
+
+**How maps are acquired:** the DP5 has no list mode, so maps are step scans.  Every pixel gets
+a slot (settle + dwell + ~15 ms) scheduled ahead on the DAQ sample clock; when the beam reaches
+it, the MCA counts for a preset real time (`PRER`, 1 ms resolution) and is read out and cleared
+while the beam moves on.  A slot the PC reaches too late is redone at the end.  On the
+USB-6363 + DP5 the overhead is ≈ 22 ms per pixel (64×48 at 50 ms dwell ≈ 3.6 min).
+
+**EDS phantom (testing without an SEM):** `--phantom eds` makes the USB-6363 generate a
+multi-phase specimen: its SE image on **AO2** (wire to AI0) and the signal of a **reset-type SDD
+preamplifier** on **AO3** (wire to the DP5 input) – photon steps whose rate and energies follow
+the composition under the commanded beam position (X-ray generation model at 20 kV, Fano
+statistics, leakage ramp, resets).  With the simulator the same photons feed a simulated pulse
+processor.  `run_eds_hw_test.bat` uses it to check the whole chain: image, count rate,
+calibration, AutoID/quant on every phase, a map against the ground truth, and the SEM pause.
+
+**DP5 notes (FW 6.10.02):** a preset real time stops counting and sets "preset done" but leaves
+"MCA enabled" set (the HAL disables it before read-and-clear).  With the phantom's 6 mV/keV
+steps the factory fast threshold (`THFA` 30) misses pulses (ICR < OCR) – run *Auto thresholds*
+with the beam off; the live time is clamped to the real time meanwhile.
+
 ## Demo / debug GUIs
 
 ```bash
@@ -167,6 +216,10 @@ easyebl/
     engine/   threaded ImagingEngine: settings, source, program, assembler, frames, core
     sem/      SEM GUI: window, view (data bar), panels, advanced dialog, optics stubs
     cli.py    text console; export.py  TIFF/PNG/JSON writers; launch.py  engine from CLI args
+  hal/dp5/    vendored Amptek DP5 USB driver; hal/mca.py pulse-processor HAL (DP5, simulated DPP)
+  hal/eds_phantom.py  EDS phantom (SE image + reset-preamp SDD signal); hal/devlock.py process lock
+  xray/       X-ray lines/edges/attenuation (xraydb tables) and the generation model
+  eds/        EDSController (spectra, images, maps), spectrum/map data, analysis/, gui/
   alignment/  templates + NCC matching, transform fitting, MarkerAligner
   litho/      dose maths, geometry, fills, VectorScanCompiler, LithoWriter, GDS import
   gui/        shared widgets (DataclassForm, ImageView, WaveformView) and the launcher
@@ -179,7 +232,8 @@ handle sharing, lag handling, dose quantisation).
 
 | Subsystem | Highlights |
 |---|---|
-| **HAL** | One hardware‑timed stream at a time per device; per‑module handles; exclusive claims for relays and other resources; automatic **blank + park** after every stream, including errors and aborts; voltage, rate and channel validation; event listeners for GUIs. |
+| **EDS** | Point/area/live-time spectra, electron image, line scans, scheduled step-scan maps; SNIP background, calibration, AutoID (escape/sum/flank artefacts rejected), non-negative least-squares fit with refined resolution, iterative standardless ZA quant, window/fitted/quant/phase maps. |
+| **HAL** | One hardware‑timed stream at a time per device; exclusive **lease** with preemption of the live image; per‑module handles; exclusive claims for relays and other resources; automatic **blank + park** after every stream, including errors and aborts; voltage, rate and channel validation; event listeners for GUIs. |
 | **Imaging** | Pixel staircase with configurable **pre‑line** (overscan ramp or hold, optionally blanked), **flyback** (linear/cosine/step, blanked by default), frame settle, bidirectional scans, scan rotation, frame averaging, per‑pixel settle discard, fractional **lag compensation**, live rows, sync marker lines for EDS. |
 | **Alignment** | Sub‑pixel normalised cross‑correlation; cross/square/image templates; **bidirectional averaging** cancels deflection/video lag (the lag is reported as a health check); translation/rigid/similarity/affine fits; rejection of weak or inconsistent marks. |
 | **Vector litho** | Grid‑aligned raster fill (even–odd, so holes and keyhole polygons work), serpentine or unidirectional fill along x or y; single‑pass lines; dots; blanked jumps with distance‑dependent settle; step‑and‑blank mode; **blanker‑delay compensation**; dose **error diffusion**; streaming in chunks; abort. |
