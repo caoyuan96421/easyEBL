@@ -67,7 +67,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.settings = settings or EDSSettings()
         self.sem = sem_engine
         # MicroscopeControl: the SEM's accelerating voltage becomes the nominal beam energy; a bundle
-        # (easyebl.microscope.launch) adds the microscope window and the stage readback for metadata
+        # (easyebl.microscope.bundle) adds the microscope window and the stage readback for metadata
         self.bundle = microscope_bundle
         if microscope is None and microscope_bundle is not None and microscope_bundle.connected:
             microscope = microscope_bundle.sem

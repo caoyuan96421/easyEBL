@@ -10,11 +10,5 @@ Modules:
 
 The column (magnification, focus …) is controlled through :mod:`easyebl.microscope`.
 
-Run:  ``python -m easyebl.imaging.sem [--backend nidaqmx --device Dev1] [--console]``
+The window is opened from the easyEBL program (``easyebl``, :mod:`easyebl.app`).
 """
-
-
-def main(argv=None) -> int:
-    from .app import main as _main
-
-    return _main(argv)

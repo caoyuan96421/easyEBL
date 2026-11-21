@@ -56,10 +56,11 @@ class Session:
         rtscts: bool = False,
         dsrdtr: bool = False,
         xonxoff: bool = False,
+        baudrate: int = 9600,
         **kw,
     ) -> "Session":
-        """Open real serial port(s) at 9600 8N1."""
-        flow = dict(rtscts=rtscts, dsrdtr=dsrdtr, xonxoff=xonxoff)
+        """Open real serial port(s), 8N1 at *baudrate* (the S-3000 uses 9600)."""
+        flow = dict(rtscts=rtscts, dsrdtr=dsrdtr, xonxoff=xonxoff, baudrate=baudrate)
         sem_t = SerialTransport(port, **flow)
         stage_t = SerialTransport(stage_port, **flow) if stage_port and stage_port != port else None
         return cls.from_transports(sem_t, stage_t, **kw)

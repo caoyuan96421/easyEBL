@@ -189,12 +189,3 @@ def test_dose_gui(qtbot, session):
     w.update()
     assert "minimum" in w.warn.text()
 
-
-def test_launcher(qtbot, session):
-    from easyebl.gui.launcher import MainWindow
-
-    w = MainWindow(session)
-    qtbot.addWidget(w)
-    assert w.tabs.count() == 6
-    owners = {h.owner for h in session.manager.handles()}
-    assert {"hal-debug", "imaging", "alignment", "litho-vector", "litho-gds"} <= owners

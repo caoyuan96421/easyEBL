@@ -1,6 +1,6 @@
 """Raster imaging debug GUI: scan settings, waveform preview, live image.
 
-Run:  ``python -m easyebl.imaging.gui``
+Opened from the easyEBL program: Open → Tools → Raster imaging (debug).
 """
 from __future__ import annotations
 
@@ -19,11 +19,10 @@ from ..gui.common import (
     Session,
     WaveformView,
     Worker,
-    run_standalone,
 )
 from .raster import RasterConfig, RasterImager, RasterPlan
 
-__all__ = ["ImagingWidget", "RASTER_FORM_OVERRIDES", "main"]
+__all__ = ["ImagingWidget", "RASTER_FORM_OVERRIDES"]
 
 RASTER_FORM_OVERRIDES = {
     "nx": {"min": 1, "max": 8192},
@@ -363,11 +362,3 @@ class ImagingWidget(QtWidgets.QWidget):
         if self.cb_control.isChecked():
             self.cb_control.setChecked(False)
         super().closeEvent(ev)
-
-
-def main(argv=None) -> int:
-    return run_standalone(ImagingWidget, "Raster imaging", argv)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

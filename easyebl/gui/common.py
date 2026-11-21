@@ -1,18 +1,16 @@
 """Shared helpers for the debug/demo GUIs (PySide6 + pyqtgraph).
 
-Every subsystem GUI is a ``QWidget`` that takes a :class:`Session`, so the
-same widgets can run standalone (``python -m easyebl.imaging.gui``) or as tabs
-of the launcher, where they share one DAQ manager – demonstrating the HAL's
-handle sharing.
+Every lithography / debug GUI is a ``QWidget`` that takes a :class:`Session`
+(the DAQ manager of the easyEBL backend and a field calibration); the easyEBL
+program (:mod:`easyebl.app`) shows each one in a window of its own.
 """
 from __future__ import annotations
 
-import argparse
 import dataclasses
 import sys
 import traceback
 import typing
-from typing import Any, Callable
+from typing import Callable
 
 import numpy as np
 
@@ -23,7 +21,7 @@ except ImportError as e:  # pragma: no cover
     raise ImportError("GUI requires PySide6 and pyqtgraph: pip install easyebl[gui]") from e
 
 from ..core.calibration import FieldCalibration
-from ..hal import DAQConfig, DAQManager, SimParams, SimulatedBackend, create_backend
+from ..hal import DAQConfig, DAQManager, SimParams, SimulatedBackend
 
 __all__ = [
     "QtCore",
@@ -39,8 +37,6 @@ __all__ = [
     "LogBox",
     "parse_points",
     "format_points",
-    "run_standalone",
-    "standalone_parser",
 ]
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
@@ -65,25 +61,6 @@ class Session:
     def simulated(cls, sample=None, params: SimParams | None = None, config: DAQConfig | None = None):
         be = SimulatedBackend(config or DAQConfig(), params or SimParams(), sample)
         return cls(DAQManager(be).open())
-
-    @classmethod
-    def from_args(cls, args) -> "Session":
-        preset = getattr(args, "preset", None)
-        if args.config:
-            cfg = DAQConfig.from_json(open(args.config).read())
-        elif preset == "usb6363":
-            cfg = DAQConfig.usb6363()
-        else:
-            cfg = DAQConfig()
-        if args.device:
-            cfg.device = args.device
-        field = getattr(args, "field_um", None) or 100.0
-        cal = FieldCalibration(field, cfg.ao_limit_v)
-        if args.backend == "sim":
-            s = cls.simulated(config=cfg, params=SimParams(field_size_um=field, v_full_scale=cfg.ao_limit_v))
-            s.calibration = cal
-            return s
-        return cls(DAQManager(create_backend(args.backend, cfg)).open(), cal)
 
     @property
     def simulator(self) -> SimulatedBackend | None:
@@ -368,29 +345,3 @@ def parse_points(text: str) -> np.ndarray:
 
 def format_points(pts) -> str:
     return "\n".join(f"{x:g}, {y:g}" for x, y in np.atleast_2d(pts))
-
-
-# ----------------------------------------------------------------- standalone
-def standalone_parser(desc: str) -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=desc)
-    p.add_argument("--backend", default="sim", choices=["sim", "nidaqmx"], help="hardware backend")
-    p.add_argument("--device", default=None, help="NI device name (e.g. Dev1)")
-    p.add_argument("--config", default=None, help="DAQConfig JSON file")
-    p.add_argument("--preset", default=None, choices=["usb6363"], help="built-in wiring preset")
-    p.add_argument("--field-um", dest="field_um", type=float, default=None,
-                   help="field size (µm) that the full AO range maps to (default 100)")
-    return p
-
-
-def run_standalone(widget_factory: Callable[[Session], QtWidgets.QWidget], title: str, argv=None) -> int:
-    args = standalone_parser(title).parse_args(argv)
-    app = ensure_app()
-    session = Session.from_args(args)
-    w = widget_factory(session)
-    w.setWindowTitle(f"easyEBL – {title} [{session.manager.capabilities().name}]")
-    w.resize(1300, 850)
-    w.show()
-    try:
-        return app.exec()
-    finally:
-        session.close()

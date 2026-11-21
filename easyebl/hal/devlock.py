@@ -6,8 +6,8 @@ an EDS window started separately) cannot see each other's manager, and DAQmx
 would happily let both drive the same AO channels.  The NI backend therefore
 takes an OS file lock named after the device when it opens; a second process
 gets a clear :class:`~easyebl.hal.DeviceBusyError` naming the holder's PID
-instead of fighting over the scan coils.  Run SEM and EDS in one process (the
-suite launcher) to share the DAQ.
+instead of fighting over the scan coils.  The easyEBL program (``easyebl``) opens the
+DAQ once and shares it between all subsystems.
 
 The lock lives in the temp directory and is released by the OS when the
 process exits, even after a crash.
@@ -68,7 +68,7 @@ class DeviceLock:
                 pid = self.holder_pid()
                 raise DeviceBusyError(
                     f"{self.name} is in use by another easyEBL process" + (f" (PID {pid})" if pid else "")
-                    + " – close it, or run SEM and EDS together in one window (easyebl-suite)"
+                    + " – use its menu (tray icon) to open more subsystems instead of a second program"
                 ) from None
             fh.seek(0)
             fh.truncate()

@@ -1,6 +1,6 @@
 """HAL debug GUI: device state, handles/claims, static control, test waveforms.
 
-Run:  ``python -m easyebl.hal.gui [--backend nidaqmx --device Dev1]``
+Opened from the easyEBL program: Open → Tools → HAL debug.
 """
 from __future__ import annotations
 
@@ -14,10 +14,9 @@ from ..gui.common import (
     Session,
     WaveformView,
     Worker,
-    run_standalone,
 )
 
-__all__ = ["HALDebugWidget", "test_waveform", "main"]
+__all__ = ["HALDebugWidget", "test_waveform"]
 
 
 def test_waveform(kind: str, amp_v: float, freq_hz: float, duration_s: float, rate: float, blank_square: bool):
@@ -218,11 +217,3 @@ class HALDebugWidget(QtWidgets.QWidget):
         self.mgr.remove_listener(self._listener)
         self.handle.close()
         super().closeEvent(ev)
-
-
-def main(argv=None) -> int:
-    return run_standalone(HALDebugWidget, "HAL debug", argv)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

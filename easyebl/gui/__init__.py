@@ -1,1 +1,1 @@
-"""Shared GUI helpers and the demo launcher (requires PySide6 + pyqtgraph)."""
+"""Shared GUI helpers for the lithography and debug tools (requires PySide6 + pyqtgraph)."""

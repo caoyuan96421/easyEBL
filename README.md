@@ -32,7 +32,7 @@ Python 3.10 or newer.
 python -m venv .venv
 .venv\Scripts\activate            # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
-pip install -e .                   # the easyebl package and its console commands
+pip install -e .                   # the easyebl package and the `easyebl` command
 ```
 
 `requirements.txt` lists every prerequisite (numpy, scipy, PySide6, pyqtgraph, gdstk, nidaqmx,
@@ -42,25 +42,40 @@ a libusb/WinUSB driver.
 
 ## Running
 
-Every program takes `--backend sim` (simulator, no hardware) or
-`--backend nidaqmx --preset usb6363 --device Dev1` (the USB-6363 on the SEM).  SEM, EDS and the
-suite also take `--microscope COM4` (the S-3000's RS-232 port), `--microscope sim` (default with
-`--backend sim`) or `--microscope none` (default on hardware).  `easyebl-microscope` takes
-`--port COM4` or `--port sim`.
+There is one program:
 
-| Program | Console command | Module |
-|---|---|---|
-| SEM imaging | `easyebl-sem` | `python -m easyebl.imaging.sem` |
-| SEM text console | `easyebl-sem-cli` | `python -m easyebl.imaging.cli` |
-| EDS | `easyebl-eds` | `python -m easyebl.eds` |
-| SEM + EDS (+ microscope) in one program | `easyebl-suite` | `python -m easyebl.eds.gui.suite` |
-| Microscope (column + stage) | `easyebl-microscope` | `python -m easyebl.microscope` |
-| Demo / all tools as tabs | `easyebl-demo` | `python -m easyebl.gui.launcher` |
-| Raster debug GUI | – | `python -m easyebl.imaging.gui` |
+```bash
+easyebl                  # the hardware configured in Hardware → Configure… (saved per user)
+easyebl --sim            # this session on simulators only (the saved configuration is kept)
+easyebl --open sem,eds   # also open these windows: sem, eds, microscope, vector, gds, dose,
+                         # alignment, raster, hal
+python -m easyebl        # the same as easyebl
+```
 
-In VS Code select the `.venv` interpreter (*Python: Select Interpreter*) and pick a program in
-*Run and Debug* (F5): `.vscode/launch.json` has a simulator and a USB-6363 entry for each.
-`python -m easyebl.eds.gui.suite` is the module form of `easyebl-suite`.
+It opens a **small menu window** that shows, for the scan DAQ, the EDS pulse processor and the
+microscope, whether it is connected (green), simulated (blue), waiting or needing attention
+(orange) or failed (red, with the reason), and puts an **icon in the system tray**.
+
+* **Open** starts a subsystem: SEM imaging, EDS, Microscope (column & stage), and under *Tools*
+  vector and GDS lithography, the dose calculator, alignment, the raster debug GUI and HAL debug.
+  A subsystem whose hardware is missing is greyed out (the tooltip says why).
+* **Hardware → Configure…** chooses each device and its address: NI-DAQmx device name or the
+  simulator, wiring preset or a DAQConfig JSON, start field, sample clock, buffer latency, video
+  input mode; DP5 (USB), its mock device or none; the microscope's serial port (listed), the
+  simulator or none, and the baud rate.  *Apply & reconnect* saves it to
+  `%APPDATA%\easyEBL\system.json` and reconnects; *All simulators* fills in the simulators.
+  **Reconnect all** reopens everything with the same settings.
+* **The hardware stays connected in the background.**  All subsystems share the one backend (one
+  DAQ manager, one DP5, one serial port), so SEM and EDS share the DAQ through the HAL lease.
+  Closing a subsystem window, or the menu window itself, does not disconnect anything.
+* **Tray icon:** click it to bring the menu back; right-click it for the menu, any subsystem,
+  *Hardware…* and **Shut down easyEBL**, which closes every window and disconnects all hardware.
+  The icon shows a coloured dot when a device needs attention.
+* Only one easyEBL runs per user: starting it again brings the running menu to the front (and
+  opens the windows named by `--open`).
+
+In VS Code select the `.venv` interpreter (*Python: Select Interpreter*) and pick *easyEBL* or
+*easyEBL (simulators)* in *Run and Debug* (F5).
 
 ## Quick start (simulator)
 
@@ -89,8 +104,7 @@ report = LithoWriter(mgr.get_handle("litho"), cal).expose(pattern, params, trans
 
 ## SEM imaging (USB-6363)
 
-Run `easyebl-sem --backend nidaqmx --preset usb6363 --device Dev1` (or `--backend sim` for the
-simulator). The window looks and works like a commercial SEM screen:
+Open → *SEM imaging*.  The window looks and works like a commercial SEM screen:
 
 * **Run / Freeze** (F5): Freeze finishes the frame; press again to stop at once. **Single** (F6).
 * **Speed**: TV · Fast 1–2 · Slow 1–3 · Photo 1–3 (0.5–160 µs per pixel; F3/F4 step faster or slower). **Scan size**: 320×240 to 2560×1920.
@@ -98,16 +112,15 @@ simulator). The window looks and works like a commercial SEM screen:
 * **Contrast / Brightness**, **Auto C/B** (Ctrl+A, one-shot or continuous), and running **averaging**.
 * **Beam shift**: arrow pad, drag the image, or double-click a point to centre it. It is clamped to the field.
 * **Data bar** with the scale bar, field magnification and date. There is also a scan-line marker during slow scans.
-* **Magnification, focus/WD, stigmation, gun alignment** go to the SEM over RS-232 (`--microscope`); the
+* **Magnification, focus/WD, stigmation, gun alignment** go to the SEM over RS-232; the
   mouse wheel on the image steps the magnification and the field calibration follows it (see
   [Microscope](#microscope-hitachi-s-3000-rs-232)).  The data bar shows the SEM's kV and WD, and captures
   store the column and stage readbacks in their metadata.  **Microscope…** opens the stage window.
 * **Advanced…**: sample rate, buffer/latency, video input range, flyback, pre-line, settle, lag compensation, field calibration, and save options.
 * **External scan** (toolbar) switches the SEM between its own scan and this program (HAL external control).
 
-The same engine can be driven from text commands:
-`python -m easyebl.imaging.cli -c "run; wait frames=5; capture shot frames=2 res=2560x1920 speed=Photo1; quit"`.
-You can also start the GUI with `--console` to type commands next to it.
+The engine can also be driven by text commands from Python
+(`easyebl.imaging.cli.ImagingShell(engine).run_commands("run; wait frames=5; capture shot frames=2")`).
 
 ### How the imaging engine uses the hardware
 
@@ -139,7 +152,7 @@ without the device and connect when it appears. Simulator tests: `tests/system/t
 
 ### Raster debug GUI
 
-Run `python -m easyebl.imaging.gui --backend nidaqmx --preset usb6363 [--field-um 100]`.
+Open → Tools → *Raster imaging (debug)*.
 
 * **External scan control** switches the SEM to DAQ scanning (HAL external control).
   Unchecking it returns the SEM to internal scan.
@@ -151,15 +164,9 @@ Run `python -m easyebl.imaging.gui --backend nidaqmx --preset usb6363 [--field-u
 
 ## EDS (Amptek DP5)
 
-```bash
-easyebl-suite --backend nidaqmx --preset usb6363 --device Dev1   # SEM + EDS windows sharing the USB-6363
-easyebl-eds   --backend nidaqmx --preset usb6363 --device Dev1   # EDS window only
-easyebl-eds   --backend sim                                      # simulator + the DP5 driver's mock device
-```
-
-`--mca dp5` (default on hardware) uses the DP5 over USB; `--mca mock` (default with
-`--backend sim`) uses the DP5 driver's mock device, which counts a ⁵⁵Fe-like spectrum (Mn Kα/Kβ)
-independent of the beam position.
+Open → *EDS*.  In *Hardware → Configure…* the pulse processor is the DP5 over USB, or the DP5
+driver's mock device, which counts a ⁵⁵Fe-like spectrum (Mn Kα/Kβ) independent of the beam
+position (the simulator configuration).
 
 **Workflow (Point & ID / mapping):** acquire an electron image (or take the SEM's latest
 frame), then click a point or drag a rectangle/ellipse – the spectrum is acquired there,
@@ -176,7 +183,7 @@ parameters.
 (state `PAUSED`), the SEM is switched to external scan for the job, and imaging resumes by
 itself afterwards; a capture or an exposure is never interrupted (the lease waits).  Two
 separate programs cannot drive the same NI device (an OS lock gives a clear "in use" error),
-so use `easyebl-suite` for SEM + EDS.
+which is why there is one easyEBL program for every subsystem.
 
 **How maps are acquired:** the DP5 has no list mode, so maps are step scans.  Every pixel gets
 a slot (settle + dwell + ~15 ms) scheduled ahead on the DAQ sample clock; when the beam reaches
@@ -191,10 +198,7 @@ clamped to the real time meanwhile.
 
 ## Microscope (Hitachi S-3000, RS-232)
 
-```bash
-easyebl-microscope --port COM4          # column settings + stage (or --port sim)
-easyebl-suite --backend nidaqmx --preset usb6363 --device Dev1 --microscope COM4   # everything together
-```
+Open → *Microscope*; the port and baud rate are set in *Hardware → Configure…*.
 
 The SEM text protocol and the stage protocol share **one serial port** (9600 8N1; the SEM relays
 the stage lines after `#STAGE ON`, which is sent automatically).  The driver
@@ -233,22 +237,16 @@ S-3000. On top of it:
   are stored in `microscope.json`.  Only beam 1 is used: the protocol has no command to select
   between the SEM's two beam-current memories.
 
-The serial port can be opened by one program at a time: use `easyebl-suite` to run SEM, EDS and the
-microscope window together.  Only the simulator has been used so far; see
+The serial port is opened once by the easyEBL backend and shared by the SEM, EDS and microscope
+windows.  Only the simulator has been used so far; see
 *hitachi_s3000_control_lib/docs/commissioning.md* for what is verified on the instrument.
 
-## Demo / debug GUIs
+## Lithography and debug tools
 
-```bash
-easyebl-demo                              # all tools as tabs, sharing one DAQ manager
-python -m easyebl.hal.gui                 # HAL: handles/claims, static beam, test waveforms
-python -m easyebl.imaging.gui             # raster imaging
-python -m easyebl.alignment.gui           # automatic marker alignment (sim: misplace specimen)
-python -m easyebl.litho.gui_vector        # single polygon (raster fill), lines & dots
-python -m easyebl.litho.gui_gds [f.gds]   # GDS lithography with dose mapping
-python -m easyebl.litho.gui_dose          # dose / dwell calculator
-# add  --backend nidaqmx --device Dev1 [--config daq.json]  for hardware
-```
+Open → Tools: *Vector lithography* (single polygon with raster fill, lines and dots), *GDS
+lithography* (dose mapping), *Dose calculator*, *Alignment* (automatic marker alignment; on the
+simulator it misplaces the specimen), *Raster imaging (debug)* and *HAL debug* (handles, claims,
+static beam, test waveforms).  They use the same DAQ as SEM imaging.
 
 On the simulator, the litho GUIs show the resulting **dose map**, and the alignment GUI
 compares the fitted transform with the deliberately misplaced specimen.
@@ -262,7 +260,7 @@ easyebl/
   imaging/    RasterConfig → RasterPlan (waveforms) → RasterImager (+ LineAssembler for AI)
     engine/   threaded ImagingEngine: settings, source, program, assembler, frames, core
     sem/      SEM GUI: window, view (data bar), panels (column via easyebl.microscope), advanced dialog
-    cli.py    text console; export.py  TIFF/PNG/JSON writers; launch.py  engine from CLI args
+    cli.py    text commands (ImagingShell); export.py  TIFF/PNG/JSON writers
   hal/dp5/    vendored Amptek DP5 USB driver (+ mock device); hal/mca.py pulse-processor HAL
   hal/devlock.py  process lock on the NI device
   microscope/ Hitachi S-3000 RS-232: link (shared port, priorities), sem (column HAL), stage (stage HAL),
@@ -273,7 +271,8 @@ tests/        unit/, system/ (simulator pipelines), gui/ (offscreen Qt); data/ r
   eds/        EDSController (spectra, images, maps), spectrum/map data, analysis/, gui/
   alignment/  templates + NCC matching, transform fitting, MarkerAligner
   litho/      dose maths, geometry, fills, VectorScanCompiler, LithoWriter, GDS import
-  gui/        shared widgets (DataclassForm, ImageView, WaveformView) and the launcher
+  gui/        shared widgets (DataclassForm, ImageView, WaveformView) for the tools
+  app/        the easyEBL program: SystemConfig, SystemBackend (all hardware), menu window + tray
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the design rationale (timing model,

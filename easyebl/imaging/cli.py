@@ -1,36 +1,24 @@
-"""Command-line control of the imaging engine.
+"""Text commands for the imaging engine (scripting).
 
-Interactive::
+:class:`ImagingShell` is a :class:`cmd.Cmd` on an :class:`ImagingEngine`; every
+command goes through the engine's thread-safe API::
 
-    python -m easyebl.imaging.cli --backend nidaqmx --device Dev1
-    sem> run
-    sem> speed Slow 1
-    sem> shift 2 -1
-    sem> capture photos/sample1 frames=2 res=2560x1920 speed=Photo1
-    sem> quit
+    from easyebl.imaging.cli import ImagingShell
+    sh = ImagingShell(engine, close_on_quit=False)
+    sh.run_commands("run; speed Slow 1; wait 3; capture photos/sample1 frames=2; freeze")
 
-One-shot / scripted (commands separated by ``;`` or from a file)::
-
-    python -m easyebl.imaging.cli -c "run; wait 3; capture shot.tif; quit"
-    python -m easyebl.imaging.cli --script session.txt
-
-The same :class:`ImagingShell` also runs inside the SEM GUI (``--console``),
-controlling the very engine the GUI shows; every command goes through the
-engine's thread-safe API.
+``help`` lists the commands (``run``, ``speed``, ``shift``, ``capture`` …).
 """
 from __future__ import annotations
 
-import argparse
 import cmd
 import shlex
-import sys
-import threading
 import time
 
-from .engine import RESOLUTIONS, SCAN_SPEEDS, EngineState, ImagingEngine, speed_by_name
+from .engine import RESOLUTIONS, SCAN_SPEEDS, ImagingEngine, speed_by_name
 from .export import save_frame
 
-__all__ = ["ImagingShell", "main", "start_console"]
+__all__ = ["ImagingShell"]
 
 
 def _kv(args: list[str]) -> tuple[list[str], dict]:
@@ -333,57 +321,3 @@ class ImagingShell(cmd.Cmd):
 
     do_exit = do_quit
     do_EOF = do_quit
-
-
-def start_console(engine: ImagingEngine, on_quit=None) -> threading.Thread:
-    """Run an :class:`ImagingShell` on stdin/stdout in a daemon thread (for the GUI)."""
-
-    def loop():
-        sh = ImagingShell(engine, close_on_quit=False)
-        try:
-            sh.cmdloop()
-        finally:
-            if on_quit is not None:
-                on_quit()
-
-    t = threading.Thread(target=loop, name="easyebl-console", daemon=True)
-    t.start()
-    return t
-
-
-def main(argv=None) -> int:
-    for s in (sys.stdout, sys.stderr):
-        try:
-            s.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
-            pass
-    from .launch import add_hardware_args, open_engine
-
-    p = add_hardware_args(argparse.ArgumentParser(description="easyEBL SEM imaging console"))
-    p.add_argument("-c", "--commands", default=None, help="commands separated by ';' (then exit)")
-    p.add_argument("--script", default=None, help="file with one command per line (then exit)")
-    p.add_argument("--external", "--relay", dest="external", action="store_true",
-                   help="switch the SEM to external scan (HAL external control) while the console runs")
-    args = p.parse_args(argv)
-    mgr, engine = open_engine(args)
-    relay = None
-    try:
-        if args.external:
-            relay = mgr.get_handle("external_scan")
-            relay.set_external_control(True)
-        sh = ImagingShell(engine)
-        if args.commands or args.script:
-            text = args.commands or open(args.script, encoding="utf-8").read()
-            sh.run_commands(text)
-            return 1 if sh.failed else 0
-        sh.cmdloop()
-        return 0
-    finally:
-        engine.close()
-        if relay is not None:
-            relay.close()  # returns the SEM to its internal scan
-        mgr.close()
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

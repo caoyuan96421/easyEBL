@@ -1,13 +1,13 @@
 """Dose / dwell-time calculator GUI.
 
-Run:  ``python -m easyebl.litho.gui_dose``
+Opened from the easyEBL program: Open → Tools → Dose calculator.
 """
 from __future__ import annotations
 
-from ..gui.common import DataclassForm, QtWidgets, Session, ensure_app
+from ..gui.common import DataclassForm, QtWidgets, Session
 from .dose import DoseCalculator
 
-__all__ = ["DoseCalculatorWidget", "main"]
+__all__ = ["DoseCalculatorWidget"]
 
 OVERRIDES = {
     "field_um": {"label": "field size", "suffix": " µm", "min": 0.001, "decimals": 3},
@@ -80,16 +80,3 @@ class DoseCalculatorWidget(QtWidgets.QWidget):
             self.out.setItem(i, 1, QtWidgets.QTableWidgetItem(v))
         self.out.resizeColumnToContents(0)
         self.warn.setText("<br>".join("⚠ " + w for w in r.warnings) or "✓ settings OK")
-
-
-def main(argv=None) -> int:
-    app = ensure_app()
-    w = DoseCalculatorWidget()
-    w.setWindowTitle("easyEBL – dose calculator")
-    w.resize(800, 420)
-    w.show()
-    return app.exec()
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

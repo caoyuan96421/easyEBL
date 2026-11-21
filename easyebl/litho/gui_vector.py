@@ -1,16 +1,16 @@
 """Vector-scan lithography debug GUI: single polygon (raster fill), lines and dots.
 
-Run:  ``python -m easyebl.litho.gui_vector``
+Opened from the easyEBL program: Open → Tools → Vector lithography.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from ..gui.common import QtWidgets, Session, format_points, parse_points, run_standalone
+from ..gui.common import QtWidgets, Session, format_points, parse_points
 from .geometry import Dot, Pattern, Polygon, Polyline, regular_polygon
 from .gui_common import ExposurePanel
 
-__all__ = ["VectorLithoWidget", "PRESETS", "main"]
+__all__ = ["VectorLithoWidget", "PRESETS"]
 
 PRESETS = {
     "rectangle 10×6 µm": [(-5, -3), (5, -3), (5, 3), (-5, 3)],
@@ -115,11 +115,3 @@ class VectorLithoWidget(QtWidgets.QWidget):
         if self.mode.currentIndex() == 0:
             return Pattern([self.polygon()])
         return self.lines_and_dots()
-
-
-def main(argv=None) -> int:
-    return run_standalone(VectorLithoWidget, "Vector-scan lithography", argv)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

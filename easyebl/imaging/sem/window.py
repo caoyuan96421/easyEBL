@@ -78,7 +78,7 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.engine = engine
         self.owns_engine = owns_engine
         self.simulated = simulated
-        # a MicroscopeBundle (easyebl.microscope.launch) gives the stage, the microscope window and the
+        # a MicroscopeBundle (easyebl.microscope.bundle) gives the stage, the microscope window and the
         # magnification ↔ field coupling; a bare MicroscopeControl only the column
         self.bundle = microscope_bundle
         self.mic = microscope or (microscope_bundle.sem if microscope_bundle is not None else StubMicroscope())

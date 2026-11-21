@@ -1,25 +1,17 @@
-"""Opening the microscope from command-line arguments, for the SEM, EDS and suite programs.
+"""The opened microscope as one object: link, SEM and stage HAL modules, settings.
 
-The serial port can be opened by one program at a time, so each program opens
-it once (:func:`open_from_args`) and hands the same :class:`MicroscopeBundle`
-to every window that needs it: the SEM window (column panel, data bar, image
-metadata), the EDS window (beam voltage) and the microscope window.
+The serial port can be opened by one program at a time, so the easyEBL
+backend opens it once (:func:`open_bundle`) and hands the same
+:class:`MicroscopeBundle` to every window that needs it: the SEM window
+(column panel, data bar, image metadata), the EDS window (beam voltage) and
+the microscope window.
 """
 from __future__ import annotations
-
-import argparse
 
 from .control import StubMicroscope
 from .settings import MicroscopeSettings
 
-__all__ = ["add_microscope_args", "open_from_args", "MicroscopeBundle"]
-
-
-def add_microscope_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    p.add_argument("--microscope", default=None, metavar="PORT",
-                   help="SEM remote control (Hitachi S-3000, RS-232): a serial port (e.g. COM4), 'sim' or 'none'; "
-                        "default: 'sim' with --backend sim, else 'none'")
-    return p
+__all__ = ["MicroscopeBundle", "open_bundle"]
 
 
 class MicroscopeBundle:
@@ -30,6 +22,8 @@ class MicroscopeBundle:
         self.sem = sem if sem is not None else StubMicroscope()
         self.settings = settings or MicroscopeSettings()
         self.follower = None
+        #: ``opener()`` shows the microscope window (set by the easyEBL app, which manages the windows)
+        self.opener = None
         self._window = None
 
     @property
@@ -55,7 +49,7 @@ class MicroscopeBundle:
         return self.follower
 
     def window(self, parent=None):
-        """The microscope window (created once; the bundle keeps owning the port)."""
+        """A microscope window of its own (when no app manages the windows)."""
         if self.link is None:
             return None
         if self._window is None:
@@ -66,6 +60,8 @@ class MicroscopeBundle:
         return self._window
 
     def show_window(self):
+        if self.opener is not None:
+            return self.opener()
         w = self.window()
         if w is not None:
             w.show()
@@ -86,18 +82,17 @@ class MicroscopeBundle:
             self.link.close()
 
 
-def open_from_args(args, settings: MicroscopeSettings | None = None) -> MicroscopeBundle:
-    """Open the microscope named by ``--microscope`` (a stub bundle for 'none')."""
-    port = getattr(args, "microscope", None)
-    if port is None:
-        port = "sim" if getattr(args, "backend", "sim") == "sim" else "none"
-    settings = settings or MicroscopeSettings.load()
-    if str(port).lower() in ("none", "off", ""):
-        return MicroscopeBundle(settings=settings)
+def open_bundle(port: str | None, baudrate: int = 9600, settings: MicroscopeSettings | None = None,
+                command_delay_s: float = 0.25) -> MicroscopeBundle:
+    """Open the microscope on *port* (``"COM4"``), the simulator (``"sim"``) or nothing (``"none"``)."""
     from . import open_microscope
 
-    link, sem, stage = open_microscope(port, stage_poll_s=settings.stage_poll_s,
-                                       sem_status_poll_s=settings.sem_status_poll_s)
-    if str(port).lower() not in ("sim", "simulator"):
+    settings = settings or MicroscopeSettings.load()
+    if not port or str(port).lower() in ("none", "off"):
+        return MicroscopeBundle(settings=settings)
+    kw = {} if str(port).lower() in ("sim", "simulator") else {"baudrate": int(baudrate)}
+    link, sem, stage = open_microscope(port, command_delay_s=command_delay_s, stage_poll_s=settings.stage_poll_s,
+                                       sem_status_poll_s=settings.sem_status_poll_s, **kw)
+    if not link.simulated:
         settings.port = port
     return MicroscopeBundle(link, sem, stage, settings)

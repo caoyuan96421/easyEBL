@@ -58,3 +58,9 @@ def _microscope_settings_in_tmp(tmp_path, monkeypatch):
     """Microscope settings never touch the user's file during tests."""
     monkeypatch.setenv("EASYEBL_MICROSCOPE_SETTINGS", str(tmp_path / "microscope.json"))
 
+
+
+@pytest.fixture(autouse=True)
+def _system_config_in_tmp(tmp_path, monkeypatch):
+    """The easyEBL hardware configuration never touches the user's file during tests."""
+    monkeypatch.setenv("EASYEBL_SYSTEM_CONFIG", str(tmp_path / "system.json"))

@@ -20,12 +20,7 @@ test = ["pytest>=7", "pytest-qt>=4", "gdstk>=0.9", "PySide6>=6.5", "pyqtgraph>=0
 all = ["gdstk>=0.9", "PySide6>=6.5", "pyqtgraph>=0.13", "nidaqmx>=0.9", "pyusb>=1.2", "libusb-package>=1.0", "pyserial>=3.5"]
 
 [project.scripts]
-easyebl-demo = "easyebl.gui.launcher:main"
-easyebl-sem = "easyebl.imaging.sem:main"
-easyebl-sem-cli = "easyebl.imaging.cli:main"
-easyebl-eds = "easyebl.eds.gui:main"
-easyebl-suite = "easyebl.eds.gui:suite_main"
-easyebl-microscope = "easyebl.microscope.gui:main"
+easyebl = "easyebl.app:main"
 
 [tool.setuptools.packages.find]
 include = ["easyebl*"]

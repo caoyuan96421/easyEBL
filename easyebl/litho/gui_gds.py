@@ -1,6 +1,6 @@
 """GDS lithography debug GUI: load, map doses, check field fit, expose.
 
-Run:  ``python -m easyebl.litho.gui_gds [file.gds]``
+Opened from the easyEBL program: Open → Tools → GDS lithography.
 """
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ import tempfile
 
 import numpy as np
 
-from ..gui.common import QtCore, QtWidgets, Session, run_standalone
+from ..gui.common import QtCore, QtWidgets, Session
 from .gds import GDSDoseMapping, gds_info, read_gds, write_gds
 from .geometry import Pattern, Polygon, rectangle, regular_polygon
 from .gui_common import ExposurePanel
 
-__all__ = ["GDSWidget", "make_demo_gds", "main"]
+__all__ = ["GDSWidget", "make_demo_gds"]
 
 
 def make_demo_gds(path: str) -> str:
@@ -166,17 +166,3 @@ class GDSWidget(QtWidgets.QWidget):
         if self._pattern is None:
             raise RuntimeError("no GDS pattern loaded")
         return self._pattern
-
-
-def main(argv=None) -> int:
-    import sys
-
-    argv = list(sys.argv[1:] if argv is None else argv)
-    path = None
-    if argv and not argv[0].startswith("-"):
-        path = argv.pop(0)
-    return run_standalone(lambda s: GDSWidget(s, path=path), "GDS lithography", argv)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

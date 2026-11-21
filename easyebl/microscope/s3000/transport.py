@@ -47,6 +47,7 @@ class SerialTransport:
         dsrdtr: bool = False,
         xonxoff: bool = False,
         write_timeout: float = 2.0,
+        baudrate: int = BAUD_RATE,
     ):
         try:
             import serial  # type: ignore[import-not-found]
@@ -56,7 +57,7 @@ class SerialTransport:
         try:
             self._ser = serial.Serial(
                 port=port,
-                baudrate=BAUD_RATE,
+                baudrate=int(baudrate),
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,

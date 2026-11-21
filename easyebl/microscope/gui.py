@@ -5,15 +5,13 @@ condenser, SEM display).  Right: the stage (positions, STOP ALL, moves, jogs).
 Every control queues a request on the shared link and returns at once; the
 window shows readbacks as they arrive (it never waits for the port).
 
-Run standalone with ``easyebl-microscope [--port COM4 | --port sim]``.  The
-port can be opened by one program only: to use the microscope together with
-SEM imaging and EDS, start ``easyebl-suite`` (it hosts this window as well).
+Opened from the easyEBL program (``easyebl``: Open → Microscope), which opens the
+serial port once and shares it with SEM imaging (column panel, metadata) and
+EDS (beam voltage).
 """
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
-import sys
 import time
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -25,7 +23,7 @@ from .sem import MAGNIFICATIONS, PRESET_KEYS, SCAN_MODES, SEMControl
 from .settings import MicroscopeSettings
 from .stage import AXES, StageControl
 
-__all__ = ["MicroscopeWindow", "BeamPresetDialog", "main"]
+__all__ = ["MicroscopeWindow", "BeamPresetDialog"]
 
 STATE_COLORS = {"connected": "#4c4", "uncertain": "#fb4", "disconnected": "#f55", "closed": "#888"}
 _BIG = "font-size:20px;font-weight:bold"
@@ -902,41 +900,3 @@ class BeamPresetDialog(QtWidgets.QDialog):
         self._save()
         self._fill(select=min(r, len(self.presets) - 1))
         self._msg(f"deleted {name!r}")
-
-
-# ==================================================================== entry point
-def main(argv=None) -> int:
-    from ..imaging.sem.window import apply_dark_theme
-    from . import open_microscope
-
-    p = argparse.ArgumentParser(description="easyEBL microscope control (Hitachi S-3000, RS-232)")
-    p.add_argument("--port", default=None, help="serial port (e.g. COM4) or 'sim'; default: the saved port")
-    p.add_argument("--settings", default=None, help="settings JSON (default: per-user file)")
-    args = p.parse_args(argv)
-    settings = MicroscopeSettings.load(args.settings)
-    port = args.port or settings.port
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
-    apply_dark_theme(app)
-    try:
-        link, sem, stage = open_microscope(port, stage_poll_s=settings.stage_poll_s,
-                                           sem_status_poll_s=settings.sem_status_poll_s)
-    except Exception as e:  # noqa: BLE001
-        if QtWidgets.QMessageBox.question(None, "Microscope", f"Cannot open {port}: {e}\n\nUse the simulator?") \
-                != QtWidgets.QMessageBox.Yes:
-            return 1
-        port = "sim"
-        link, sem, stage = open_microscope("sim", stage_poll_s=settings.stage_poll_s,
-                                           sem_status_poll_s=settings.sem_status_poll_s)
-    if port.lower() not in ("sim", "simulator"):
-        settings.port = port
-    w = MicroscopeWindow(link, sem, stage, settings)
-    w.resize(1200, 860)
-    w.show()
-    try:
-        return app.exec()
-    finally:
-        link.close()
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

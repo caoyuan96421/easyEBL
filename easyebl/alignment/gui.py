@@ -4,7 +4,7 @@ Edit nominal mark positions, scan + match each mark, fit a transform and
 inspect per-mark images, scores, residuals and the measured lag shift.  On
 the simulator the specimen can be deliberately misplaced to test recovery.
 
-Run:  ``python -m easyebl.alignment.gui``
+Opened from the easyEBL program: Open → Tools → Alignment.
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from ..gui.common import (
     Worker,
     format_points,
     parse_points,
-    run_standalone,
 )
 from ..imaging.gui import RASTER_FORM_OVERRIDES
 from ..imaging.raster import RasterConfig, RasterImager
@@ -29,7 +28,7 @@ from .aligner import MarkerAligner, MarkSpec
 from .fitting import MODELS
 from .matching import cross_template, square_template
 
-__all__ = ["AlignmentWidget", "main"]
+__all__ = ["AlignmentWidget"]
 
 DEFAULT_MARKS = np.array([(-35.0, -35.0), (35.0, -35.0), (35.0, 35.0), (-35.0, 35.0)])
 
@@ -247,16 +246,3 @@ class AlignmentWidget(QtWidgets.QWidget):
             r = min(rows)
             if r < len(self.result.measurements):
                 self._show_mark(self.result.measurements[r])
-
-
-def main(argv=None) -> int:
-    def make(session):
-        w = AlignmentWidget(session)
-        w._apply_sim()
-        return w
-
-    return run_standalone(make, "Marker alignment", argv)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

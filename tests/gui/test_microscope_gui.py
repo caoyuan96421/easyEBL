@@ -12,7 +12,7 @@ from easyebl.core import FieldCalibration  # noqa: E402
 from easyebl.hal import DAQConfig, DAQManager, SimParams, SimulatedBackend  # noqa: E402
 from easyebl.imaging.engine import EngineOptions, ImagingEngine  # noqa: E402
 from easyebl.microscope import MicroscopeLink, SEMControl, StageControl  # noqa: E402
-from easyebl.microscope.launch import MicroscopeBundle  # noqa: E402
+from easyebl.microscope.bundle import MicroscopeBundle  # noqa: E402
 from easyebl.microscope.settings import MicroscopeSettings  # noqa: E402
 
 
@@ -120,30 +120,6 @@ def test_sem_window_with_microscope(qtbot, bundle, tmp_path):
     finally:
         w.close()
         mgr.close()
-
-
-def test_entry_points_open_the_simulated_microscope(qtbot, monkeypatch, tmp_path):
-    from PySide6 import QtWidgets
-
-    from easyebl.eds.gui import app as eds_app
-
-    shown = {}
-
-    def fake_exec(self):
-        for w in QtWidgets.QApplication.topLevelWidgets():
-            if w.isVisible():
-                shown[type(w).__name__] = w
-        for w in list(shown.values()):
-            w.close()
-        return 0
-
-    monkeypatch.setattr(QtWidgets.QApplication, "exec", fake_exec)
-    assert eds_app.suite_main(["--backend", "sim", "--settings", str(tmp_path / "eds.json")]) == 0
-    assert {"SEMWindow", "EDSWindow", "MicroscopeWindow"} <= set(shown)
-    sem_w = shown["SEMWindow"]
-    # one port, shared by the three windows (closed again when the program ends)
-    assert isinstance(sem_w.mic, SEMControl) and shown["EDSWindow"].microscope is sem_w.mic
-    assert shown["MicroscopeWindow"].sem is sem_w.mic and sem_w.mic.link.state == "closed"
 
 
 def test_beam_preset_dialog(qtbot, bundle, monkeypatch):
