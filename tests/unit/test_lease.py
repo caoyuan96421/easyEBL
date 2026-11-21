@@ -44,7 +44,7 @@ def test_lease_refuses_other_handles_and_is_reentrant():
             with pytest.raises(LeaseHeldError):
                 b.park(0.0, 0.0)
             with pytest.raises(LeaseHeldError):
-                b.set_phantom("aux0")
+                b.set_ai_terminal("DIFF")
             with a.exclusive("nested"):
                 a.run_stream(1e5, _hold(1000))  # the holder streams normally
             assert a.holds_lease

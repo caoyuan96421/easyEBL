@@ -1,0 +1,31 @@
+# easyEBL prerequisites (Python >= 3.10).
+#   pip install -r requirements.txt
+#   pip install -e .            # the easyebl package + console entry points (easyebl-sem, ...)
+#
+# Hardware drivers outside pip: NI-DAQmx runtime (NI USB-6363), and on Windows a WinUSB/libusb
+# driver for the Amptek DP5 (e.g. via Zadig) unless the Amptek driver already provides one.
+
+# core
+numpy>=1.24
+scipy>=1.10
+
+# GUIs (SEM, EDS, lithography)
+PySide6>=6.5
+pyqtgraph>=0.13
+
+# GDS import / export (lithography)
+gdstk>=0.9
+
+# NI-DAQmx scan hardware
+nidaqmx>=0.9
+
+# Amptek DP5 pulse processor (USB)
+pyusb>=1.2
+libusb-package>=1.0
+
+# tests
+pytest>=7
+pytest-qt>=4
+
+# developer tool only (tools/gen_xray_data.py regenerates easyebl/xray/data/xray_data.npz):
+# xraydb

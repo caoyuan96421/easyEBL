@@ -145,7 +145,7 @@ def test_msa_roundtrip_and_foreign_header(tmp_path, steel):
     assert s3.calibration.offset_kev == pytest.approx(-0.02)
 
 
-# real DP5 spectra of the EDS phantom (USB-6363 AO3 → DP5, 2026-11-11, scripts/hw_eds_test.py)
+# real DP5 spectra (2026-11-11)
 _STEEL = {"Fe", "Cr", "Ni", "Mn"}
 _DP5 = {"3_cu_calibrated.msa": {"Cu"}, "4_0_Si_substrate.msa": {"Si"}, "4_1_Al_pad.msa": {"Al"},
         "4_2_Cu_grid.msa": {"Cu"}, "4_3_stainless.msa": _STEEL, "4_3_stainless_run2.msa": _STEEL,
@@ -158,7 +158,7 @@ def test_autoid_on_real_dp5_spectra(name):
 
     from easyebl.xray.generation import Detector
 
-    sp = load_spectrum(Path(__file__).resolve().parents[1] / "data" / "dp5_phantom" / name)
+    sp = load_spectrum(Path(__file__).resolve().parents[1] / "data" / "dp5_spectra" / name)
     found = {i.element for i in A.identify_elements(sp, detector=Detector(fwhm_mn_ev=156))}
     truth = _DP5[name]
     assert found <= truth and truth - found <= {"Mn"}  # Mn (2 wt%) under Cr Kβ is optional
@@ -168,7 +168,7 @@ def test_calibration_assignment_ignores_a_strong_spurious_peak():
     """A large artefact peak at low energy (seen once on the DP5) must not be taken for Cu L."""
     from pathlib import Path
 
-    sp = load_spectrum(Path(__file__).resolve().parents[1] / "data" / "dp5_phantom" / "3_cu_calibrated.msa")
+    sp = load_spectrum(Path(__file__).resolve().parents[1] / "data" / "dp5_spectra" / "3_cu_calibrated.msa")
     k = np.arange(sp.n_channels)
     c = sp.counts + 31000 * np.exp(-0.5 * ((k - 56.5) / 4) ** 2) / (4 * np.sqrt(2 * np.pi))
     bad = Spectrum(np.random.default_rng(0).poisson(c), EnergyCalibration(0.0, 0.01), beam_kv=20.0)

@@ -1,11 +1,8 @@
 """A compact EDS X-ray generation model (the "ZA" part of ZAF, plus the detector).
 
-Used twice, deliberately with the same physics:
-
-* by the **EDS phantom**, to turn a phase composition into the photon spectrum
-  that the simulated SDD sees;
-* by **standardless quantification**, to turn measured net line intensities
-  back into mass fractions.
+Used by **standardless quantification** to turn measured net line intensities
+back into mass fractions, and by the spectrum analysis for expected line
+intensities.
 
 Model (per electron, into the detector's solid angle, arbitrary but fixed units)::
 

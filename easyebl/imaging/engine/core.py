@@ -61,7 +61,7 @@ from ...hal.backend import (
     StreamOverflowError,
     StreamUnderflowError,
 )
-from ...hal.manager import _KEEP, LeaseHeldError
+from ...hal.manager import LeaseHeldError
 from ..raster import RasterConfig, RasterPlan
 from .assembler import CaptureAccumulator, FrameRecord, ImageAccumulator, StreamAssembler
 from .frames import EngineState, EventBus, Frame, FrameSlot
@@ -552,58 +552,6 @@ class ImagingEngine:
                          changes=_jsonable(changes))
         return new
 
-    def set_phantom(self, output=_KEEP, noise_v: float | None = None, *, kind: str | None = None,
-                    sdd_output=_KEEP, eds: dict | None = None) -> dict:
-        """Switch the phantom (HAL dummy-image source) on an aux output, or off (None).
-
-        *kind* ``"chart"`` (test chart) or ``"eds"`` (EDS specimen: SE image on
-        *output*, SDD preamp signal on *sdd_output*); *eds* changes EDS phantom
-        parameters (see :meth:`DAQHandle.set_phantom`).  Omitted arguments keep
-        their value.
-
-        Changing the routing pauses scanning, switches the HAL and resumes live
-        scanning if it was running: the AO task gains or loses channels, so the
-        fastest sample clock changes (USB-6363: 2.0 / 1.54 / 1.25 MS/s for 2 / 3 /
-        4 channels) and the clock is re-derived.  A noise- or rate-only change
-        applies on the fly.  Returns the new routing (``DAQHandle.phantom``).
-        """
-        h = self.handle
-        cur = h.phantom
-        kw = {"kind": kind, "eds": eds}
-        if output is not _KEEP:
-            kw["output"] = output
-        if sdd_output is not _KEEP:
-            kw["sdd_output"] = sdd_output
-        same = ((output is _KEEP or output == cur["output"]) and (kind is None or kind == cur["kind"])
-                and (sdd_output is _KEEP or sdd_output == cur["sdd_output"])
-                and all(k == "cps" or cur["eds"].get(k) == v for k, v in (eds or {}).items()))
-        if same:
-            h.set_phantom(noise_v=noise_v, **kw)
-            self.events.emit("settings", f"phantom noise {h.phantom['noise_v']:g} V", phantom=h.phantom)
-            return h.phantom
-        resume = self._pause_for_hardware_change("phantom")
-        try:
-            h.set_phantom(noise_v=noise_v, **kw)
-        except Exception:
-            if resume:
-                self.run()
-            raise
-        self._rederive_rate()
-        ph = h.phantom
-        if ph["output"] or ph["sdd_output"]:
-            parts = []
-            if ph["output"]:
-                parts.append(f"image on {ph['output']} ({ph['physical'] or 'dummy – no effect'})")
-            if ph["kind"] == "eds" and ph["sdd_output"]:
-                parts.append(f"SDD on {ph['sdd_output']} ({ph['sdd_physical'] or 'dummy – no effect'})")
-            state = f"{ph['kind']} phantom: " + ", ".join(parts)
-        else:
-            state = "phantom off"
-        self.events.emit("settings", f"{state}; sample clock {self.rate / 1e6:.4g} MS/s", phantom=ph)
-        if resume:
-            self.run()
-        return ph
-
     def _pause_for_hardware_change(self, what: str) -> bool:
         """Stop scanning so the HAL may change the stream layout; True if live should resume."""
         with self._lock:
@@ -614,18 +562,6 @@ class ImagingEngine:
             if not self.wait_idle(5.0):
                 raise RuntimeError(f"scanning did not stop – {what} not changed")
         return resume
-
-    def _rederive_rate(self) -> None:
-        """The fastest clock depends on the stream layout: re-derive it after a HAL change."""
-        with self._lock:
-            n_ai = len(self._cfg.ai_channels)
-            best = self.daq_config.max_scan_rate(n_ai)
-            if self._opts.rate is not None and self._opts.rate > best * (1 + 1e-9):
-                self._opts = self._opts.with_(rate=None)  # explicit clock no longer possible: fastest
-            rate = self._resolve_rate(self._opts, n_ai)
-            if rate != self._cfg.rate:
-                self._cfg = self._normalize(self._cfg.with_(rate=rate), self._cal)
-                self._gen += 1
 
     def set_ai_terminal(self, mode: str) -> str:
         """Video input mode (``"DIFF"``, ``"RSE"``, …).  Pauses scanning, switches, resumes."""

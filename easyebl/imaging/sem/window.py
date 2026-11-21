@@ -89,8 +89,6 @@ class SEMWindow(QtWidgets.QMainWindow):
         self._sub = engine.subscribe(maxlen=200)
 
         self.view = SEMImageView()
-        dc = engine.daq_config
-        self._sync_detector_label()
         self.setCentralWidget(self.view)
         self.scan = ScanPanel(engine, self.notify)
         self.capture = CapturePanel()
@@ -151,9 +149,6 @@ class SEMWindow(QtWidgets.QMainWindow):
         cap = engine.handle.capabilities()
         self.setWindowTitle(f"easyEBL SEM – {cap.name}")
         self.notify(f"Connected to {cap.name}. Sample clock {engine.rate / 1e6:g} MS/s.")
-        if dc.phantom_physical:
-            self.notify(f"Dummy-image test: phantom chart on {dc.phantom_output} ({dc.phantom_physical}) – "
-                        f"wire it to the video input ({dc.ai_channels.get('video', 'ai0')}).")
         self._update_status()
 
     # ------------------------------------------------------------------- UI
@@ -238,9 +233,6 @@ class SEMWindow(QtWidgets.QMainWindow):
             if ev.kind == "state":
                 self.scan.sync_state(EngineState(ev.data.get("state", "idle")))
             elif ev.kind == "settings":  # also changes made by the console / scripts
-                if "phantom" in ev.data:
-                    self._sync_detector_label()
-                    self.notify(ev.message)
                 self.scan.sync()
                 self.shift.sync()
                 if ev.data.get("changes", {}).get("averaging") is not None:
@@ -388,16 +380,7 @@ class SEMWindow(QtWidgets.QMainWindow):
         self._adv.show()
         self._adv.raise_()
 
-    def _sync_detector_label(self):
-        ph = self.engine.handle.phantom
-        if ph["physical"]:
-            self.view.info["detector"] = f"PHANTOM ({ph['output']} = {ph['physical']})"
-        else:
-            self.view.info.pop("detector", None)
-        self.view.update()
-
     def _after_advanced(self):
-        self._sync_detector_label()
         self.cb.ai_range_v = self._ai_range()
         self.scan.sync()
         self.shift.sync()

@@ -387,28 +387,9 @@ class SimulatedBackend(DAQBackend):
         if np.any(frac > 0):
             m = frac > 0
             self.dose.deposit(pos[m, 0], pos[m, 1], p.beam_current_a * dt * frac[m])
-        # X-ray photons of the EDS phantom (they reach photon listeners, e.g. a simulated DPP)
-        eds = self.eds_phantom()
-        if eds is not None:
-            eds.photons(c.x, c.y, c.blank, rate)
         # video
         if n_ai == 0:
             return np.zeros((0, n))
-        phantom = self.phantom_source()
-        if phantom is not None:
-            # dummy-image test: the phantom output is wired back to the video input, so the AI
-            # sees the commanded-position phantom signal, one conversion late – no SEM physics
-            sig = phantom.output(c.x, c.y, c.blank)
-            d_v = int(p.ai_latency_samples)
-            if d_v > 0:
-                vh = np.concatenate([self._video_hist, sig])
-                if len(vh) < n + d_v:
-                    vh = np.concatenate([np.zeros(n + d_v - len(vh)), vh])
-                sig = vh[len(vh) - n - d_v : len(vh) - d_v]
-                self._video_hist = vh[-d_v:]
-            out = np.repeat(sig[None, :], n_ai, axis=0) + self._float_offset(n, rate)[None, :]
-            lim = self.config.ai_range_v if ai_range_v is None else ai_range_v
-            return np.clip(out, -lim * 1.0575, lim * 1.0575)  # X-series over-range limit
         sig = self.sample.intensity(pos[:, 0], pos[:, 1]) * p.video_gain_v
         sig = np.where(blank_eff, 0.0, sig)
         if p.video_tau_s > 0:

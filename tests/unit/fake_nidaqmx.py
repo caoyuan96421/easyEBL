@@ -30,7 +30,7 @@ class FakeDevice:
         self.static_ao = []
         self.static_aux = []  # (physical channel, volts) of single-channel static AO writes
         self.static_do = []
-        self.loopback_row = 0  # which AO channel of the stream the AI input sees (0 = X, 2 = AO2 …)
+        self.loopback_row = 0  # which AO channel of the stream the AI input sees (0 = X, 1 = Y)
         self.stream_ao_channels = []
         self.ao_running = False
         self.ai_read = 0

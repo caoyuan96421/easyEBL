@@ -395,39 +395,17 @@ def test_open_with_missing_device_waits_for_it(fake):
     mgr.close()
 
 
-# ------------------------------------------------------------------ phantom on aux0 = AO2
-def test_phantom_stream_on_ao2_and_aux_static(fake):
-    """The phantom adds AO2 to the hardware-timed AO task; AI looped back from AO2 gives the chart."""
-    import time
-
-    from easyebl.core import FieldCalibration
-    from easyebl.imaging.engine import EngineOptions, ImagingEngine
-
-    cfg = DAQConfig.usb6363()
-    cfg.phantom_output = "aux0"
-    mgr = DAQManager(NIDAQBackend(cfg)).open()
-    cal = FieldCalibration(100.0, cfg.ao_limit_v)
-    fake.loopback_row = 2  # the wire AO2 -> AI0
-    eng = ImagingEngine(mgr, cal, options=EngineOptions(latency_s=0.02))
+# ------------------------------------------------------------------ aux outputs
+def test_stream_uses_xy_only_and_aux_is_static(fake):
+    """Streams drive only AO0/AO1; aux outputs are static writes on AO2/AO3."""
+    mgr = DAQManager(NIDAQBackend(DAQConfig.usb6363())).open()
     try:
-        assert eng.rate == pytest.approx(100e6 / 65)  # 3 AO channels on the 6363
-        eng.update(nx=64, ny=48, width_um=50, dwell_s=4e-6, ai_latency_samples=0.0, center_um=(5.0, -5.0))
-        eng.run()
-        f = eng.wait_frame(complete=True, timeout=10)
-        f = eng.wait_frame(f.seq, complete=True, timeout=10)
-        assert fake.stream_ao_channels == ["Dev1/ao0", "Dev1/ao1", "Dev1/ao2"]
-        expected = mgr.backend.phantom_source().expected_image(f.config, cal)
-        np.testing.assert_allclose(f.image, expected, atol=1e-6)
-        eng.stop()
-        assert eng.wait_idle(5)
-        t0 = time.monotonic()
-        while mgr.is_busy and time.monotonic() - t0 < 2:
-            time.sleep(0.01)
+        mgr.get_handle("s").run_stream(500e3, [OutputChunk.constant(2000, 0, 0, True)], ai_channels=["video"])
+        assert fake.stream_ao_channels == ["Dev1/ao0", "Dev1/ao1"]
         h = mgr.get_handle("aux")
         h.set_aux_output("aux1", 1.5)  # static write on AO3
         assert fake.static_aux[-1] == ("Dev1/ao3", 1.5)
     finally:
-        eng.close()
         mgr.close()
     assert fake.static_aux[-1] == ("Dev1/ao3", 0.0)  # back to 0 V on close
 

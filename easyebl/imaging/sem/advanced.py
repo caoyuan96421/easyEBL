@@ -45,7 +45,6 @@ class AdvancedDialog(QtWidgets.QDialog):
         tabs.addTab(self._scan_tab(), "Scan waveform")
         tabs.addTab(self._cal_tab(), "Calibration")
         tabs.addTab(self._save_tab(), "Saving")
-        tabs.addTab(self._phantom_tab(), "Test signal")
         self.msg = QtWidgets.QLabel()
         self.msg.setWordWrap(True)
         bb = QtWidgets.QDialogButtonBox(
@@ -112,40 +111,12 @@ class AdvancedDialog(QtWidgets.QDialog):
         return w
 
     def _fill_rates(self):
-        """Rates the device can do now (the limit depends on the AO channel count, e.g. the phantom)."""
+        """Rates the device can do now."""
         dc = self.engine.daq_config
         self.rate.clear()
         for i, r in enumerate(valid_rates(dc.max_scan_rate(len(self.engine.config.ai_channels)))):
             label = f"{r / 1e6:.4g} MS/s" if r >= 1e6 else f"{r / 1e3:g} kS/s"
             self.rate.addItem(label + ("  (fastest)" if i == 0 else ""), None if i == 0 else r)
-
-    def _phantom_tab(self):
-        w = QtWidgets.QWidget()
-        f = QtWidgets.QFormLayout(w)
-        dc = self.engine.daq_config
-        self.ph_on = QtWidgets.QCheckBox("Generate the phantom test chart (dummy image)")
-        self.ph_on.setToolTip("Every scan also drives a synthetic test chart on an aux output, sample for "
-                              "sample on the scan clock. Wire it to the video input to image it.")
-        f.addRow(self.ph_on)
-        self.ph_out = QtWidgets.QComboBox()
-        for name, phys in dc.aux_outputs.items():
-            self.ph_out.addItem(f"{name} = {phys}" if phys else f"{name} (dummy – no channel on this board)", name)
-        f.addRow("Output", self.ph_out)
-        self.ph_noise = _dspin(0.0, 2.0, 3, " V rms", 0.05)
-        self.ph_noise.setToolTip("White noise added to every sample (applies immediately, even while scanning)")
-        f.addRow("Synthetic noise", self.ph_noise)
-        video = dc.ai_channels.get("video", "ai0")
-        note = QtWidgets.QLabel(
-            f"Wire the chosen output to the video input ({video}+). In DIFF input mode also wire "
-            f"AO GND → {video}− (an open {video}− drifts into the rail); RSE needs only the one wire. "
-            "Switching on/off briefly restarts scanning: the extra AO channel lowers the fastest clock "
-            f"(here {dc.max_ao_rate_for(2) / 1e6:g} → {dc.max_ao_rate_for(3) / 1e6:g} MS/s). "
-            "The chart is fixed to the DAQ field: zoom and beam shift move across it."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#9aa")
-        f.addRow(note)
-        return w
 
     def _scan_tab(self):
         w = QtWidgets.QWidget()
@@ -182,7 +153,7 @@ class AdvancedDialog(QtWidgets.QDialog):
         self.lag.setToolTip("Deflection + detector lag compensation (the alignment tool measures it)")
         f.addRow("Lag compensation", self.lag)
         self.ai_lat = _dspin(0, 100, 2, " samples", 0.1)
-        self.ai_lat.setToolTip("AO→AI conversion latency (≈1 sample on X-series; scripts/measure_delay.py)")
+        self.ai_lat.setToolTip("AO→AI conversion latency (≈1 sample on X-series)")
         f.addRow("AI latency", self.ai_lat)
         return w
 
@@ -236,10 +207,6 @@ class AdvancedDialog(QtWidgets.QDialog):
         self._fill_rates()
         i = 0 if o.rate is None else self.rate.findData(c.rate)
         self.rate.setCurrentIndex(max(0, i))
-        ph = e.handle.phantom
-        self.ph_on.setChecked(ph["output"] is not None)
-        self.ph_out.setCurrentIndex(max(0, self.ph_out.findData(ph["output"] or "aux0")))
-        self.ph_noise.setValue(ph["noise_v"])
         self.latency.setValue(o.latency_s * 1e3)
         self.ai_range.setCurrentIndex(max(0, self.ai_range.findData(o.ai_range_v)))
         self.ai_mode.setCurrentIndex(max(0, self.ai_mode.findData(e.handle.ai_terminal)))
@@ -281,13 +248,6 @@ class AdvancedDialog(QtWidgets.QDialog):
                 e.set_calibration(new_cal)
             if self.ai_mode.currentData() != e.handle.ai_terminal:
                 e.set_ai_terminal(self.ai_mode.currentData())
-            # phantom first: it changes the AO channel count and with it the fastest clock
-            want = self.ph_out.currentData() if self.ph_on.isChecked() else None
-            ph = e.handle.phantom
-            if want != ph["output"] or abs(self.ph_noise.value() - ph["noise_v"]) > 1e-9:
-                e.set_phantom(want, self.ph_noise.value())
-                if want != ph["output"]:
-                    self._fill_rates()
             rate = self.rate.currentData()
             if rate is not None and rate > e.daq_config.max_scan_rate(len(e.config.ai_channels)) * (1 + 1e-9):
                 rate = None

@@ -53,9 +53,8 @@ class JobCancelled(RuntimeError):
 class EDSOptions:
     rate: float | None = None  # stream sample clock (S/s); None = the device maximum for the layout
     max_rate: float = 1.25e6  # …but not above this (plenty for SE averaging; light on USB)
-    # Output buffer.  Deep, like the DP5 simulator scripts (1 s buffer, 50 ms writes): the EDS
-    # phantom generates its SDD waveform in Python, and a shallow buffer underflows on Windows.
-    # Maps do not wait for it – their pixels are scheduled ahead on the sample clock.
+    # Output buffer.  Deep, so host stalls do not underflow it on Windows; maps do not wait
+    # for it – their pixels are scheduled ahead on the sample clock.
     latency_s: float = 0.4
     chunk_n: int = 8192
     pixel_slack_s: float = 0.015  # map slot = settle + dwell + slack (DP5 read-out and clear)

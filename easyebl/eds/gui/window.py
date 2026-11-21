@@ -187,10 +187,6 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"easyEBL EDS – {controller.mca.name} + {cap.name}")
         self.notify(f"Pulse processor: {controller.mca.name} ({controller.mca.channels} channels); "
                     f"DAQ: {cap.name}; beam {controller.beam_kv:g} kV")
-        dc = controller.daq_config
-        if dc.phantom_kind == "eds":
-            self.notify(f"EDS phantom: SE image on {dc.phantom_output} ({dc.phantom_physical or 'sim'}), "
-                        f"SDD signal on {dc.sdd_output} ({dc.sdd_physical or 'sim'})")
         self._update_status()
 
     # ================================================================ settings

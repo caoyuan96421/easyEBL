@@ -13,7 +13,6 @@ AI_TERMINALS = ("DIFF", "RSE", "NRSE", "PSEUDO_DIFF")
 #: Logical auxiliary analog outputs every HAL configuration provides.  On a board
 #: without the matching AO channel they are dummies (accepted, no hardware effect).
 AUX_OUTPUTS = ("aux0", "aux1")
-PHANTOM_KINDS = ("chart", "eds")
 
 
 @dataclass
@@ -47,16 +46,6 @@ class DAQConfig:
     * ``aux_outputs``: the auxiliary analog outputs ``aux0`` / ``aux1`` → physical
       AO channel, or ``None`` for a dummy output (boards with only two AO
       channels).  Applications use the logical names only.
-    * ``phantom_output``: route the phantom specimen (synthetic video, see
-      :mod:`easyebl.hal.phantom`) to this aux output during streams, e.g.
-      ``"aux0"`` with AO2 wired to the video input.  ``phantom_noise_v`` adds
-      white noise.  Ignored on a dummy output.
-    * ``phantom_kind``: ``"chart"`` (test chart, :mod:`easyebl.hal.phantom`) or
-      ``"eds"`` (multi-phase EDS specimen, :mod:`easyebl.hal.eds_phantom`): its SE
-      image goes to ``phantom_output`` and the signal of a reset-type SDD preamp
-      to ``sdd_output`` (e.g. ``"aux1"`` = AO3, wired to the pulse processor).
-      ``eds_phantom`` holds its parameters (``cps``, ``beam_kv``, ``mv_per_kev``,
-      ``noise_mv``, ``leak_v_per_s``; see :class:`EDSPhantomSpecimen`).
     * ``ao_rate_limits``: maximum AO update rate by number of AO channels in a
       stream (X-series share one DAC timing engine); None = ``max_ao_rate``.
     """
@@ -78,11 +67,6 @@ class DAQConfig:
     # needs AI− wired too – an unconnected AI− floats and drifts into the rail.
     ai_terminal: str = "RSE"  # RSE | DIFF | NRSE | PSEUDO_DIFF
     aux_outputs: dict = field(default_factory=lambda: {"aux0": None, "aux1": None})
-    phantom_output: str | None = None
-    phantom_noise_v: float = 0.0
-    phantom_kind: str = "chart"  # chart | eds
-    sdd_output: str | None = None  # eds phantom: aux output carrying the SDD preamp signal
-    eds_phantom: dict = field(default_factory=dict)
     ao_rate_limits: dict | None = None
     park_x_v: float = 0.0
     park_y_v: float = 0.0
@@ -134,18 +118,6 @@ class DAQConfig:
         if len(phys) != len(set(phys)) or {self.ao_x, self.ao_y} & set(phys):
             raise ValueError("aux outputs must use distinct AO channels, different from X/Y")
         self.aux_outputs = aux
-        if self.phantom_output is not None and self.phantom_output not in AUX_OUTPUTS:
-            raise ValueError(f"phantom_output must be one of {list(AUX_OUTPUTS)} or None")
-        if self.phantom_noise_v < 0:
-            raise ValueError("phantom_noise_v must be ≥ 0")
-        if self.phantom_kind not in PHANTOM_KINDS:
-            raise ValueError(f"phantom_kind must be one of {list(PHANTOM_KINDS)}")
-        if self.sdd_output is not None:
-            if self.sdd_output not in AUX_OUTPUTS:
-                raise ValueError(f"sdd_output must be one of {list(AUX_OUTPUTS)} or None")
-            if self.sdd_output == self.phantom_output:
-                raise ValueError("sdd_output and phantom_output must be different aux outputs")
-        self.eds_phantom = dict(self.eds_phantom or {})
         if self.ao_rate_limits:
             self.ao_rate_limits = {int(k): float(v) for k, v in self.ao_rate_limits.items()}
         if self.ai_terminal not in AI_TERMINALS:
@@ -170,8 +142,7 @@ class DAQConfig:
           takes X/Y from the DAQ.  They are the HAL's ``external control``
           function; they are written from software between streams.
         * AI ``ai0`` = video, single-ended (RSE) by default; DIFF needs AI0− wired.
-        * ``aux0`` = AO2, ``aux1`` = AO3.  For a dummy-image test wire AO2 → AI0 and
-          set ``phantom_output="aux0"``.
+        * ``aux0`` = AO2, ``aux1`` = AO3 (static auxiliary outputs).
         """
         return cls(
             device=device,
@@ -216,31 +187,9 @@ class DAQConfig:
         return (self.aux_outputs or {}).get(name)
 
     @property
-    def phantom_physical(self) -> str | None:
-        """AO channel driven by the phantom during streams (None = no phantom / dummy output)."""
-        return self.aux_physical(self.phantom_output) if self.phantom_output else None
-
-    @property
-    def sdd_physical(self) -> str | None:
-        """AO channel carrying the EDS phantom's SDD signal during streams (None = off / dummy)."""
-        if self.phantom_kind != "eds" or not self.sdd_output:
-            return None
-        return self.aux_physical(self.sdd_output)
-
-    @property
-    def phantom_outputs(self) -> set:
-        """Aux outputs the phantom drives during streams (cannot be set statically)."""
-        out = set()
-        if self.phantom_physical:
-            out.add(self.phantom_output)
-        if self.sdd_physical:
-            out.add(self.sdd_output)
-        return out
-
-    @property
     def stream_ao_channels(self) -> int:
-        """AO channels in a hardware-timed stream: X, Y (+ phantom image, + SDD signal)."""
-        return 2 + (1 if self.phantom_physical else 0) + (1 if self.sdd_physical else 0)
+        """AO channels in a hardware-timed stream: X and Y."""
+        return 2
 
     def max_ao_rate_for(self, n_channels: int) -> float:
         if self.ao_rate_limits:

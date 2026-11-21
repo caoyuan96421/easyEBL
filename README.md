@@ -23,28 +23,36 @@ physics‑flavoured **SEM simulator**, so all subsystems, tests and GUIs run wit
 
 ## Install
 
-The install scripts create a `.venv` next to the code and install easyEBL into it in editable
-mode, with every extra (numpy, scipy, gdstk, PySide6, pyqtgraph, nidaqmx, pytest). They need
-Python 3.10–3.13.
+Python 3.10 or newer.
 
-**Windows:** double‑click `install.bat`, or run it from a terminal:
-
-```bat
-install.bat                      :: create .venv and install everything
-install.bat -RunTests            :: also run the test suite
-install.bat -Recreate            :: delete and rebuild .venv
-install.bat -InstallNIDriver     :: also install the NI-DAQmx driver (admin; DAQ PC only)
-install.bat -Python C:\path\to\python.exe   -Extras gui,gds
-run_demo.bat                     :: start the demo GUI on the simulator
-run_demo.bat --backend nidaqmx --device Dev1
+```bash
+python -m venv .venv
+.venv\Scripts\activate            # Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .                   # the easyebl package and its console commands
 ```
 
-If the folder is inside Dropbox, the script marks `.venv` as ignored, so the environment is not
-synced. Each PC builds its own `.venv`. Pass `-SyncVenv` to turn this off.
+`requirements.txt` lists every prerequisite (numpy, scipy, PySide6, pyqtgraph, gdstk, nidaqmx,
+pyusb, libusb-package, pytest, pytest-qt).  The pyproject extras (`pip install -e ".[all,test]"`)
+install the same set.  The hardware also needs the **NI-DAQmx** runtime from NI and, for the DP5,
+a libusb/WinUSB driver.
 
-**Linux / macOS:** `./install.sh [--tests] [--recreate] [--extras all,test] [--python python3.12]`
+## Running
 
-**Manually:** `pip install -e ".[all,test]"`
+Every program takes `--backend sim` (simulator, no hardware) or
+`--backend nidaqmx --preset usb6363 --device Dev1` (the USB-6363 on the SEM).
+
+| Program | Console command | Module |
+|---|---|---|
+| SEM imaging | `easyebl-sem` | `python -m easyebl.imaging.sem` |
+| SEM text console | `easyebl-sem-cli` | `python -m easyebl.imaging.cli` |
+| EDS | `easyebl-eds` | `python -m easyebl.eds` |
+| SEM + EDS in one program | `easyebl-suite` | – |
+| Demo / all tools as tabs | `easyebl-demo` | `python -m easyebl.gui.launcher` |
+| Raster debug GUI | – | `python -m easyebl.imaging.gui` |
+
+In VS Code select the `.venv` interpreter and run the module (e.g. a launch configuration with
+`"module": "easyebl.imaging.sem"` and `"args": ["--backend", "sim"]`).
 
 ## Quick start (simulator)
 
@@ -73,8 +81,8 @@ report = LithoWriter(mgr.get_handle("litho"), cal).expose(pattern, params, trans
 
 ## SEM imaging (USB-6363)
 
-Double-click **`run_sem.bat`** (or `easyebl-sem --backend nidaqmx --device Dev1`, add
-`--backend sim` for the simulator). The window looks and works like a commercial SEM screen:
+Run `easyebl-sem --backend nidaqmx --preset usb6363 --device Dev1` (or `--backend sim` for the
+simulator). The window looks and works like a commercial SEM screen:
 
 * **Run / Freeze** (F5): Freeze finishes the frame; press again to stop at once. **Single** (F6).
 * **Speed**: TV · Fast 1–2 · Slow 1–3 · Photo 1–3 (0.5–160 µs per pixel; F3/F4 step faster or slower). **Scan size**: 320×240 to 2560×1920.
@@ -86,7 +94,7 @@ Double-click **`run_sem.bat`** (or `easyebl-sem --backend nidaqmx --device Dev1`
 * **Advanced…**: sample rate, buffer/latency, video input range, flyback, pre-line, settle, lag compensation, field calibration, and save options.
 * **External scan** (toolbar) switches the SEM between its own scan and this program (HAL external control).
 
-The same engine can be driven from text commands. Use `run_sem_cli.bat`, or
+The same engine can be driven from text commands:
 `python -m easyebl.imaging.cli -c "run; wait frames=5; capture shot frames=2 res=2560x1920 speed=Photo1; quit"`.
 You can also start the GUI with `--console` to type commands next to it.
 
@@ -107,14 +115,8 @@ You can also start the GUI with `--console` to type commands next to it.
 * **Self-healing.** If the host stalls longer than the buffer, the DAQ underflows. The HAL then blanks and parks the beam, and
   the engine doubles the buffer and restarts on its own (at most 5 times in a row).
 
-**Dummy-image test (AO2 → AI0).** The HAL exposes AO2/AO3 as auxiliary outputs **`aux0`/`aux1`**
-(`handle.set_aux_output("aux1", 1.5)`). They are dummy channels on boards without them. With
-`phantom_output="aux0"` (`--phantom` on `run_sem.bat` / `run_sem_cli.bat`) every scan also drives a
-test chart on AO2, computed from the commanded beam position on the same sample clock. Wire AO2 → AI0+ (the default RSE input mode needs nothing else; in DIFF mode also wire AO GND → AI0−),
-and the live image shows the chart. Zoom and beam shift move across it, and `--phantom-noise 0.2` adds white noise so
-averaging versus scan speed becomes visible. `run_phantom_test.bat` measures fidelity, registration (AI
-latency), field of view, beam shift and noise versus dwell against the expected image, and saves a report and PNGs.
-Three AO channels limit the 6363 to 1.54 MS/s, which the HAL accounts for.
+**Auxiliary outputs.** The HAL exposes AO2/AO3 as static auxiliary outputs **`aux0`/`aux1`**
+(`handle.set_aux_output("aux1", 1.5)`). They are dummy channels on boards without them.
 
 **Lost USB connection.** If the 6363 is unplugged or switched off, the current call fails with
 `DeviceLostError`. Operations then fail at once instead of hanging, and the beam state is reported as *unknown*.
@@ -123,17 +125,10 @@ it, writes the safe state (blanked, parked), selects the SEM's internal scan, an
 static lines for handles that still hold them. The engine shows **DISCONNECTED**, keeps its mode and settings, and
 resumes scanning by itself. A capture in progress fails, and an interrupted single frame is rescanned. The programs also start
 without the device and connect when it appears. Simulator tests: `tests/system/test_disconnect_system.py`.
-Manual hardware check: `run_unplug_test.bat` (pull and re-plug the cable when prompted).
-
-Hardware robustness tests: `run_hw_imaging_tests.bat` (or `pytest tests/hardware --hw Dev1 -s`). They check
-steady fps at 2 MS/s, change latency for each buffer size, start/stop and random aborts, a 20 s settings storm,
-GIL stalls shorter and longer than the buffer, a 2560×1920 capture, cancelling a slow photo scan, refused concurrent access,
-close while live, and a memory soak. A report goes to `scripts/logs/`.
 
 ### Raster debug GUI
 
-Double-click `run_imaging.bat`, or run
-`python -m easyebl.imaging.gui --backend nidaqmx --preset usb6363 [--field-um 100]`.
+Run `python -m easyebl.imaging.gui --backend nidaqmx --preset usb6363 [--field-um 100]`.
 
 * **External scan control** switches the SEM to DAQ scanning (HAL external control).
   Unchecking it returns the SEM to internal scan.
@@ -142,17 +137,18 @@ Double-click `run_imaging.bat`, or run
   while live restarts the stream.
 * **Single scan** takes one frame. **Average frames** sets a running average over about N frames.
 * **Save image** writes a PNG (contrast-stretched) and an `.npy` file with the raw values.
-* `run_hw_test.bat` is a headless check of the board: static lines, single scans and live
-  streaming at several rates. It logs to `scripts/logs/console.txt`.
 
 ## EDS (Amptek DP5)
 
 ```bash
-run_suite.bat                    # SEM + EDS windows in one program, sharing the USB-6363
-run_eds.bat                      # EDS window only        (add --backend sim for the simulator)
-run_eds_hw_test.bat              # end-to-end hardware test with the EDS phantom (see below)
-python -m easyebl.eds --backend sim      # same as easyebl-eds; easyebl-suite for both windows
+easyebl-suite --backend nidaqmx --preset usb6363 --device Dev1   # SEM + EDS windows sharing the USB-6363
+easyebl-eds   --backend nidaqmx --preset usb6363 --device Dev1   # EDS window only
+easyebl-eds   --backend sim                                      # simulator + the DP5 driver's mock device
 ```
+
+`--mca dp5` (default on hardware) uses the DP5 over USB; `--mca mock` (default with
+`--backend sim`) uses the DP5 driver's mock device, which counts a ⁵⁵Fe-like spectrum (Mn Kα/Kβ)
+independent of the beam position.
 
 **Workflow (Point & ID / mapping):** acquire an electron image (or take the SEM's latest
 frame), then click a point or drag a rectangle/ellipse – the spectrum is acquired there,
@@ -169,7 +165,7 @@ parameters.
 (state `PAUSED`), the SEM is switched to external scan for the job, and imaging resumes by
 itself afterwards; a capture or an exposure is never interrupted (the lease waits).  Two
 separate programs cannot drive the same NI device (an OS lock gives a clear "in use" error),
-so use `run_suite.bat` for SEM + EDS.
+so use `easyebl-suite` for SEM + EDS.
 
 **How maps are acquired:** the DP5 has no list mode, so maps are step scans.  Every pixel gets
 a slot (settle + dwell + ~15 ms) scheduled ahead on the DAQ sample clock; when the beam reaches
@@ -177,18 +173,10 @@ it, the MCA counts for a preset real time (`PRER`, 1 ms resolution) and is read 
 while the beam moves on.  A slot the PC reaches too late is redone at the end.  On the
 USB-6363 + DP5 the overhead is ≈ 22 ms per pixel (64×48 at 50 ms dwell ≈ 3.6 min).
 
-**EDS phantom (testing without an SEM):** `--phantom eds` makes the USB-6363 generate a
-multi-phase specimen: its SE image on **AO2** (wire to AI0) and the signal of a **reset-type SDD
-preamplifier** on **AO3** (wire to the DP5 input) – photon steps whose rate and energies follow
-the composition under the commanded beam position (X-ray generation model at 20 kV, Fano
-statistics, leakage ramp, resets).  With the simulator the same photons feed a simulated pulse
-processor.  `run_eds_hw_test.bat` uses it to check the whole chain: image, count rate,
-calibration, AutoID/quant on every phase, a map against the ground truth, and the SEM pause.
-
 **DP5 notes (FW 6.10.02):** a preset real time stops counting and sets "preset done" but leaves
-"MCA enabled" set (the HAL disables it before read-and-clear).  With the phantom's 6 mV/keV
-steps the factory fast threshold (`THFA` 30) misses pulses (ICR < OCR) – run *Auto thresholds*
-with the beam off; the live time is clamped to the real time meanwhile.
+"MCA enabled" set (the HAL disables it before read-and-clear).  If the factory fast threshold
+(`THFA` 30) misses pulses (ICR < OCR), run *Auto thresholds* with the beam off; the live time is
+clamped to the real time meanwhile.
 
 ## Demo / debug GUIs
 
@@ -216,9 +204,11 @@ easyebl/
     engine/   threaded ImagingEngine: settings, source, program, assembler, frames, core
     sem/      SEM GUI: window, view (data bar), panels, advanced dialog, optics stubs
     cli.py    text console; export.py  TIFF/PNG/JSON writers; launch.py  engine from CLI args
-  hal/dp5/    vendored Amptek DP5 USB driver; hal/mca.py pulse-processor HAL (DP5, simulated DPP)
-  hal/eds_phantom.py  EDS phantom (SE image + reset-preamp SDD signal); hal/devlock.py process lock
+  hal/dp5/    vendored Amptek DP5 USB driver (+ mock device); hal/mca.py pulse-processor HAL
+  hal/devlock.py  process lock on the NI device
   xray/       X-ray lines/edges/attenuation (xraydb tables) and the generation model
+tools/        gen_xray_data.py: regenerates easyebl/xray/data/xray_data.npz (needs xraydb)
+tests/        unit/, system/ (simulator pipelines), gui/ (offscreen Qt); data/ real DP5 spectra
   eds/        EDSController (spectra, images, maps), spectrum/map data, analysis/, gui/
   alignment/  templates + NCC matching, transform fitting, MarkerAligner
   litho/      dose maths, geometry, fills, VectorScanCompiler, LithoWriter, GDS import
@@ -243,7 +233,7 @@ handle sharing, lag handling, dose quantisation).
 ## Tests
 
 ```bash
-pytest                    # everything (unit + subsystem + GUI smoke tests, ~40 s)
+pytest                    # everything (unit + subsystem + GUI smoke tests, ~2 min)
 pytest tests/unit         # fast unit tests
 pytest -m system          # subsystem tests: full pipelines on the simulator
 pytest -m gui             # offscreen Qt smoke tests

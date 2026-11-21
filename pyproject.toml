@@ -36,5 +36,4 @@ testpaths = ["tests"]
 markers = [
   "system: subsystem tests running full pipelines on the simulator",
   "gui: GUI smoke tests (offscreen Qt)",
-  "hardware: tests on a real NI DAQ (pytest tests/hardware --hw Dev1)",
 ]
