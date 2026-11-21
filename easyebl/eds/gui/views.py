@@ -46,6 +46,8 @@ class SpectrumView(pg.PlotWidget):
         self.scene().sigMouseMoved.connect(self._moved)
         self.setXRange(0, 10, padding=0)
         self._primary: Spectrum | None = None
+        # markers keep their on-screen size whatever the zoom: re-placed on every range change
+        self.getPlotItem().vb.sigRangeChanged.connect(lambda *_: self._place_labels())
 
     # ----------------------------------------------------------------- data
     def set_spectrum(self, key: str, sp: Spectrum | None, color: str = "#ffd54f", name: str | None = None,
@@ -100,9 +102,9 @@ class SpectrumView(pg.PlotWidget):
         if sp is None:
             return
         e = sp.energies
-        m = (e > 0.15) & (e < min(sp.beam_kv, e[-1]))
+        m = e > 0.15  # the whole MCA range (no nominal beam energy needed)
         top = float(sp.counts[m].max()) if m.any() else 1.0
-        self.setXRange(0.0, min(sp.beam_kv, float(e[-1])), padding=0.01)
+        self.setXRange(0.0, float(e[-1]), padding=0.01)
         if self.log_y:
             self.setYRange(0, np.log10(max(top, 10)) * 1.08, padding=0)
         else:
@@ -111,11 +113,12 @@ class SpectrumView(pg.PlotWidget):
 
     # ------------------------------------------------------------- markers
     def set_markers(self, elements, beam_kv: float | None = None) -> None:
-        """KLM line markers of *elements* (heights ∝ relative weight), labelled at the main line."""
+        """KLM line markers of *elements*, labelled at the main line.  Lines are limited to those
+        *beam_kv* can excite (None: every line inside the energy range shown)."""
         for it in self._markers + self._labels:
             self.removeItem(it)
         self._markers, self._labels = [], []
-        kv = beam_kv or self.beam_kv
+        kv = beam_kv or self.beam_kv or 1e3
         for el in elements:
             for fam in xray.families(el, kv):
                 col = FAMILY_COLORS.get(fam, "#ccc")
@@ -133,28 +136,22 @@ class SpectrumView(pg.PlotWidget):
         self._place_labels()
 
     def _place_labels(self) -> None:
-        sp = self._primary
+        """Marker heights are fractions of the visible plot height (taller = stronger line), so
+        zooming the counts axis does not stretch them; labels sit above the main lines, staggered
+        where they would overlap."""
+        if not (self._markers or self._labels):
+            return
         (x0, x1), (y0, y1) = self.viewRange()
-        top = y1 if not self.log_y else y1
+        span = y1 - y0
         for it in self._markers:
-            h = it._weight
-            if sp is not None:
-                e = it.xData[0]
-                k = int(np.clip(round(sp.calibration.channel(e)), 0, sp.n_channels - 1))
-                local = float(sp.counts[max(0, k - 3):k + 4].max())
-                yv = max(local, 1.0)
-                if self.log_y:
-                    yv = np.log10(max(yv, 1.0))
-                it.setData([e, e], [y0, y0 + (yv - y0) * (0.25 + 0.75 * h) if yv > y0 else y0 + (top - y0) * 0.1 * h])
-        for t in self._labels:
-            e = t._energy
-            yv = top * 0.9
-            if sp is not None:
-                k = int(np.clip(round(sp.calibration.channel(e)), 0, sp.n_channels - 1))
-                local = float(sp.counts[max(0, k - 3):k + 4].max())
-                yv = np.log10(max(local, 1.0)) if self.log_y else local
-                yv = min(max(yv, y0 + 0.05 * (top - y0)) + 0.04 * (top - y0), top * 0.98)
-            t.setPos(e, yv)
+            e = float(it.xData[0])
+            it.setData([e, e], [y0, y0 + span * (0.12 + 0.55 * it._weight)])
+        last_e, tier = -1e9, 0
+        min_gap = 0.06 * (x1 - x0)
+        for t in sorted(self._labels, key=lambda t: t._energy):
+            tier = tier + 1 if t._energy - last_e < min_gap else 0
+            last_e = t._energy
+            t.setPos(t._energy, y0 + span * min(0.70 + 0.07 * (tier % 4), 0.95))
 
     # ------------------------------------------------------------- window
     def show_window(self, on: bool, lo: float | None = None, hi: float | None = None) -> None:

@@ -107,10 +107,12 @@ def write_tiff16(path, img: np.ndarray, description: str = "") -> None:
     Path(path).write_bytes(out + a.tobytes())
 
 
-def save_frame(frame, path, levels: tuple | None = None, ai_range_v: float = 10.0, formats=("tif", "png", "json")) -> list:
+def save_frame(frame, path, levels: tuple | None = None, ai_range_v: float = 10.0, formats=("tif", "png", "json"),
+               microscope: dict | None = None) -> list:
     """Save a :class:`~easyebl.imaging.engine.Frame`; returns the written paths.
 
     *path* may carry any of the extensions; the stem is used for all formats.
+    *microscope*: SEM / stage readbacks stored in the metadata (``"microscope"``).
     """
     p = Path(path)
     stem = p.with_suffix("") if p.suffix.lower() in (".tif", ".tiff", ".png", ".npy", ".json") else p
@@ -118,6 +120,8 @@ def save_frame(frame, path, levels: tuple | None = None, ai_range_v: float = 10.
     written = []
     meta = frame.metadata()
     meta["ai_range_v"] = ai_range_v
+    if microscope:
+        meta["microscope"] = dict(microscope)
     meta["tif_scale"] = f"V = (value / 65535) * {2 * ai_range_v:g} - {ai_range_v:g}"
     multi = len(frame.images) > 1
     for ch, img in frame.images.items():

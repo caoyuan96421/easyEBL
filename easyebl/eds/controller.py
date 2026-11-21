@@ -15,6 +15,15 @@ its ``session("eds")``, so two EDS front-ends cannot interleave either.
 
 Acquisition model (DP5: no list mode)
 -------------------------------------
+Idle monitor
+------------
+Between jobs :meth:`EDSController.start_idle_monitor` keeps the pulse processor
+counting without a preset and reads it in *delta* mode (read-and-clear every
+``interval_s``): each ``idle_spectrum`` event carries the counts, ICR, OCR and
+dead time of the last interval only - handy for checking the beam current.
+Jobs stop it for their duration (they own the MCA) and it re-arms afterwards.
+The beam is not touched (the SEM positions it).
+
 Each pixel is a separate preset-real-time acquisition while the beam is held
 on it (see :mod:`easyebl.eds.beam`): move → wait for the beam to be there (+
 settle) → enable the MCA (it stops itself after the preset) → move to the next
@@ -207,6 +216,16 @@ class EDSController:
         self._ids = itertools.count(1)
         self._closed = False
         self.last_beam_v: tuple | None = None
+        # idle monitor (delta-mode MCA readout between jobs)
+        self._mca_lock = threading.RLock()  # held by a job for its duration and by each idle read
+        self._idle_thread: threading.Thread | None = None
+        self._idle_stop = threading.Event()
+        self._idle_wake = threading.Event()
+        self._idle_interval = 1.0
+        self._idle_pause = 0
+        self._idle_armed = False
+        self._idle_error: str | None = None
+        self.idle_spectrum: Spectrum | None = None
 
     # ------------------------------------------------------------ settings
     @property
@@ -264,9 +283,15 @@ class EDSController:
 
     def _run_job(self, job: EDSJob, fn, args):
         try:
-            self.events.emit("job_started", job.description, job=job.id, job_kind=job.kind)
-            with self.mca.session(self.handle.owner):
-                res = fn(job, *args)
+            self._mca_lock.acquire()
+            self._idle_armed = False  # the job reconfigures the MCA; the idle monitor re-arms after it
+            try:
+                self.events.emit("job_started", job.description, job=job.id, job_kind=job.kind)
+                with self.mca.session(self.handle.owner):
+                    res = fn(job, *args)
+            finally:
+                self._mca_lock.release()
+                self._idle_wake.set()
         except JobCancelled:
             res = job.partial
             job.message = "cancelled"
@@ -309,6 +334,38 @@ class EDSController:
         if j is not None:
             j.cancel()
 
+    # ------------------------------------------------------------ low-energy cut-off
+    #: the DP5 accepts a slow threshold of 0 … 24.9 % of full scale
+    THSL_MAX = 24.9
+
+    def thsl_for(self, min_energy_kev: float) -> float:
+        """DP5 slow threshold (% of full scale) that rejects pulses below *min_energy_kev*
+        (through the current energy calibration and channel count)."""
+        n = max(1, int(self.mca.channels))
+        ch = float(self._ecal.channel(float(min_energy_kev)))
+        return float(np.clip(100.0 * ch / n, 0.0, self.THSL_MAX))
+
+    def set_min_energy(self, min_energy_kev: float) -> float:
+        """Cut off the noise peak at 0 keV: write the slow threshold for *min_energy_kev*.
+        Refused while a job runs.  Returns the THSL written (%)."""
+        if self.busy:
+            raise RuntimeError("the minimum energy cannot change during an acquisition")
+        thsl = round(self.thsl_for(min_energy_kev), 3)
+        with self.idle_paused(), self.mca.session(self.handle.owner):
+            self.mca.configure({"THSL": f"{thsl:.3f}"})
+        self.events.emit("settings", f"min. energy {float(min_energy_kev):.3f} keV → slow threshold {thsl:.3f} %",
+                         min_energy_kev=float(min_energy_kev), thsl=thsl)
+        return thsl
+
+    def abort(self) -> None:
+        """Stop counting at once (e.g. the window closes): cancel the job, end the live
+        read-out and switch the MCA off without waiting for either thread."""
+        self.cancel()
+        self._idle_stop.set()
+        self._idle_wake.set()
+        with contextlib.suppress(Exception):
+            self.mca.disable()
+
     def close(self, timeout: float = 15.0) -> None:
         with self._lock:
             self._closed = True
@@ -319,7 +376,132 @@ class EDSController:
                 j.future.exception(timeout)
             except Exception:  # noqa: BLE001
                 pass
+        self.stop_idle_monitor()
         self.handle.close()
+
+    # ------------------------------------------------------------ idle monitor
+    @property
+    def idle_interval_s(self) -> float:
+        return self._idle_interval
+
+    def set_idle_interval(self, seconds: float) -> None:
+        """Delta-mode readout interval of the idle monitor (s)."""
+        if not seconds > 0:
+            raise ValueError("idle interval must be > 0")
+        self._idle_interval = float(seconds)
+        self._idle_wake.set()
+
+    @property
+    def idle_monitoring(self) -> bool:
+        t = self._idle_thread
+        return t is not None and t.is_alive()
+
+    @property
+    def idle_state(self) -> str:
+        """``off``, ``live``, ``job`` (a job owns the MCA), ``paused``, ``not connected`` or ``error: ...``."""
+        if not self.idle_monitoring:
+            return "off"
+        if self.busy:
+            return "job"
+        if self._idle_pause:
+            return "paused"
+        if not self.mca.is_open:
+            return "not connected"
+        if self._idle_error:
+            return f"error: {self._idle_error}"
+        return "live"
+
+    def start_idle_monitor(self, interval_s: float | None = None) -> None:
+        """Keep the MCA counting between jobs and emit ``idle_spectrum`` events (delta mode)."""
+        if interval_s is not None:
+            self.set_idle_interval(interval_s)
+        if self.idle_monitoring or self._closed:
+            return
+        self._idle_stop.clear()
+        self._idle_armed = False
+        self._idle_thread = threading.Thread(target=self._idle_loop, name="easyebl-eds-idle", daemon=True)
+        self._idle_thread.start()
+
+    def stop_idle_monitor(self, timeout: float = 5.0) -> None:
+        t = self._idle_thread
+        if t is None:
+            return
+        self._idle_stop.set()
+        self._idle_wake.set()
+        t.join(timeout)
+        self._idle_thread = None
+        with self._mca_lock:
+            if self._idle_armed and not self.busy:
+                self._idle_armed = False
+                with contextlib.suppress(Exception):
+                    self.mca.disable()
+
+    @contextlib.contextmanager
+    def idle_paused(self):
+        """Stop the idle readout for a while (e.g. while a dialog configures the processor)."""
+        with self._mca_lock:
+            self._idle_pause += 1
+            if self._idle_armed:
+                self._idle_armed = False
+                with contextlib.suppress(Exception):
+                    self.mca.disable()
+        try:
+            yield
+        finally:
+            with self._mca_lock:
+                self._idle_pause -= 1
+            self._idle_wake.set()
+
+    def _idle_loop(self) -> None:
+        while not self._idle_stop.is_set():
+            if not self._idle_armed:
+                self._idle_step()  # arm now (no wait)
+                if self._idle_armed:
+                    t_read = time.monotonic() + self._idle_interval
+                else:
+                    t_read = time.monotonic() + min(self._idle_interval, 0.5)
+            woke = self._idle_wake.wait(max(0.0, t_read - time.monotonic()))
+            if self._idle_stop.is_set():
+                break
+            if woke:
+                self._idle_wake.clear()
+                if self._idle_armed:  # interval changed: restart the period without reading
+                    t_read = time.monotonic() + self._idle_interval
+                continue
+            if self._idle_armed:
+                self._idle_step()
+                t_read = time.monotonic() + self._idle_interval
+
+    def _idle_step(self) -> None:
+        if self.busy or self._idle_pause or not self.mca.is_open:
+            return
+        if not self._mca_lock.acquire(blocking=False):
+            return
+        try:
+            if self.busy or self._idle_pause:
+                return
+            with self.mca.session(self.handle.owner):
+                if not self._idle_armed:
+                    self.mca.set_preset_real_time(None)
+                    self.mca.clear()
+                    self.mca.enable()
+                    self._idle_armed = True
+                    return
+                r = self.mca.read(clear=True)
+            sp = self._spectrum(r, "live (delta)", mode="delta")
+            self.idle_spectrum = sp
+            if self._idle_error is not None:
+                self._idle_error = None
+                self.events.emit("info", f"{self.mca.name}: live readout restored")
+            self.events.emit("idle_spectrum", "", spectrum=sp)
+        except Exception as e:  # noqa: BLE001 - keep trying; report once
+            self._idle_armed = False
+            msg = f"{type(e).__name__}: {e}"
+            if msg != self._idle_error:
+                self._idle_error = msg
+                self.events.emit("warning", f"{self.mca.name} live readout failed: {msg}")
+        finally:
+            self._mca_lock.release()
 
     # ------------------------------------------------------------ conversions
     def _to_volts(self, points_um) -> np.ndarray:
@@ -331,9 +513,8 @@ class EDSController:
                         self.beam_kv, self.takeoff_deg, title=title, metadata=meta)
 
     def cube_channels(self) -> int:
-        n = int(self.mca.channels)
-        k = int(np.ceil(self._ecal.channel(self.beam_kv + 0.5))) + 1
-        return max(16, min(n, k))
+        """Channels stored per map pixel: the whole MCA range (no nominal beam energy needed)."""
+        return int(self.mca.channels)
 
     # ============================================================== spectra
     def acquire_spectrum(self, real_time_s: float, at_um=None, region_um=None, shape: str = "rect",

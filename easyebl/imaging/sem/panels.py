@@ -1,4 +1,4 @@
-"""Control panels of the SEM window (scan, image, beam shift, column stubs)."""
+"""Control panels of the SEM window (scan, image, beam shift, column)."""
 from __future__ import annotations
 
 from typing import Callable
@@ -6,8 +6,8 @@ from typing import Callable
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..engine import RESOLUTIONS, SCAN_SPEEDS, EngineState, ImagingEngine
+from ...microscope.control import MicroscopeControl, NotAvailable
 from .display import ContrastBrightness
-from .optics import MicroscopeControl, NotAvailable
 
 __all__ = ["ScanPanel", "ImagePanel", "BeamShiftPanel", "ColumnPanel", "CapturePanel"]
 
@@ -331,12 +331,18 @@ class BeamShiftPanel(QtWidgets.QGroupBox):
 
 # ================================================================== column
 class ColumnPanel(QtWidgets.QGroupBox):
-    """Magnification, focus/WD, stigmation, alignment – column control (stubs for now)."""
+    """Magnification, focus/WD, stigmation, alignment – the SEM column over its remote control.
+
+    Requests are queued on the microscope link (they return at once); errors come
+    back through :attr:`failed` on the GUI thread."""
+
+    failed = QtCore.Signal(str)
 
     def __init__(self, microscope: MicroscopeControl, notify: Notify, parent=None):
         super().__init__("Column", parent)
         self.mic = microscope
         self.notify = notify
+        self.failed.connect(notify)
         lay = QtWidgets.QGridLayout(self)
         lay.setContentsMargins(8, 10, 8, 8)
 
@@ -373,24 +379,30 @@ class ColumnPanel(QtWidgets.QGroupBox):
         b_as.clicked.connect(lambda: self._call(self.mic.auto_stigma))
         b_al = QtWidgets.QPushButton("Alignment ▾")
         menu = QtWidgets.QMenu(b_al)
-        for kind in ("Beam", "Aperture", "Stigma X", "Stigma Y"):
+        for kind in ("Gun", "Aperture", "Stigma X", "Stigma Y"):
             menu.addAction(f"{kind} alignment", lambda k=kind: self._call(lambda: self.mic.alignment(k)))
         b_al.setMenu(menu)
         for b in (b_af, b_as, b_al):
             row.addWidget(b)
         lay.addLayout(row, 4, 0, 1, 4)
-        self.l_note = QtWidgets.QLabel(f"Microscope: {microscope.name} (stub – set on the SEM)")
+        self.l_note = QtWidgets.QLabel(f"Microscope: {microscope.name}" + (
+            "" if microscope.connected else " – no remote control: set the column on the SEM"))
         self.l_note.setStyleSheet("color:#9aa")
         self.l_note.setWordWrap(True)
         lay.addWidget(self.l_note, 5, 0, 1, 4)
 
     def _call(self, fn):
         try:
-            fn()
+            fut = fn()
         except NotAvailable as e:
-            self.notify(f"{str(e).capitalize()} is not available yet – use the SEM console.")
+            self.notify(f"{str(e).capitalize()} is not available – use the SEM console.")
+            return
         except Exception as e:  # noqa: BLE001
             self.notify(f"error: {e}")
+            return
+        if hasattr(fut, "add_done_callback"):
+            fut.add_done_callback(lambda f: None if f.cancelled() or f.exception() is None
+                                  else self.failed.emit(f"microscope: {f.exception()}"))
 
     def sync(self, frame=None):
         mag = self.mic.magnification()

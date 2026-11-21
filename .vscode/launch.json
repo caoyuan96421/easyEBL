@@ -70,6 +70,22 @@
             "justMyCode": true
         },
         {
+            "name": "Microscope (sim)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.microscope",
+            "args": ["--port", "sim"],
+            "justMyCode": true
+        },
+        {
+            "name": "Microscope (COM4)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.microscope",
+            "args": ["--port", "COM4"],
+            "justMyCode": true
+        },
+        {
             "name": "Demo launcher (sim)",
             "type": "debugpy",
             "request": "launch",

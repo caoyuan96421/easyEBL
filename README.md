@@ -13,6 +13,9 @@ It also does **EDS** (energy-dispersive X-ray spectroscopy) with an Amptek **DP5
 processor: spectra, AutoID, standardless quantification, line scans and spectrum maps, in an
 Oxford-AZtec-like window that shares the DAQ with SEM imaging (see [EDS](#eds-amptek-dp5)).
 
+The SEM column and the five-axis **stage** are controlled over the S-3000's **RS-232** remote
+interface (see [Microscope](#microscope-hitachi-s-3000-rs-232)).
+
 Everything is written on top of a **hardware abstraction layer (HAL)** and ships with a
 physics‑flavoured **SEM simulator**, so all subsystems, tests and GUIs run without hardware.
 
@@ -33,21 +36,25 @@ pip install -e .                   # the easyebl package and its console command
 ```
 
 `requirements.txt` lists every prerequisite (numpy, scipy, PySide6, pyqtgraph, gdstk, nidaqmx,
-pyusb, libusb-package, pytest, pytest-qt).  The pyproject extras (`pip install -e ".[all,test]"`)
+pyusb, libusb-package, pyserial, pytest, pytest-qt).  The pyproject extras (`pip install -e ".[all,test]"`)
 install the same set.  The hardware also needs the **NI-DAQmx** runtime from NI and, for the DP5,
 a libusb/WinUSB driver.
 
 ## Running
 
 Every program takes `--backend sim` (simulator, no hardware) or
-`--backend nidaqmx --preset usb6363 --device Dev1` (the USB-6363 on the SEM).
+`--backend nidaqmx --preset usb6363 --device Dev1` (the USB-6363 on the SEM).  SEM, EDS and the
+suite also take `--microscope COM4` (the S-3000's RS-232 port), `--microscope sim` (default with
+`--backend sim`) or `--microscope none` (default on hardware).  `easyebl-microscope` takes
+`--port COM4` or `--port sim`.
 
 | Program | Console command | Module |
 |---|---|---|
 | SEM imaging | `easyebl-sem` | `python -m easyebl.imaging.sem` |
 | SEM text console | `easyebl-sem-cli` | `python -m easyebl.imaging.cli` |
 | EDS | `easyebl-eds` | `python -m easyebl.eds` |
-| SEM + EDS in one program | `easyebl-suite` | `python -m easyebl.eds.gui.suite` |
+| SEM + EDS (+ microscope) in one program | `easyebl-suite` | `python -m easyebl.eds.gui.suite` |
+| Microscope (column + stage) | `easyebl-microscope` | `python -m easyebl.microscope` |
 | Demo / all tools as tabs | `easyebl-demo` | `python -m easyebl.gui.launcher` |
 | Raster debug GUI | – | `python -m easyebl.imaging.gui` |
 
@@ -91,7 +98,10 @@ simulator). The window looks and works like a commercial SEM screen:
 * **Contrast / Brightness**, **Auto C/B** (Ctrl+A, one-shot or continuous), and running **averaging**.
 * **Beam shift**: arrow pad, drag the image, or double-click a point to centre it. It is clamped to the field.
 * **Data bar** with the scale bar, field magnification and date. There is also a scan-line marker during slow scans.
-* **Magnification, focus/WD, stigmation, alignment** are stubs (`easyebl/imaging/sem/optics.py`) until the SEM's RS‑232 control is implemented.
+* **Magnification, focus/WD, stigmation, gun alignment** go to the SEM over RS-232 (`--microscope`); the
+  mouse wheel on the image steps the magnification and the field calibration follows it (see
+  [Microscope](#microscope-hitachi-s-3000-rs-232)).  The data bar shows the SEM's kV and WD, and captures
+  store the column and stage readbacks in their metadata.  **Microscope…** opens the stage window.
 * **Advanced…**: sample rate, buffer/latency, video input range, flyback, pre-line, settle, lag compensation, field calibration, and save options.
 * **External scan** (toolbar) switches the SEM between its own scan and this program (HAL external control).
 
@@ -179,6 +189,54 @@ USB-6363 + DP5 the overhead is ≈ 22 ms per pixel (64×48 at 50 ms dwell ≈ 3.
 (`THFA` 30) misses pulses (ICR < OCR), run *Auto thresholds* with the beam off; the live time is
 clamped to the real time meanwhile.
 
+## Microscope (Hitachi S-3000, RS-232)
+
+```bash
+easyebl-microscope --port COM4          # column settings + stage (or --port sim)
+easyebl-suite --backend nidaqmx --preset usb6363 --device Dev1 --microscope COM4   # everything together
+```
+
+The SEM text protocol and the stage protocol share **one serial port** (9600 8N1; the SEM relays
+the stage lines after `#STAGE ON`, which is sent automatically).  The driver
+(`easyebl/microscope/s3000`) is vendored from *hitachi_s3000_control_lib*, which was verified on the
+S-3000. On top of it:
+
+* **`MicroscopeLink`** owns the port and runs one request at a time in priority order: SEM settings,
+  then stage moves, then reads, then background polling.  A SEM setting waits at most for the
+  transaction already on the wire (replies take 0.25–1 s).  After a reply times out the link stops
+  until you check the SEM and press **Resync** (nothing is ever resent automatically).
+* **`SEMControl`** (column HAL): HV setpoint / on / off, magnification (the 65-step list), working
+  distance, coarse/fine focus, stigmator, condenser coarse/fine (raw 0–99), SEM display contrast /
+  brightness / scan mode / freeze, detector, AFC / ASF / ABC / AGA.  Readbacks are cached (instant for
+  the GUIs), refreshed after each setting and by a slow MAG / HV / WD poll (default 10 s) so changes
+  on the SEM panel are seen.  Repeated settings coalesce: ten wheel steps during one transaction
+  become one `MAG` with the final value.
+* **`StageControl`** (stage HAL): X, Y, Z in µm and R, T in degrees.  Positions are polled at the
+  lowest priority, **at most every 20 s** (one `R3` per controller), never while moving.  Moves are
+  absolute or relative and wait for the motors' completion events. **STOP** never waits in the queue:
+  S0 is sent at once, also while a long SEM command holds the port, and a move that is being sent
+  at that moment is halted too.  Negative coordinates stay disabled until their encoding is checked
+  on the instrument.
+* **Wiring.** Imaging and EDS use the column through `MicroscopeControl`.  The DAQ field follows the
+  magnification as `field = K / magnification`.  `K` is learnt from the current field calibration
+  the first time and re-learnt when the field is calibrated in *Advanced…*; it is stored in
+  `%APPDATA%\easyEBL\microscope.json`.  Zooming keeps the scan's share of the field.  EDS takes the
+  SEM's kV as the nominal beam energy, and spectra and images carry the column and stage readbacks.
+* The window: HV, magnification, focus / WD, stigmator, condenser and SEM display on the left; on
+  the right a big **STOP ALL** (also *Esc*), a position table with read times, absolute / relative
+  moves, X/Y/Z/R/T jogs behind an *Enable stage motion* interlock, and the raw TX/RX log.  On the
+  real instrument, HV switching, automatic routines and moves ask for confirmation.
+* **Beam presets** (*Beam presets…* in the toolbar or *Presets…* in the beam group): any number of
+  named settings of beam 1 coarse / fine, stigmator X / Y and contrast / brightness.  *Save current…*
+  reads the six values fresh from the SEM; *Recall* (or double-click) sends them, after checking all
+  six first.  Names and values can be edited in the table, and rows reordered or deleted.  Presets
+  are stored in `microscope.json`.  Only beam 1 is used: the protocol has no command to select
+  between the SEM's two beam-current memories.
+
+The serial port can be opened by one program at a time: use `easyebl-suite` to run SEM, EDS and the
+microscope window together.  Only the simulator has been used so far; see
+*hitachi_s3000_control_lib/docs/commissioning.md* for what is verified on the instrument.
+
 ## Demo / debug GUIs
 
 ```bash
@@ -203,10 +261,12 @@ easyebl/
   hal/        DAQConfig, DAQBackend (abstract), DAQManager + DAQHandle, SimulatedBackend, NIDAQBackend
   imaging/    RasterConfig → RasterPlan (waveforms) → RasterImager (+ LineAssembler for AI)
     engine/   threaded ImagingEngine: settings, source, program, assembler, frames, core
-    sem/      SEM GUI: window, view (data bar), panels, advanced dialog, optics stubs
+    sem/      SEM GUI: window, view (data bar), panels (column via easyebl.microscope), advanced dialog
     cli.py    text console; export.py  TIFF/PNG/JSON writers; launch.py  engine from CLI args
   hal/dp5/    vendored Amptek DP5 USB driver (+ mock device); hal/mca.py pulse-processor HAL
   hal/devlock.py  process lock on the NI device
+  microscope/ Hitachi S-3000 RS-232: link (shared port, priorities), sem (column HAL), stage (stage HAL),
+              coupling (field ↔ magnification), gui; s3000/ vendored driver + simulator
   xray/       X-ray lines/edges/attenuation (xraydb tables) and the generation model
 tools/        gen_xray_data.py: regenerates easyebl/xray/data/xray_data.npz (needs xraydb)
 tests/        unit/, system/ (simulator pipelines), gui/ (offscreen Qt); data/ real DP5 spectra

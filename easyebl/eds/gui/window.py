@@ -7,7 +7,8 @@ DAQ or the pulse processor directly.
 
 Layout: electron image with acquisition sites (left) · spectrum with element
 markers and fit (centre) · quantification / maps / line profile (bottom) ·
-acquisition and analysis controls (right).
+control tabs Acquire / Map / Composition (right) with the live MCA panel
+(delta-mode spectrum, ICR, OCR, dead time) always visible below them.
 """
 from __future__ import annotations
 
@@ -60,11 +61,18 @@ class EDSWindow(QtWidgets.QMainWindow):
     TICK_MS = 100
 
     def __init__(self, controller: EDSController, settings: EDSSettings | None = None, sem_engine=None,
-                 simulated: bool = False, owns_controller: bool = True):
+                 simulated: bool = False, owns_controller: bool = True, microscope=None, microscope_bundle=None):
         super().__init__()
         self.ctrl = controller
         self.settings = settings or EDSSettings()
         self.sem = sem_engine
+        # MicroscopeControl: the SEM's accelerating voltage becomes the nominal beam energy; a bundle
+        # (easyebl.microscope.launch) adds the microscope window and the stage readback for metadata
+        self.bundle = microscope_bundle
+        if microscope is None and microscope_bundle is not None and microscope_bundle.connected:
+            microscope = microscope_bundle.sem
+        self.microscope = microscope
+        self._mic_kv = None
         self.simulated = simulated
         self.owns_controller = owns_controller
         self._sub = controller.events.subscribe(maxlen=2000)
@@ -121,6 +129,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         ll.setContentsMargins(0, 0, 0, 0)
         ll.addWidget(QtWidgets.QLabel("<b>Electron image</b>"))
         ll.addWidget(tools)
+        ll.addWidget(self._image_controls())
         ll.addWidget(self.imgview, 1)
         ll.addWidget(self.site_list)
 
@@ -159,15 +168,20 @@ class EDSWindow(QtWidgets.QMainWindow):
         split.setSizes([520, 900])
         self.setCentralWidget(split)
 
-        # ------------------------------------------------ controls dock
+        # ------------------------------------------------ controls dock: tabs + live MCA panel
         self.controls = QtWidgets.QTabWidget()
         self.controls.addTab(self._acquire_tab(), "Acquire")
         self.controls.addTab(self._map_tab(), "Map")
-        self.controls.addTab(self._analysis_tab(), "Analyse")
+        self.controls.addTab(self._composition_tab(), "Composition")
+        side = QtWidgets.QWidget()
+        sl = QtWidgets.QVBoxLayout(side)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.addWidget(self.controls, 1)
+        sl.addWidget(self._live_panel())
         dock = QtWidgets.QDockWidget("EDS")
         dock.setObjectName("eds_controls")
         dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable)
-        dock.setWidget(self.controls)
+        dock.setWidget(side)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -187,6 +201,10 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"easyEBL EDS – {controller.mca.name} + {cap.name}")
         self.notify(f"Pulse processor: {controller.mca.name} ({controller.mca.channels} channels); "
                     f"DAQ: {cap.name}; beam {controller.beam_kv:g} kV")
+        self._emin_pending = True
+        self.apply_min_energy()
+        if self.settings.idle_monitor:
+            self.ctrl.start_idle_monitor(self.settings.idle_update_s)
         self._update_status()
 
     # ================================================================ settings
@@ -207,35 +225,47 @@ class EDSWindow(QtWidgets.QMainWindow):
         return self.settings.detector
 
     # ================================================================ panels
-    def _acquire_tab(self):
+    def _image_controls(self):
+        """Electron image acquisition – one row directly above the image."""
         s = self.settings
         w = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(w)
-        g = QtWidgets.QGroupBox("Electron image")
-        f = QtWidgets.QFormLayout(g)
+        grid = QtWidgets.QGridLayout(w)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(2)
         self.im_res = QtWidgets.QComboBox()
         for nx, ny in [(256, 192), (512, 384), (768, 576), (1024, 768), (256, 256), (512, 512)]:
             self.im_res.addItem(f"{nx} × {ny}", f"{nx}x{ny}")
         i = self.im_res.findData(f"{s.image_nx}x{s.image_ny}")
         self.im_res.setCurrentIndex(max(0, i))
+        self.im_res.setToolTip("resolution")
         self.im_dwell = QtWidgets.QDoubleSpinBox()
         self.im_dwell.setRange(0.5, 1000)
         self.im_dwell.setValue(s.image_dwell_us)
         self.im_dwell.setSuffix(" µs")
+        self.im_dwell.setToolTip("dwell per pixel")
         self.b_image = QtWidgets.QPushButton("Acquire image")
         self.b_image.clicked.connect(self.acquire_image)
         self.b_semimg = QtWidgets.QPushButton("Use SEM image")
         self.b_semimg.setEnabled(self.sem is not None)
         self.b_semimg.setToolTip("take the latest frame of the SEM window (same field calibration)")
         self.b_semimg.clicked.connect(self.use_sem_image)
-        f.addRow("Resolution", self.im_res)
-        f.addRow("Dwell", self.im_dwell)
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.b_image)
-        row.addWidget(self.b_semimg)
-        f.addRow(row)
-        lay.addWidget(g)
+        self.b_image.setText("Acquire")
+        self.b_image.setToolTip("acquire an electron image with the DAQ")
+        self.b_semimg.setText("From SEM")
+        for wd in (self.im_res, self.im_dwell, self.b_image, self.b_semimg):
+            wd.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+            wd.setMinimumWidth(60)
+        grid.addWidget(self.im_res, 0, 0)
+        grid.addWidget(self.im_dwell, 0, 1)
+        grid.addWidget(self.b_image, 1, 0)
+        grid.addWidget(self.b_semimg, 1, 1)
+        return w
 
+    def _acquire_tab(self):
+        s = self.settings
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
         g = QtWidgets.QGroupBox("Spectrum")
         f = QtWidgets.QFormLayout(g)
         self.sp_time = QtWidgets.QDoubleSpinBox()
@@ -249,45 +279,190 @@ class EDSWindow(QtWidgets.QMainWindow):
         tr.addWidget(self.sp_time)
         tr.addWidget(self.sp_live)
         f.addRow("Time", tr)
-        self.sp_autoacq = QtWidgets.QCheckBox("acquire when a site is drawn")
-        self.sp_autoacq.setChecked(True)
-        self.sp_autoid = QtWidgets.QCheckBox("AutoID + quant when done")
-        self.sp_autoid.setChecked(True)
-        f.addRow(self.sp_autoacq)
-        f.addRow(self.sp_autoid)
+        self.sp_emin = QtWidgets.QDoubleSpinBox()
+        self.sp_emin.setRange(0.02, 5.0)
+        self.sp_emin.setDecimals(3)
+        self.sp_emin.setSingleStep(0.01)
+        self.sp_emin.setValue(s.min_energy_kev)
+        self.sp_emin.setSuffix(" keV")
+        self.sp_emin.setToolTip("pulses below this energy are rejected (DP5 slow threshold) – cuts off the "
+                                "noise peak at 0 keV.  Default just below C Kα (0.277 keV).")
+        self._emin_timer = QtCore.QTimer(self)
+        self._emin_timer.setSingleShot(True)
+        self._emin_timer.setInterval(400)
+        self._emin_timer.timeout.connect(self.apply_min_energy)
+        self.sp_emin.valueChanged.connect(lambda *_: self._emin_timer.start())
+        f.addRow("Min. energy", self.sp_emin)
+        hint = QtWidgets.QLabel("Draw a point or area on the image (or select a site), then Acquire. "
+                                "With no site selected the whole image is measured.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#9aa")
+        f.addRow(hint)
         row = QtWidgets.QHBoxLayout()
-        self.b_field = QtWidgets.QPushButton("Whole field")
-        self.b_field.setToolTip("spectrum while the beam rasters the whole image")
-        self.b_field.clicked.connect(lambda: self._new_site("field", self._image_region()))
-        self.b_spot = QtWidgets.QPushButton("SEM spot")
-        self.b_spot.setToolTip("acquire without moving the beam (SEM in spot mode / its own scan)")
-        self.b_spot.clicked.connect(lambda: self._new_site("spot", ()))
-        self.b_again = QtWidgets.QPushButton("Re-acquire")
-        self.b_again.clicked.connect(lambda: self.acquire_site(self._current) if self._current else None)
-        row.addWidget(self.b_field)
-        row.addWidget(self.b_spot)
-        row.addWidget(self.b_again)
-        f.addRow(row)
+        self.b_acquire = QtWidgets.QPushButton("Acquire")
+        self.b_acquire.setStyleSheet("QPushButton{background:#2e7d32;color:white;font-weight:bold;padding:6px}")
+        self.b_acquire.setToolTip("acquire a spectrum at the selected site (none selected: the whole image)")
+        self.b_acquire.clicked.connect(self.acquire)
         self.b_stop = QtWidgets.QPushButton("Stop")
-        self.b_stop.setStyleSheet("QPushButton{background:#8a2c2c;color:white;font-weight:bold}")
+        self.b_stop.setStyleSheet("QPushButton{background:#8a2c2c;color:white;font-weight:bold;padding:6px}")
         self.b_stop.clicked.connect(self.stop)
-        f.addRow(self.b_stop)
+        row.addWidget(self.b_acquire, 2)
+        row.addWidget(self.b_stop, 1)
+        f.addRow(row)
+        self.l_e0 = QtWidgets.QLabel("–")
+        self.l_e0.setToolTip("landing energy from the end of the continuum (Duane–Hunt limit) of the "
+                             "current spectrum; the nominal value (Advanced) is used when it cannot be measured")
+        f.addRow("Beam energy", self.l_e0)
+
+        # advanced detector / analysis parameters (collapsed)
+        self.c_kv = QtWidgets.QDoubleSpinBox()
+        self.c_kv.setRange(1, 40)
+        self.c_kv.setDecimals(1)
+        self.c_kv.setValue(s.beam_kv)
+        self.c_kv.setSuffix(" kV")
+        self.c_kv.setToolTip("used only when the spectrum does not show the end of the continuum")
+        self.c_kv.valueChanged.connect(self._conditions_changed)
+        self.b_kv_sync = QtWidgets.QPushButton("Sync from SEM")
+        self.b_kv_sync.setToolTip("read the accelerating voltage from the SEM")
+        self.b_kv_sync.setEnabled(self.microscope is not None)
+        self.b_kv_sync.clicked.connect(self.sync_beam_kv)
+        kv_row = QtWidgets.QHBoxLayout()
+        kv_row.addWidget(self.c_kv, 1)
+        kv_row.addWidget(self.b_kv_sync)
+        self.b_adv = QtWidgets.QToolButton()
+        self.b_adv.setText("Advanced")
+        self.b_adv.setCheckable(True)
+        self.b_adv.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.b_adv.setArrowType(QtCore.Qt.RightArrow)
+        self.b_adv.setStyleSheet("QToolButton{border:none}")
+        f.addRow(self.b_adv)
+        self.adv = QtWidgets.QWidget()
+        af = QtWidgets.QFormLayout(self.adv)
+        af.setContentsMargins(12, 0, 0, 0)
+        self.c_to = QtWidgets.QDoubleSpinBox()
+        self.c_to.setRange(5, 90)
+        self.c_to.setValue(s.takeoff_deg)
+        self.c_to.setSuffix(" °")
+        self.c_to.valueChanged.connect(self._conditions_changed)
+        self.c_fwhm = QtWidgets.QDoubleSpinBox()
+        self.c_fwhm.setRange(100, 300)
+        self.c_fwhm.setValue(s.fwhm_mn_ev)
+        self.c_fwhm.setSuffix(" eV @ Mn Kα")
+        self.c_fwhm.valueChanged.connect(self._conditions_changed)
+        self.c_win = QtWidgets.QComboBox()
+        self.c_win.addItems(["AP3.3", "Be8", "none"])
+        self.c_win.setCurrentText(s.window)
+        self.c_win.currentTextChanged.connect(self._conditions_changed)
+        self.c_idle = QtWidgets.QDoubleSpinBox()
+        self.c_idle.setRange(0.1, 60)
+        self.c_idle.setDecimals(1)
+        self.c_idle.setSingleStep(0.5)
+        self.c_idle.setValue(s.idle_update_s)
+        self.c_idle.setSuffix(" s")
+        self.c_idle.setToolTip("read-out interval of the live MCA (delta mode) between acquisitions")
+        self.c_idle.valueChanged.connect(self._idle_interval_changed)
+        af.addRow("Nominal beam energy", kv_row)
+        af.addRow("Take-off", self.c_to)
+        af.addRow("Resolution", self.c_fwhm)
+        af.addRow("Window", self.c_win)
+        af.addRow("Live MCA update", self.c_idle)
+        self.adv.setVisible(False)
+        self.b_adv.toggled.connect(self._toggle_advanced)
+        f.addRow(self.adv)
         lay.addWidget(g)
 
-        g = QtWidgets.QGroupBox("Pulse processor")
+        g = QtWidgets.QGroupBox("Display")
         f = QtWidgets.QFormLayout(g)
-        self.l_rates = QtWidgets.QLabel("–")
-        self.l_dead = QtWidgets.QProgressBar()
-        self.l_dead.setRange(0, 100)
-        self.l_dead.setFormat("dead time %p %")
-        f.addRow("Rates", self.l_rates)
-        f.addRow(self.l_dead)
-        b = QtWidgets.QPushButton("Settings…")
-        b.clicked.connect(self.open_processor)
-        f.addRow(b)
+        self.d_log = QtWidgets.QCheckBox("log scale")
+        self.d_log.toggled.connect(self.specview.set_log)
+        f.addRow(self.d_log)
+        self.d_overlay = QtWidgets.QCheckBox("overlay all site spectra")
+        self.d_overlay.toggled.connect(lambda *_: self._show_current())
+        f.addRow(self.d_overlay)
+        self.d_norm = QtWidgets.QCheckBox("normalise overlays (counts/s)")
+        self.d_norm.toggled.connect(lambda *_: self._show_current())
+        f.addRow(self.d_norm)
         lay.addWidget(g)
         lay.addStretch(1)
         return w
+
+    def _toggle_advanced(self, on: bool):
+        self.adv.setVisible(on)
+        self.b_adv.setArrowType(QtCore.Qt.DownArrow if on else QtCore.Qt.RightArrow)
+
+    def _live_panel(self):
+        """Live MCA (delta mode between jobs), rates and dead time – always visible."""
+        g = QtWidgets.QGroupBox("Live MCA")
+        v = QtWidgets.QVBoxLayout(g)
+        v.setContentsMargins(4, 4, 4, 4)
+        self.live_plot = pg.PlotWidget(background="#1e1f22")
+        self.live_plot.setMinimumHeight(130)
+        self.live_plot.setMaximumHeight(170)
+        self.live_plot.showGrid(x=True, y=True, alpha=0.15)
+        self.live_plot.getPlotItem().getAxis("bottom").enableAutoSIPrefix(False)
+        self.live_plot.setLabel("bottom", "keV")
+        self.live_plot.getPlotItem().getAxis("left").setWidth(36)
+        self.live_plot.setMouseEnabled(x=True, y=False)
+        self.live_plot.setXRange(0, 10, padding=0)
+        self._live_curve = self.live_plot.plot([], [], stepMode="center", fillLevel=0,
+                                               brush=pg.mkBrush(79, 195, 247, 70), pen=pg.mkPen("#4fc3f7"))
+        v.addWidget(self.live_plot)
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(10)
+        self.l_icr = QtWidgets.QLabel("ICR –")
+        self.l_ocr = QtWidgets.QLabel("OCR –")
+        self.l_live_t = QtWidgets.QLabel("")
+        self.l_live_t.setStyleSheet("color:#9aa")
+        for lb in (self.l_icr, self.l_ocr):
+            lb.setStyleSheet("font-weight:bold")
+        grid.addWidget(self.l_icr, 0, 0)
+        grid.addWidget(self.l_ocr, 0, 1)
+        grid.addWidget(self.l_live_t, 0, 2)
+        self.l_dead = QtWidgets.QProgressBar()
+        self.l_dead.setRange(0, 100)
+        self.l_dead.setFormat("dead time %p %")
+        grid.addWidget(self.l_dead, 1, 0, 1, 3)
+        v.addLayout(grid)
+        r = QtWidgets.QHBoxLayout()
+        self.cb_live = QtWidgets.QCheckBox("Live between acquisitions")
+        self.cb_live.setChecked(self.settings.idle_monitor)
+        self.cb_live.toggled.connect(self._live_toggled)
+        r.addWidget(self.cb_live, 1)
+        b = QtWidgets.QPushButton("Processor…")
+        b.setToolTip("pulse processor settings")
+        b.clicked.connect(self.open_processor)
+        r.addWidget(b)
+        v.addLayout(r)
+        return g
+
+    def _live_toggled(self, on: bool):
+        self.settings.idle_monitor = bool(on)
+        if on:
+            self.ctrl.start_idle_monitor(self.settings.idle_update_s)
+        else:
+            self.ctrl.stop_idle_monitor()
+
+    def _idle_interval_changed(self, v: float):
+        self.settings.idle_update_s = float(v)
+        self.ctrl.set_idle_interval(float(v))
+
+    def _show_rates(self, sp: Spectrum):
+        if sp is None or sp.real_time <= 0:
+            return
+        self.l_icr.setText(f"ICR {sp.icr / 1e3:.2f} kcps")
+        self.l_ocr.setText(f"OCR {sp.ocr / 1e3:.2f} kcps")
+        self.l_dead.setValue(int(round(100 * min(max(sp.dead_fraction, 0.0), 1.0))))
+
+    def _show_live(self, sp: Spectrum):
+        cal = self.ctrl.energy_calibration
+        n = len(sp.counts)
+        edges = cal.energy(np.arange(n + 1) - 0.5)
+        self._live_curve.setData(edges, sp.counts.astype(float))
+        hi = max(float(sp.counts.max()), 1.0) if n else 1.0
+        self.live_plot.setYRange(0, hi * 1.1, padding=0)
+        self.live_plot.setXRange(0, float(edges[-1]), padding=0)
+        self.l_live_t.setText(f"Δ {sp.real_time:.2f} s · {sp.total:,} cts")
+        self._show_rates(sp)
 
     def _map_tab(self):
         s = self.settings
@@ -380,26 +555,38 @@ class EDSWindow(QtWidgets.QMainWindow):
         self._update_eta()
         return w
 
-    def _analysis_tab(self):
+    def _composition_tab(self):
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
         g = QtWidgets.QGroupBox("Elements")
         v = QtWidgets.QVBoxLayout(g)
         self.el_label = QtWidgets.QLabel("–")
         self.el_label.setWordWrap(True)
-        self.el_label.setStyleSheet("font-size:14px;font-weight:bold")
+        self.el_label.setStyleSheet("font-size:16px;font-weight:bold")
         v.addWidget(self.el_label)
+        note = QtWidgets.QLabel("Selected elements stay for every spectrum until cleared; "
+                                "AutoID only adds to them.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#9aa")
+        v.addWidget(note)
+        big = "QPushButton{padding:8px;font-weight:bold}"
+        self.b_ptable = QtWidgets.QPushButton("Periodic table…")
+        self.b_ptable.setStyleSheet(big)
+        self.b_ptable.clicked.connect(self.pick_elements)
+        self.b_autoid = QtWidgets.QPushButton("AutoID")
+        self.b_autoid.setStyleSheet(big)
+        self.b_autoid.setToolTip("identify elements in the current spectrum and add them to the selection")
+        self.b_autoid.clicked.connect(lambda: self.analyse(autoid=True))
         r = QtWidgets.QHBoxLayout()
-        b = QtWidgets.QPushButton("AutoID")
-        b.clicked.connect(lambda: self.analyse(autoid=True))
-        r.addWidget(b)
-        b = QtWidgets.QPushButton("Periodic table…")
-        b.clicked.connect(self.pick_elements)
-        r.addWidget(b)
-        b = QtWidgets.QPushButton("Clear")
-        b.clicked.connect(lambda: self.set_elements([]))
-        r.addWidget(b)
+        r.addWidget(self.b_ptable)
+        r.addWidget(self.b_autoid)
         v.addLayout(r)
+        self.b_clear_el = QtWidgets.QPushButton("Clear elements")
+        self.b_clear_el.clicked.connect(lambda: self.set_elements([]))
+        v.addWidget(self.b_clear_el)
+        self.sp_autoid = QtWidgets.QCheckBox("AutoID + quant when a spectrum is done")
+        self.sp_autoid.setChecked(True)
+        v.addWidget(self.sp_autoid)
         lay.addWidget(g)
         g = QtWidgets.QGroupBox("Quantification")
         f = QtWidgets.QFormLayout(g)
@@ -414,44 +601,6 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.q_fit.setChecked(True)
         self.q_fit.toggled.connect(self._show_fit)
         f.addRow(self.q_fit)
-        lay.addWidget(g)
-        g = QtWidgets.QGroupBox("Display")
-        f = QtWidgets.QFormLayout(g)
-        self.d_log = QtWidgets.QCheckBox("log scale")
-        self.d_log.toggled.connect(self.specview.set_log)
-        f.addRow(self.d_log)
-        self.d_overlay = QtWidgets.QCheckBox("overlay all site spectra")
-        self.d_overlay.toggled.connect(lambda *_: self._show_current())
-        f.addRow(self.d_overlay)
-        self.d_norm = QtWidgets.QCheckBox("normalise overlays (counts/s)")
-        self.d_norm.toggled.connect(lambda *_: self._show_current())
-        f.addRow(self.d_norm)
-        lay.addWidget(g)
-        g = QtWidgets.QGroupBox("Conditions")
-        f = QtWidgets.QFormLayout(g)
-        self.c_kv = QtWidgets.QDoubleSpinBox()
-        self.c_kv.setRange(1, 40)
-        self.c_kv.setValue(self.settings.beam_kv)
-        self.c_kv.setSuffix(" kV")
-        self.c_kv.valueChanged.connect(self._conditions_changed)
-        self.c_to = QtWidgets.QDoubleSpinBox()
-        self.c_to.setRange(5, 90)
-        self.c_to.setValue(self.settings.takeoff_deg)
-        self.c_to.setSuffix(" °")
-        self.c_to.valueChanged.connect(self._conditions_changed)
-        self.c_fwhm = QtWidgets.QDoubleSpinBox()
-        self.c_fwhm.setRange(100, 300)
-        self.c_fwhm.setValue(self.settings.fwhm_mn_ev)
-        self.c_fwhm.setSuffix(" eV @ Mn Kα")
-        self.c_fwhm.valueChanged.connect(self._conditions_changed)
-        self.c_win = QtWidgets.QComboBox()
-        self.c_win.addItems(["AP3.3", "Be8", "none"])
-        self.c_win.setCurrentText(self.settings.window)
-        self.c_win.currentTextChanged.connect(self._conditions_changed)
-        f.addRow("Beam", self.c_kv)
-        f.addRow("Take-off", self.c_to)
-        f.addRow("Resolution", self.c_fwhm)
-        f.addRow("Window", self.c_win)
         lay.addWidget(g)
         lay.addStretch(1)
         return w
@@ -473,6 +622,9 @@ class EDSWindow(QtWidgets.QMainWindow):
         m = mb.addMenu("&Tools")
         m.addAction("Energy calibration…", self.open_calibration)
         m.addAction("Pulse processor…", self.open_processor)
+        if self.bundle is not None and self.bundle.connected:
+            m.addSeparator()
+            m.addAction("Microscope…", self.bundle.show_window)
 
     def _make_status(self):
         sb = self.statusBar()
@@ -494,7 +646,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         return self.image.region_um if self.image is not None else self.ctrl.full_field_um()
 
     def _cursor(self, e, c):
-        near = xray.lines_near(e, tol=0.04, beam_kv=self.ctrl.beam_kv, min_weight=0.3)[:3]
+        near = xray.lines_near(e, tol=0.04, beam_kv=self._kv(), min_weight=0.3)[:3]
         self.l_cursor.setText(f"{e:.3f} keV  {c:.0f} cts  " + " ".join(ln.label for ln in near))
 
     def _busy(self) -> bool:
@@ -564,8 +716,14 @@ class EDSWindow(QtWidgets.QMainWindow):
         if kind in ("point", "rect", "ellipse"):
             self.imgview.add_site(site.id, kind, params, site.color, str(site.id))
         self.site_list.setCurrentRow(self.site_list.count() - 1)
-        if self.sp_autoacq.isChecked() or kind in ("field", "spot"):
-            self.acquire_site(site)
+        return site
+
+    def acquire(self):
+        """Acquire button: a spectrum at the selected site, or – none selected – over the whole image."""
+        site = self._current
+        if site is None or site.kind == "spot":
+            site = self._new_site("field", self._image_region())
+        self.acquire_site(site)
 
     def acquire_site(self, site: _Site | None):
         if site is None:
@@ -626,9 +784,36 @@ class EDSWindow(QtWidgets.QMainWindow):
             if self.d_norm.isChecked() and sp.live_time > 0:
                 sp = Spectrum(sp.counts / sp.live_time, cal, sp.real_time, sp.live_time, beam_kv=sp.beam_kv)
             self.specview.set_spectrum(f"site{s.id}", sp, s.color, s.name, primary=(s is self._current))
-        self.specview.set_markers(self.elements, self.ctrl.beam_kv)
+        self.specview.set_markers(self.elements, self._kv())
         self._show_fit()
         self.specview.autoscale()
+        self._show_e0()
+
+    def _kv(self) -> float | None:
+        """Beam energy of the current spectrum (None: no spectrum – every line is shown)."""
+        sp = self._spectrum_of_current()
+        return float(sp.beam_kv) if sp is not None else None
+
+    def _show_e0(self):
+        sp = self._spectrum_of_current()
+        if sp is None:
+            self.l_e0.setText("–")
+            return
+        src = sp.metadata.get("beam_kv_source", "")
+        txt = {"spectrum": "from the spectrum", "nominal": "nominal (end of continuum not measurable)",
+               "file": "from the file"}.get(src, src)
+        self.l_e0.setText(f"{sp.beam_kv:.1f} kV  {txt}")
+
+    def _assign_beam_kv(self, sp) -> None:
+        """E0 of *sp* from its Duane–Hunt limit, else the nominal value (Advanced)."""
+        est = A.estimate_beam_kv(sp.with_calibration(self.ctrl.energy_calibration), detector=self.detector)
+        sp.metadata = dict(sp.metadata or {})
+        if est is not None:
+            sp.beam_kv = float(est)
+            sp.metadata["beam_kv_source"] = "spectrum"
+        else:
+            sp.beam_kv = float(self.settings.beam_kv)
+            sp.metadata["beam_kv_source"] = "nominal"
 
     def _show_fit(self, *_):
         if self.q_fit.isChecked() and self._fit is not None and self._fit[0] is self._spectrum_of_current():
@@ -648,7 +833,7 @@ class EDSWindow(QtWidgets.QMainWindow):
     def set_elements(self, els):
         self.elements = sorted(set(els), key=xray.z_of)
         self.el_label.setText(" ".join(self.elements) if self.elements else "–")
-        self.specview.set_markers(self.elements, self.ctrl.beam_kv)
+        self.specview.set_markers(self.elements, self._kv())
         self.specview.autoscale()
 
     def pick_elements(self):
@@ -669,17 +854,21 @@ class EDSWindow(QtWidgets.QMainWindow):
         det, els, oxide = self.detector, list(self.elements), self.q_oxide.isChecked()
 
         def work():
-            ids = A.identify_elements(sp, detector=det) if autoid else None
-            elements = [i.element for i in ids] if ids is not None else els
+            ids = A.identify_elements(sp, detector=det) if autoid else []
+            added = [i.element for i in ids if i.element not in els]
+            elements = els + added  # AutoID only adds; the user's selection is kept
             if not elements:
-                return elements, None, None
+                return elements, added, None, None
             fit = A.fit_spectrum(sp, elements, detector=det)
             q = A.quantify(fit, sp.beam_kv, sp.takeoff_deg, det, oxygen_by_stoichiometry=oxide)
-            return elements, fit, q
+            return elements, added, fit, q
 
         def done(res):
-            elements, fit, q = res
-            self.set_elements(elements)
+            elements, added, fit, q = res
+            # merge with the current selection (the user may have changed it while the analysis ran)
+            self.set_elements(list(self.elements) + list(added))
+            if autoid:
+                self.notify("AutoID: " + (f"added {', '.join(added)}" if added else "nothing new"))
             self._fit = (raw, fit) if fit is not None else None
             self._quant = q
             self._show_quant(q)
@@ -711,9 +900,25 @@ class EDSWindow(QtWidgets.QMainWindow):
             for c, v in enumerate(vals):
                 t.setItem(i, c, QtWidgets.QTableWidgetItem(v))
         tot = sum(r.wt for r in q.rows)
-        self.quant_note.setText(f"Total {tot:.1f} wt% (normalised) – {q.method}; {q.beam_kv:g} kV. "
+        self.quant_note.setText(f"Total {tot:.1f} wt% (normalised) – {q.method}; E0 {q.beam_kv:.1f} kV. "
                                 + " ".join(q.notes))
         self.bottom.setCurrentIndex(0)
+
+    def sync_beam_kv(self):
+        """Beam energy from the SEM (its remote control reports the accelerating voltage)."""
+        kv = None
+        if self.microscope is not None:
+            try:
+                kv = self.microscope.accelerating_voltage_kv()
+            except Exception as e:  # noqa: BLE001
+                self.notify(f"SEM beam voltage: {e}")
+                return
+        if kv is None:
+            self.notify("the SEM does not report its accelerating voltage "
+                        f"({getattr(self.microscope, 'name', 'no SEM link')}) – enter the beam energy by hand")
+            return
+        self.c_kv.setValue(float(kv))
+        self.notify(f"nominal beam energy {float(kv):g} kV (from the SEM)")
 
     def _conditions_changed(self, *_):
         s = self.settings
@@ -721,9 +926,13 @@ class EDSWindow(QtWidgets.QMainWindow):
         s.fwhm_mn_ev, s.window = self.c_fwhm.value(), self.c_win.currentText()
         self.ctrl.beam_kv, self.ctrl.takeoff_deg = s.beam_kv, s.takeoff_deg
         for site in self._sites:
-            if site.spectrum is not None:
-                site.spectrum.beam_kv, site.spectrum.takeoff_deg = s.beam_kv, s.takeoff_deg
-        self.specview.set_markers(self.elements, s.beam_kv)
+            sp = site.spectrum
+            if sp is not None:
+                sp.takeoff_deg = s.takeoff_deg
+                if (sp.metadata or {}).get("beam_kv_source") == "nominal":  # measured E0 stays
+                    sp.beam_kv = s.beam_kv
+        self.specview.set_markers(self.elements, self._kv())
+        self._show_e0()
 
     # ================================================================ maps
     def _map_elements(self):
@@ -739,7 +948,7 @@ class EDSWindow(QtWidgets.QMainWindow):
             return
         sm = self.map
         sm = SpectrumMap(sm.cube, self.ctrl.energy_calibration, sm.region_um, sm.dwell_s, sm.real_time, sm.live_time,
-                         sm.fast_count, sm.se, sm.done, self.ctrl.beam_kv, self.ctrl.takeoff_deg, sm.timestamp,
+                         sm.fast_count, sm.se, sm.done, sm.beam_kv, self.ctrl.takeoff_deg, sm.timestamp,
                          sm.metadata)
         kind, binning, det = self.m_kind.currentIndex(), self.m_bin.value(), self.detector
         oxide = self.q_oxide.isChecked()
@@ -834,6 +1043,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         mask[r0:r0 + b, c0:c0 + b] = True
         sp = sm.sum_spectrum(mask).with_calibration(self.ctrl.energy_calibration)
         sp.title = f"map pixel ({col}, {row})"
+        sp.metadata = dict(sp.metadata or {}, beam_kv_source=sm.metadata.get("beam_kv_source", "nominal"))
         site = _Site(next(self._site_ids), "point", sm.pixel_to_um(c0 + (b - 1) / 2, r0 + (b - 1) / 2))
         site.spectrum = sp
         self._sites.append(site)
@@ -844,6 +1054,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         if self.map is None:
             return
         sp = self.map.sum_spectrum().with_calibration(self.ctrl.energy_calibration)
+        sp.metadata = dict(sp.metadata or {}, beam_kv_source=self.map.metadata.get("beam_kv_source", "nominal"))
         site = _Site(next(self._site_ids), "field", self.map.region_um)
         site.spectrum = sp
         self._sites.append(site)
@@ -895,6 +1106,19 @@ class EDSWindow(QtWidgets.QMainWindow):
         self._calib_dialog = d
         d.show()
 
+    def apply_min_energy(self):
+        """Write the slow threshold for the minimum energy (deferred while an acquisition runs)."""
+        e = float(self.sp_emin.value())
+        self.settings.min_energy_kev = e
+        if self.ctrl.busy:
+            self._emin_pending = True
+            return
+        try:
+            self.ctrl.set_min_energy(e)
+            self._emin_pending = False
+        except Exception as e_:  # noqa: BLE001 - shown to the user
+            self.notify(f"min. energy not applied: {e_}")
+
     def _calibration_applied(self, cal, fwhm_ev, fano):
         self.ctrl.set_energy_calibration(cal)
         self.settings.energy_calibration = cal
@@ -905,15 +1129,20 @@ class EDSWindow(QtWidgets.QMainWindow):
         if np.isfinite(fano):
             self.settings.fano = float(fano)
         self._save_settings()
+        self.apply_min_energy()  # the threshold in % depends on the calibration
         self.notify(f"energy calibration applied: offset {cal.offset_kev * 1e3:+.2f} eV, "
                     f"gain {cal.gain_kev * 1e3:.4f} eV/ch; FWHM@Mn {self.settings.fwhm_mn_ev:g} eV")
         self._show_current()
 
     def open_processor(self):
+        if self._busy():
+            return
         d = ProcessorDialog(self.ctrl.mca, self)
         d.channelsChanged.connect(lambda o, n: self.notify(
             f"MCA channels {o} → {n}: the energy calibration changed – recalibrate (Tools → Energy calibration)"))
-        d.exec()
+        with self.ctrl.idle_paused():  # the dialog owns the processor while it is open
+            d.exec()
+        self.apply_min_energy()  # channels may have changed (or THSL written by hand / auto thresholds)
 
     # ================================================================ files
     def _folder(self):
@@ -932,6 +1161,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         site = _Site(next(self._site_ids), "spot", ())
         site.spectrum = sp
         sp.title = sp.title or os.path.basename(path)
+        sp.metadata = dict(sp.metadata or {}, beam_kv_source="file")
         self._sites.append(site)
         self.site_list.addItem(f"{site.name} – {os.path.basename(path)}")
         self.site_list.setCurrentRow(self.site_list.count() - 1)
@@ -1017,7 +1247,27 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.notify(f"saved {path}")
 
     # ================================================================ periodic updates
+    def _follow_microscope_kv(self):
+        """The SEM's accelerating voltage (while HV is on) is the nominal beam energy."""
+        if self.microscope is None:
+            return
+        try:
+            kv = self.microscope.accelerating_voltage_kv()
+        except Exception:  # noqa: BLE001
+            return
+        if kv and kv != self._mic_kv:
+            self._mic_kv = kv
+            if abs(self.c_kv.value() - kv) > 1e-6:
+                self.c_kv.setValue(float(kv))
+                self.notify(f"nominal beam energy {kv:g} kV (from the SEM)")
+
+    def _microscope_metadata(self) -> dict:
+        if self.bundle is not None:
+            return self.bundle.metadata()
+        return self.microscope.snapshot() if self.microscope is not None else {}
+
     def _tick(self):
+        self._follow_microscope_kv()
         for ev in self._sub.drain():
             self._event(ev)
         job = self._job
@@ -1057,8 +1307,11 @@ class EDSWindow(QtWidgets.QMainWindow):
                         self._last_auto = time.monotonic()
                         self.specview.autoscale()
             if sp is not None and sp.real_time > 0:
-                self.l_rates.setText(f"ICR {sp.icr / 1e3:.1f} k  OCR {sp.ocr / 1e3:.1f} kcps")
-                self.l_dead.setValue(int(round(100 * sp.dead_fraction)))
+                self._show_rates(sp)
+        elif ev.kind == "idle_spectrum":
+            sp = d.get("spectrum")
+            if sp is not None:
+                self._show_live(sp)
         elif ev.kind == "image":
             im = d.get("image")
             if im is not None:
@@ -1086,7 +1339,11 @@ class EDSWindow(QtWidgets.QMainWindow):
             site = getattr(job, "_site", None)
             if site is not None:
                 site.spectrum = res
-                res.beam_kv, res.takeoff_deg = self.ctrl.beam_kv, self.ctrl.takeoff_deg
+                res.takeoff_deg = self.ctrl.takeoff_deg
+                self._assign_beam_kv(res)
+                mic = self._microscope_metadata()
+                if mic:
+                    res.metadata = dict(res.metadata or {}, microscope=mic)
                 if site is self._current:
                     self._show_current()
                 if self.sp_autoid.isChecked() and site is self._current and res.total > 200 and not job.cancelled:
@@ -1095,12 +1352,24 @@ class EDSWindow(QtWidgets.QMainWindow):
             self.image = res
             self.imgview.set_image(res)
         elif job.kind == "map" and isinstance(res, SpectrumMap):
+            self._map_beam_kv(res)
             self.map = res
             self._map_done(res)
         elif job.kind == "linescan" and isinstance(res, SpectrumMap):
+            self._map_beam_kv(res)
             self.map = res
             self._show_linescan(res)
         self.p_job.setValue(1000)
+        if self._emin_pending:
+            self.apply_min_energy()
+
+    def _map_beam_kv(self, sm: SpectrumMap):
+        """E0 of a map / line scan from its sum spectrum (Duane–Hunt), else the nominal value."""
+        s = sm.sum_spectrum()
+        self._assign_beam_kv(s)
+        sm.beam_kv = s.beam_kv
+        sm.metadata = dict(sm.metadata or {}, beam_kv_source=s.metadata["beam_kv_source"])
+        self.notify(f"map E0 {sm.beam_kv:.1f} kV ({sm.metadata['beam_kv_source']})")
 
     def _map_done(self, sm: SpectrumMap):
         self.imgview.set_overlay(None)
@@ -1112,6 +1381,11 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.compute_maps()
 
     def _update_status(self):
+        st = self.ctrl.idle_state
+        if st != "live":
+            txt = {"job": "acquisition running", "off": "live read-out off", "paused": "paused"}.get(st, st)
+            self.l_live_t.setText(txt if len(txt) < 48 else txt[:45] + "…")
+            self.l_live_t.setToolTip(st)
         j = self.ctrl.job
         if j is not None and not j.done():
             self.l_state.setText(f"{j.description} – {j.message}")
@@ -1127,6 +1401,7 @@ class EDSWindow(QtWidgets.QMainWindow):
     # ================================================================ lifecycle
     def closeEvent(self, ev):
         self.timer.stop()
+        self.ctrl.abort()  # stop counting now: cancel the job, stop the live read-out, MCA off
         self._save_settings()
         if self.ctrl.busy:
             self.ctrl.cancel()

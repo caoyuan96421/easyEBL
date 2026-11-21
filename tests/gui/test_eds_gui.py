@@ -24,11 +24,19 @@ def eds(qtbot, tmp_path):
     # a deliberately wrong calibration: the dialog must fix it
     settings.energy_calibration = EnergyCalibration(0.05, 0.0099)
     ctrl = EDSController(mgr, dpp, FieldCalibration(100.0, cfg.ao_limit_v), settings.energy_calibration)
-    w = EDSWindow(ctrl, settings, simulated=True)
+    from easyebl.microscope import MicroscopeLink, SEMControl
+
+    settings.idle_update_s = 0.2
+    link = MicroscopeLink.simulated(command_delay_s=0.0)
+    link.session.simulator.sem["HV_SET"] = link.session.simulator.sem["HV"] = "15.0"
+    mic = SEMControl(link)
+    mic.refresh().result(10)
+    w = EDSWindow(ctrl, settings, simulated=True, microscope=mic)
     qtbot.addWidget(w)
     w.show()
     yield w, mgr, dpp
     w.close()
+    link.close()
     dpp.close()
     mgr.close()
 
@@ -49,7 +57,8 @@ def test_eds_window_workflow(qtbot, eds, tmp_path):
     # calibration from a whole-field spectrum (the DP5 mock sees a 55Fe source: Mn Kα + Kβ)
     w.sp_time.setValue(1.5)
     w.sp_autoid.setChecked(False)
-    w._new_site("field", w._image_region())
+    w.site_list.setCurrentRow(-1)
+    w.b_acquire.click()  # nothing selected: the whole image
     _wait_idle(qtbot, w)
     sp = w._current.spectrum
     assert sp is not None and sp.total > 5000
@@ -68,6 +77,8 @@ def test_eds_window_workflow(qtbot, eds, tmp_path):
     w.sp_autoid.setChecked(True)
     w.sp_time.setValue(1.0)
     w._site_requested("point", (0.0, 0.0))
+    assert not w.ctrl.busy and w._current.spectrum is None  # drawing only creates the site …
+    w.b_acquire.click()  # … the Acquire button measures it
     _wait_idle(qtbot, w)
     assert w._current.spectrum is not None and w._current.spectrum.total > 0
 
@@ -113,3 +124,83 @@ def test_processor_dialog(qtbot, eds):
     d.cb_speed.setCurrentIndex(0)
     d._apply_speed()
     assert dpp.current_speed() == 1
+
+
+def test_live_panel_composition_and_beam_sync(qtbot, eds):
+    w, mgr, dpp = eds
+    # the live MCA panel updates between acquisitions (delta mode)
+    qtbot.waitUntil(lambda: w.l_icr.text() != "ICR –" and w._live_curve.yData is not None
+                    and len(w._live_curve.yData) > 0, timeout=5000)
+    assert w.ctrl.idle_state == "live" and "Δ" in w.l_live_t.text()
+    w.cb_live.setChecked(False)
+    assert w.ctrl.idle_state == "off" and not w.settings.idle_monitor
+    w.cb_live.setChecked(True)
+    qtbot.waitUntil(lambda: w.ctrl.idle_state == "live", timeout=3000)
+
+    # the nominal beam energy (fallback), its SEM sync, take-off, resolution and window are advanced
+    assert not w.adv.isVisibleTo(w) and not w.c_kv.isVisibleTo(w)
+    w.b_adv.setChecked(True)
+    assert w.adv.isVisibleTo(w)
+    w.b_kv_sync.click()
+    assert w.c_kv.value() == 15.0 and w.ctrl.beam_kv == 15.0
+    w.c_kv.setValue(20.0)
+
+    # AutoID only adds to the user's selection, and the selection survives new spectra
+    w.set_elements(["Zr", "Mo"])
+    w.sp_time.setValue(0.5)
+    w.site_list.setCurrentRow(-1)
+    w.b_acquire.click()
+    qtbot.waitUntil(lambda: not w.ctrl.busy and w._job is None and w._analysis is None, timeout=30000)
+    assert {"Zr", "Mo"} <= set(w.elements)
+    w.analyse(autoid=True)
+    qtbot.waitUntil(lambda: w._analysis is None, timeout=30000)
+    assert {"Zr", "Mo"} <= set(w.elements)
+    w.b_clear_el.click()
+    assert w.elements == []
+
+
+def test_markers_keep_their_screen_size_and_e0_shown(qtbot, eds):
+    w, mgr, dpp = eds
+    w.set_elements(["Fe", "Cu"])
+    sv = w.specview
+    (_, _), (y0, y1) = sv.viewRange()
+    frac = [(m.yData[1] - y0) / (y1 - y0) for m in sv._markers]
+    sv.setYRange(y0, y0 + (y1 - y0) * 0.1, padding=0)  # zoom the counts axis in 10x
+    (_, _), (z0, z1) = sv.viewRange()
+    frac2 = [(m.yData[1] - z0) / (z1 - z0) for m in sv._markers]
+    assert frac and np.allclose(frac, frac2, atol=1e-6)  # same height on screen
+    # E0 of a spectrum without a measurable continuum end falls back to the nominal value
+    w.sp_time.setValue(0.5)
+    w.site_list.setCurrentRow(-1)
+    w.b_acquire.click()
+    qtbot.waitUntil(lambda: not w.ctrl.busy and w._job is None, timeout=30000)
+    sp = w._current.spectrum
+    assert sp.metadata["beam_kv_source"] == "nominal" and sp.beam_kv == w.settings.beam_kv
+    assert "nominal" in w.l_e0.text()
+    # the spectrum view shows every MCA channel
+    (x0, x1), _ = sv.viewRange()
+    assert x1 >= float(sp.with_calibration(w.ctrl.energy_calibration).energies[-1])
+
+
+def test_close_stops_a_running_acquisition(qtbot, eds):
+    w, mgr, dpp = eds
+    w.sp_time.setValue(60.0)
+    w.site_list.setCurrentRow(-1)
+    w.b_acquire.click()
+    qtbot.waitUntil(lambda: w.ctrl.busy and dpp.status().mca_enabled, timeout=10000)
+    job = w.ctrl.job
+    w.close()
+    assert not dpp.status().mca_enabled  # counting stopped at once
+    job.future.exception(10)  # the job thread ends promptly (cancelled)
+    assert job.cancelled
+
+
+def test_min_energy_control(qtbot, eds):
+    w, mgr, dpp = eds
+    assert w.sp_emin.value() == pytest.approx(0.22)  # default: just below C Kα
+    thsl0 = float(dpp.get_settings(["THSL"])["THSL"])
+    assert thsl0 == pytest.approx(w.ctrl.thsl_for(0.22), abs=0.01)  # applied when the window opened
+    w.sp_emin.setValue(0.5)
+    qtbot.waitUntil(lambda: abs(float(dpp.get_settings(["THSL"])["THSL"]) - w.ctrl.thsl_for(0.5)) < 0.01,
+                    timeout=3000)
+    assert w.settings.min_energy_kev == 0.5

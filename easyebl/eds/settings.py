@@ -45,6 +45,9 @@ class EDSSettings:
     image_ny: int = 384
     image_dwell_us: float = 4.0
     oxygen_by_stoichiometry: bool = False
+    min_energy_kev: float = 0.22  # low-energy cut-off (DP5 slow threshold), just below C Kα (0.277 keV)
+    idle_monitor: bool = True  # live MCA (delta mode) between acquisitions
+    idle_update_s: float = 1.0  # its read-out interval
     save_folder: str = ""
     path: str = field(default="", repr=False, compare=False)
 

@@ -130,3 +130,44 @@ def test_beam_program_and_ai_windows():
     assert w.result("future", 0)[0] == pytest.approx(2999.5)
     w.request("lost", 0, 10)
     assert np.isnan(w.result("lost", 0)[0])
+
+
+def test_idle_monitor_reads_delta_spectra_and_yields_to_jobs(rig):
+    mgr, dpp, ctrl = rig
+    sub = ctrl.events.subscribe()
+    ctrl.start_idle_monitor(0.2)
+    try:
+        deadline = time.monotonic() + 5
+        idle = []
+        while len(idle) < 3 and time.monotonic() < deadline:
+            idle += [ev.data["spectrum"] for ev in sub.drain() if ev.kind == "idle_spectrum"]
+            time.sleep(0.02)
+        assert len(idle) >= 3 and ctrl.idle_state == "live"
+        for sp in idle:  # delta mode: each reading covers one interval only
+            assert sp.real_time == pytest.approx(0.2, abs=0.05) and sp.icr > 0 and 0 <= sp.dead_fraction < 1
+        # a job takes the MCA (its preset is honoured); the monitor re-arms afterwards
+        sp = ctrl.acquire_spectrum(0.3, at_um=(0.0, 0.0)).result(30)
+        assert sp.real_time == pytest.approx(0.3, abs=5e-3)
+        sub.drain()
+        deadline = time.monotonic() + 5
+        while not any(ev.kind == "idle_spectrum" for ev in sub.drain()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert time.monotonic() < deadline, "idle monitor did not resume after the job"
+        ctrl.set_idle_interval(0.5)
+        with ctrl.idle_paused():
+            assert ctrl.idle_state == "paused" and not dpp.status().mca_enabled
+    finally:
+        ctrl.stop_idle_monitor()
+    assert ctrl.idle_state == "off" and not dpp.status().mca_enabled
+
+
+def test_min_energy_sets_the_slow_threshold(rig):
+    mgr, dpp, ctrl = rig
+    n = dpp.channels
+    thsl = ctrl.set_min_energy(1.0)  # 1 keV = channel 100 with 10 eV/ch
+    assert thsl == pytest.approx(100.0 * ctrl.energy_calibration.channel(1.0) / n, abs=1e-3)
+    assert float(dpp.get_settings(["THSL"])["THSL"]) == pytest.approx(thsl, abs=0.01)
+    sp = ctrl.acquire_spectrum(0.3, at_um=(0.0, 0.0)).result(30)
+    k = int(ctrl.energy_calibration.channel(1.0))
+    assert sp.total > 0 and sp.counts[:k].sum() == 0  # nothing below the cut-off
+    assert ctrl.thsl_for(100.0) == ctrl.THSL_MAX  # clamped to the DP5 range

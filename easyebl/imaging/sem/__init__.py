@@ -7,7 +7,8 @@ Modules:
 * :mod:`.panels`   – scan / capture / image / beam-shift / column panels
 * :mod:`.advanced` – the "Advanced…" hardware & waveform dialog
 * :mod:`.display`  – contrast/brightness model, scale-bar maths (no Qt)
-* :mod:`.optics`   – microscope (column) control interface – stubs for now
+
+The column (magnification, focus …) is controlled through :mod:`easyebl.microscope`.
 
 Run:  ``python -m easyebl.imaging.sem [--backend nidaqmx --device Dev1] [--console]``
 """

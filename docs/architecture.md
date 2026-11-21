@@ -140,10 +140,7 @@ The simulator injects the fault with `unplug(after_samples=…, fail_delay_s=…
 
 ## 9. Not yet implemented
 
-* EDS (Amptek DP5) integration. Hooks exist: timed marker lines (`line_sync_marker`,
-  `frame_sync_marker`) for hardware sequential buffering or list‑mode sync.
-* Hitachi RS‑232 remote control (magnification, focus, stigmation, stage). The SEM GUI already calls
-  the `MicroscopeControl` stubs in `imaging/sem/optics.py`.
-* Multi‑field writing with stage moves and per‑field marks.
+* Multi‑field writing with stage moves and per‑field marks (the stage HAL, `easyebl.microscope`,
+  provides the moves; the litho writer does not use it yet).
 * A calibration‑grid workflow (distortion and centre shift per magnification step).
 * Proximity‑effect correction (use BEAMER and import the dose classes).

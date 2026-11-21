@@ -52,3 +52,9 @@ def ground_truth(sim, image):
     xy = image.pixel_to_field(cols, rows)
     return sim.sample.intensity(xy[..., 0], xy[..., 1]) * sim.params.video_gain_v
 
+
+@pytest.fixture(autouse=True)
+def _microscope_settings_in_tmp(tmp_path, monkeypatch):
+    """Microscope settings never touch the user's file during tests."""
+    monkeypatch.setenv("EASYEBL_MICROSCOPE_SETTINGS", str(tmp_path / "microscope.json"))
+

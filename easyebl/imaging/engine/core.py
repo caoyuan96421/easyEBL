@@ -512,10 +512,19 @@ class ImagingEngine:
     def set_rotation_deg(self, deg: float) -> RasterConfig:
         return self.update(rotation_rad=math.radians(deg))
 
-    def set_calibration(self, calibration: FieldCalibration) -> None:
-        """New µm ↔ V calibration (e.g. the SEM magnification changed)."""
+    def set_calibration(self, calibration: FieldCalibration, scale_scan: bool = False) -> None:
+        """New µm ↔ V calibration.
+
+        ``scale_scan=True`` (the SEM magnification changed): the scan keeps its share of
+        the field – width, height and centre scale with the field size, like zooming on the
+        SEM.  Otherwise the scan keeps its size in µm and must fit the new field."""
         with self._lock:
-            cfg = self._normalize(self._cfg, calibration)
+            cfg = self._cfg
+            if scale_scan:
+                r = calibration.field_size_um / self._cal.field_size_um
+                cfg = cfg.with_(width_um=cfg.width_um * r, center_um=(cfg.center_um[0] * r, cfg.center_um[1] * r),
+                                height_um=None if cfg.height_um is None else cfg.height_um * r)
+            cfg = self._normalize(cfg, calibration)
             self._cal = calibration
             self._cfg = cfg
             self._gen += 1

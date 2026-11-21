@@ -10,7 +10,7 @@ from ..engine import SATURATION_WARN, EngineState, ImagingEngine
 from ..export import auto_levels, save_frame
 from .advanced import AdvancedDialog, SaveSettings
 from .display import ContrastBrightness, format_length
-from .optics import MicroscopeControl, StubMicroscope
+from ...microscope.control import MicroscopeControl, StubMicroscope
 from .panels import BeamShiftPanel, CapturePanel, ColumnPanel, ImagePanel, ScanPanel
 from .view import SEMImageView, render_annotated
 
@@ -72,12 +72,16 @@ class SEMWindow(QtWidgets.QMainWindow):
         microscope: MicroscopeControl | None = None,
         owns_engine: bool = True,
         simulated: bool = False,
+        microscope_bundle=None,
     ):
         super().__init__()
         self.engine = engine
         self.owns_engine = owns_engine
         self.simulated = simulated
-        self.mic = microscope or StubMicroscope()
+        # a MicroscopeBundle (easyebl.microscope.launch) gives the stage, the microscope window and the
+        # magnification ↔ field coupling; a bare MicroscopeControl only the column
+        self.bundle = microscope_bundle
+        self.mic = microscope or (microscope_bundle.sem if microscope_bundle is not None else StubMicroscope())
         self.save_settings = SaveSettings(folder=os.path.join(os.getcwd(), "captures"))
         self.cb = ContrastBrightness(ai_range_v=self._ai_range())
         self._last_seq = 0
@@ -172,6 +176,9 @@ class SEMWindow(QtWidgets.QMainWindow):
         a.toggled.connect(lambda on: setattr(self.view, "show_scan_line", on))
         tb.addSeparator()
         tb.addAction("Advanced…", self.open_advanced)
+        if self.bundle is not None and self.bundle.connected:
+            tb.addAction("Microscope…", self.bundle.show_window).setToolTip(
+                "SEM column settings and stage control (RS-232)")
         tb.addAction("Full screen", lambda: self.showNormal() if self.isFullScreen() else self.showFullScreen())
 
     def _make_status(self):
@@ -293,6 +300,17 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.l_pix.setText(f"{c.nx}×{c.ny} · field {format_length(c.width_um)} · "
                            f"pixel {format_length(c.pixel_size_um[0])}")
         self.column.sync()
+        self._sync_microscope_info()
+
+    def _sync_microscope_info(self):
+        """Data bar: accelerating voltage and working distance from the microscope (when known)."""
+        kv, wd = self.mic.accelerating_voltage_kv(), self.mic.working_distance_mm()
+        info = self.view.info
+        new_kv = f"{kv:g} kV" if kv else "-- kV"
+        new_wd = f"WD {wd:g} mm" if wd else "WD --"
+        if info.get("kv") != new_kv or info.get("wd") != new_wd:
+            info["kv"], info["wd"] = new_kv, new_wd
+            self.view.update()
 
     def _pointer(self, xy):
         self.l_ptr.setText("" if xy is None else f"x {xy[0]:+.3f} µm, y {xy[1]:+.3f} µm")
@@ -351,7 +369,9 @@ class SEMWindow(QtWidgets.QMainWindow):
     def save_frame(self, frame, stem: str):
         s = self.save_settings
         try:
-            files = save_frame(frame, stem, levels=self.levels(), ai_range_v=self._ai_range(), formats=s.formats)
+            meta = self.bundle.metadata() if self.bundle is not None else self.mic.snapshot()
+            files = save_frame(frame, stem, levels=self.levels(), ai_range_v=self._ai_range(), formats=s.formats,
+                               microscope=meta)
             if s.data_bar:
                 img = render_annotated(frame, self.levels(), self.view.info)
                 p = f"{stem}_databar.png"
@@ -381,6 +401,9 @@ class SEMWindow(QtWidgets.QMainWindow):
         self._adv.raise_()
 
     def _after_advanced(self):
+        f = self.bundle.follower if self.bundle is not None else None
+        if f is not None:
+            f.adopt()  # a new full-scale field at this magnification re-calibrates field × magnification
         self.cb.ai_range_v = self._ai_range()
         self.scan.sync()
         self.shift.sync()

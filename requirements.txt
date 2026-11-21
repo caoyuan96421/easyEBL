@@ -19,6 +19,9 @@ gdstk>=0.9
 # NI-DAQmx scan hardware
 nidaqmx>=0.9
 
+# Hitachi S-3000 SEM + stage remote control (RS-232)
+pyserial>=3.5
+
 # Amptek DP5 pulse processor (USB)
 pyusb>=1.2
 libusb-package>=1.0
