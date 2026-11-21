@@ -47,12 +47,13 @@ Every program takes `--backend sim` (simulator, no hardware) or
 | SEM imaging | `easyebl-sem` | `python -m easyebl.imaging.sem` |
 | SEM text console | `easyebl-sem-cli` | `python -m easyebl.imaging.cli` |
 | EDS | `easyebl-eds` | `python -m easyebl.eds` |
-| SEM + EDS in one program | `easyebl-suite` | – |
+| SEM + EDS in one program | `easyebl-suite` | `python -m easyebl.eds.gui.suite` |
 | Demo / all tools as tabs | `easyebl-demo` | `python -m easyebl.gui.launcher` |
 | Raster debug GUI | – | `python -m easyebl.imaging.gui` |
 
-In VS Code select the `.venv` interpreter and run the module (e.g. a launch configuration with
-`"module": "easyebl.imaging.sem"` and `"args": ["--backend", "sim"]`).
+In VS Code select the `.venv` interpreter (*Python: Select Interpreter*) and pick a program in
+*Run and Debug* (F5): `.vscode/launch.json` has a simulator and a USB-6363 entry for each.
+`python -m easyebl.eds.gui.suite` is the module form of `easyebl-suite`.
 
 ## Quick start (simulator)
 

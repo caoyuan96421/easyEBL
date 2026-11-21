@@ -1,0 +1,106 @@
+{
+    // Run / debug the easyEBL programs (F5). Select the .venv interpreter first
+    // (Python: Select Interpreter). "sim" = simulator, "USB-6363" = the scan DAQ on the SEM.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "SEM (sim)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.imaging.sem",
+            "args": ["--backend", "sim"],
+            "justMyCode": true
+        },
+        {
+            "name": "SEM (USB-6363)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.imaging.sem",
+            "args": ["--backend", "nidaqmx", "--preset", "usb6363", "--device", "Dev1"],
+            "justMyCode": true
+        },
+        {
+            "name": "SEM console (sim)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.imaging.cli",
+            "args": ["--backend", "sim"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "SEM console (USB-6363)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.imaging.cli",
+            "args": ["--backend", "nidaqmx", "--preset", "usb6363", "--device", "Dev1"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "EDS (sim + DP5 mock)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.eds",
+            "args": ["--backend", "sim"],
+            "justMyCode": true
+        },
+        {
+            "name": "EDS (USB-6363 + DP5)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.eds",
+            "args": ["--backend", "nidaqmx", "--preset", "usb6363", "--device", "Dev1"],
+            "justMyCode": true
+        },
+        {
+            "name": "SEM + EDS suite (sim)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.eds.gui.suite",
+            "args": ["--backend", "sim"],
+            "justMyCode": true
+        },
+        {
+            "name": "SEM + EDS suite (USB-6363 + DP5)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.eds.gui.suite",
+            "args": ["--backend", "nidaqmx", "--preset", "usb6363", "--device", "Dev1"],
+            "justMyCode": true
+        },
+        {
+            "name": "Demo launcher (sim)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.gui.launcher",
+            "args": [],
+            "justMyCode": true
+        },
+        {
+            "name": "Raster debug GUI (sim)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.imaging.gui",
+            "args": ["--backend", "sim"],
+            "justMyCode": true
+        },
+        {
+            "name": "HAL debug GUI (sim)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "easyebl.hal.gui",
+            "args": [],
+            "justMyCode": true
+        },
+        {
+            "name": "pytest (all)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": ["-q"],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
