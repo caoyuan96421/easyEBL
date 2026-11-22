@@ -73,7 +73,7 @@ class ImagingWidget(QtWidgets.QWidget):
         self._t_emit = 0.0
         self._fps_t = []
 
-        cfg = RasterConfig(nx=256, ny=256, width_um=0.8 * session.calibration.field_size_um,
+        cfg = RasterConfig(nx=256, ny=256, width_um=session.calibration.field_size_um,
                            ai_channels=tuple(session.manager.config.ai_channels)[:1])
         self.form = DataclassForm(cfg, RASTER_FORM_OVERRIDES,
                                   hidden=("height_um", "line_sync_marker", "frame_sync_marker", "frames"))

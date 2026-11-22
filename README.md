@@ -142,6 +142,11 @@ The engine can also be driven by text commands from Python
 **Auxiliary outputs.** The HAL exposes AO2/AO3 as static auxiliary outputs **`aux0`/`aux1`**
 (`handle.set_aux_output("aux1", 1.5)`). They are dummy channels on boards without them.
 
+**Static beam and ADC, no stream.** `handle.park(x_v, y_v, blank=False)` holds the beam at a voltage;
+`handle.read_ai_mean("video", samples=1000)` reads the video input now (a finite AI-only acquisition,
+100 kS/s by default, averaged; `read_ai` returns the samples).  Outputs are untouched; both are refused
+while a stream runs.  Point EDS spectra use exactly this: no stream while the DP5 counts.
+
 **Lost USB connection.** If the 6363 is unplugged or switched off, the current call fails with
 `DeviceLostError`. Operations then fail at once instead of hanging, and the beam state is reported as *unknown*.
 A watchdog probes the device every 0.5 s with a harmless one-sample AI read. When the device answers again, the HAL resets
@@ -201,7 +206,7 @@ clamped to the real time meanwhile.
 Open → *Microscope*; the port and baud rate are set in *Hardware → Configure…*.
 
 The SEM text protocol and the stage protocol share **one serial port** (9600 8N1; the SEM relays
-the stage lines after `#STAGE ON`, which is sent automatically).  The driver
+the stage lines only after `#STAGE ON`).  The driver
 (`easyebl/microscope/s3000`) is vendored from *hitachi_s3000_control_lib*, which was verified on the
 S-3000. On top of it:
 
@@ -221,14 +226,19 @@ S-3000. On top of it:
   S0 is sent at once, also while a long SEM command holds the port, and a move that is being sent
   at that moment is halted too.  Negative coordinates stay disabled until their encoding is checked
   on the instrument.
+* **Who drives the stage.** By default the **SEM PC** has it (`#STAGE OFF`: its trackball works and
+  it decides about motor power).  Positions are still read – each read sends `#STAGE ON`, the query
+  and `#STAGE OFF`.  `engage()` (`#STAGE ON`) gives easyEBL the stage for moves; `release()` stops
+  any move and hands it back.
 * **Wiring.** Imaging and EDS use the column through `MicroscopeControl`.  The DAQ field follows the
   magnification as `field = K / magnification`.  `K` is learnt from the current field calibration
   the first time and re-learnt when the field is calibrated in *Advanced…*; it is stored in
   `%APPDATA%\easyEBL\microscope.json`.  Zooming keeps the scan's share of the field.  EDS takes the
   SEM's kV as the nominal beam energy, and spectra and images carry the column and stage readbacks.
 * The window: HV, magnification, focus / WD, stigmator, condenser and SEM display on the left; on
-  the right a big **STOP ALL** (also *Esc*), a position table with read times, absolute / relative
-  moves, X/Y/Z/R/T jogs behind an *Enable stage motion* interlock, and the raw TX/RX log.  On the
+  the right a big **STOP ALL** (also *Esc*), the **Enable / Disable** button (easyEBL or the SEM PC
+  drives the stage), a digital readout of X, Y, Z, R (and T) – double-click a value to move that
+  axis to / by a value – the X/Y/Z/R/T jogs, and the raw TX/RX log.  On the
   real instrument, HV switching, automatic routines and moves ask for confirmation.
 * **Beam presets** (*Beam presets…* in the toolbar or *Presets…* in the beam group): any number of
   named settings of beam 1 coarse / fine, stigmator X / Y and contrast / brightness.  *Save current…*
@@ -309,6 +319,23 @@ Subsystem tests check physical outcomes on the simulator. For example:
 
 The NI backend is tested against an in‑memory fake of `nidaqmx`. These tests cover sample
 alignment of AO/DO/AI, the clock routing, the start order, blanker polarity, the safe tail and abort.
+
+**Hardware tests** (`tests/hardware`, marker `hardware`) talk to the real DP5 (USB) and S-3000
+(the serial port saved in the easyEBL configuration, else COM4).  They run with every `pytest`
+and skip by themselves when a device is not connected, switched off or in use (close easyEBL
+first).  They check communication and settings, not spectra: DP5 identity, slow threshold,
+shaping preset, preset real time, counting and clearing, the EDS live monitor; SEM readbacks,
+magnification, WD, focus, stigmator, condenser, contrast / brightness, freeze, beam presets,
+priorities, coalescing, stage reads, small X / Y moves and STOP.  Every changed setting and the
+X / Y position are restored.  They never set or switch the high voltage, run automatic routines,
+touch the DP5 detector bias or cooler, or move Z / R / T.
+
+```bash
+pytest tests/hardware                         # on the instrument
+EASYEBL_HW_NO_STAGE=1 pytest tests/hardware   # without stage moves
+EASYEBL_NO_HARDWARE_TESTS=1 pytest            # never touch the instrument
+EASYEBL_HW_DRY_RUN=1 pytest tests/hardware    # check the tests on the mock DP5 / S-3000 simulator
+```
 
 ## Hardware notes
 

@@ -80,7 +80,8 @@ class SystemBackend:
                 cfg.device = c.device
             if c.ai_terminal:
                 cfg.ai_terminal = c.ai_terminal
-            cal = FieldCalibration(float(c.field_um), cfg.ao_limit_v)
+            cal = FieldCalibration(float(c.field_um), cfg.ao_limit_v, invert_x=bool(c.invert_x),
+                                   invert_y=bool(c.invert_y), swap_xy=bool(c.swap_xy))
             if c.simulated:
                 be = SimulatedBackend(cfg, SimParams(field_size_um=float(c.field_um), v_full_scale=cfg.ao_limit_v,
                                                      realtime=True, noise_sigma=0.05))

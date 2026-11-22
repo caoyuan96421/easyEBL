@@ -80,3 +80,24 @@ def test_create_pulse_processor():
         p.close()
     with pytest.raises(ValueError):
         create_pulse_processor("sim")
+
+
+def test_speed_presets_and_auto_threshold_leave_the_slow_threshold_alone(dp5):
+    """THSL follows the EDS minimum energy only: no preset or auto threshold writes it."""
+    from easyebl.hal.dp5.presets import SHAPING_KEYS, SPEEDS
+
+    assert "THSL" not in SHAPING_KEYS and all("THSL" not in s["config"] for s in SPEEDS.values())
+    dp5.configure({"THSL": "3.000"})
+    for speed in (1, 5, 3):
+        dp5.apply_speed(speed)
+        assert float(dp5.get_settings(["THSL"])["THSL"]) == pytest.approx(3.0, abs=0.01)
+    res = dp5.auto_threshold()
+    assert "THFA" in next(iter(res.values())) and "THSL" not in next(iter(res.values()))
+    assert float(dp5.get_settings(["THSL"])["THSL"]) == pytest.approx(3.0, abs=0.01)
+
+
+def test_speed_preset_table():
+    from easyebl.hal.dp5.presets import SPEEDS
+
+    assert SPEEDS[1]["config"]["TPFA"] == "100"  # 50 ns did not work reliably
+    assert {s["config"]["BLRU"] for s in SPEEDS.values()} == {"0"}  # one baseline restorer setting

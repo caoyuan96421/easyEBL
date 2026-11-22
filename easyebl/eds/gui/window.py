@@ -6,7 +6,7 @@ a worker thread; results are picked up by timers.  Nothing here touches the
 DAQ or the pulse processor directly.
 
 Layout: electron image with acquisition sites (left) · spectrum with element
-markers and fit (centre) · quantification / maps / line profile (bottom) ·
+markers and fit (centre) · maps / line profile (bottom) ·
 control tabs Acquire / Map / Composition (right) with the live MCA panel
 (delta-mode spectrum, ICR, OCR, dead time) always visible below them.
 """
@@ -91,6 +91,9 @@ class EDSWindow(QtWidgets.QMainWindow):
         self._quant = None
         self._maps: list = []
         self._map_live_t = 0.0
+        self._live_prev = None  # last cumulative partial spectrum of the running job (for the live delta)
+        self._live_px = None  # map pixels already counted into the live delta
+        self._live_px_t = 0.0
         self._calib_dialog = None
         self._apply_settings_to_controller()
 
@@ -133,17 +136,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         ll.addWidget(self.imgview, 1)
         ll.addWidget(self.site_list)
 
-        # bottom tabs: quant / maps / line profile
-        self.quant_table = QtWidgets.QTableWidget(0, 6)
-        self.quant_table.setHorizontalHeaderLabels(["Element", "Line", "Wt%", "Wt% σ", "At%", "Oxide wt%"])
-        self.quant_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        self.quant_note = QtWidgets.QLabel()
-        self.quant_note.setStyleSheet("color:#aaa")
-        qw = QtWidgets.QWidget()
-        ql = QtWidgets.QVBoxLayout(qw)
-        ql.setContentsMargins(2, 2, 2, 2)
-        ql.addWidget(self.quant_table)
-        ql.addWidget(self.quant_note)
+        # bottom tabs: maps / line profile (the quantification is in the Composition tab)
         self.maps_area = QtWidgets.QScrollArea()
         self.maps_area.setWidgetResizable(True)
         self.maps_holder = QtWidgets.QWidget()
@@ -154,7 +147,6 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.profile.setLabel("left", "Counts")
         self.profile.addLegend()
         self.bottom = QtWidgets.QTabWidget()
-        self.bottom.addTab(qw, "Quantification")
         self.bottom.addTab(self.maps_area, "Maps")
         self.bottom.addTab(self.profile, "Line profile")
 
@@ -453,6 +445,41 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.l_ocr.setText(f"OCR {sp.ocr / 1e3:.2f} kcps")
         self.l_dead.setValue(int(round(100 * min(max(sp.dead_fraction, 0.0), 1.0))))
 
+    def _live_from_partial(self, sp: Spectrum):
+        """During a spectrum acquisition: the live panel shows what arrived since the previous
+        read-out (current partial − previous partial), with its own ICR / OCR / dead time."""
+        prev = self._live_prev
+        self._live_prev = sp
+        if prev is not None and len(prev.counts) == len(sp.counts) and sp.real_time > prev.real_time:
+            sp = Spectrum(np.clip(sp.counts.astype(np.int64) - prev.counts, 0, None), sp.calibration,
+                          sp.real_time - prev.real_time, max(sp.live_time - prev.live_time, 0.0),
+                          max(sp.fast_count - prev.fast_count, 0), max(sp.slow_count - prev.slow_count, 0),
+                          sp.beam_kv, sp.takeoff_deg)
+        self._show_live(sp)
+
+    #: how often a running map updates the live panel (s)
+    LIVE_MAP_S = 0.5
+
+    def _live_from_map(self, sm):
+        """During a map / line scan: the live panel shows the pixels finished since its last
+        update (summed), with their ICR / OCR / dead time."""
+        now = time.monotonic()
+        if now - self._live_px_t < self.LIVE_MAP_S:
+            return
+        done = np.asarray(sm.done, dtype=bool)
+        prev = self._live_px if self._live_px is not None and self._live_px.shape == done.shape else             np.zeros_like(done)
+        new = done & ~prev
+        if not new.any():
+            return
+        self._live_px, self._live_px_t = done.copy(), now
+        counts = np.asarray(sm.cube[new], dtype=np.int64).sum(axis=0)
+        real = float(np.asarray(sm.real_time)[new].sum())
+        if real <= 0:
+            return
+        sp = Spectrum(counts, sm.calibration, real, float(np.asarray(sm.live_time)[new].sum()),
+                      int(np.asarray(sm.fast_count)[new].sum()), int(counts.sum()))
+        self._show_live(sp)
+
     def _show_live(self, sp: Spectrum):
         cal = self.ctrl.energy_calibration
         n = len(sp.counts)
@@ -601,8 +628,20 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.q_fit.setChecked(True)
         self.q_fit.toggled.connect(self._show_fit)
         f.addRow(self.q_fit)
-        lay.addWidget(g)
-        lay.addStretch(1)
+        self.quant_table = QtWidgets.QTableWidget(0, 6)
+        self.quant_table.setHorizontalHeaderLabels(["Element", "Line", "Wt%", "± Wt%", "At%", "Oxide wt%"])
+        self.quant_table.verticalHeader().setVisible(False)
+        self.quant_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        hh = self.quant_table.horizontalHeader()
+        hh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        hh.setStretchLastSection(True)
+        self.quant_table.setMinimumHeight(180)
+        f.addRow(self.quant_table)
+        self.quant_note = QtWidgets.QLabel()
+        self.quant_note.setWordWrap(True)
+        self.quant_note.setStyleSheet("color:#aaa")
+        f.addRow(self.quant_note)
+        lay.addWidget(g, 1)
         return w
 
     def _make_menus(self):
@@ -748,7 +787,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         s.map_nx, s.map_ny, s.map_dwell_ms = self.m_nx.value(), self.m_ny.value(), self.m_dwell.value()
         job = self._start(self.ctrl.acquire_map, s.map_nx, s.map_ny, s.map_dwell_ms / 1e3, region)
         if job is not None:
-            self.bottom.setCurrentIndex(1)
+            self.bottom.setCurrentWidget(self.maps_area)
             self.m_progress.setValue(0)
 
     def start_linescan(self):
@@ -902,7 +941,6 @@ class EDSWindow(QtWidgets.QMainWindow):
         tot = sum(r.wt for r in q.rows)
         self.quant_note.setText(f"Total {tot:.1f} wt% (normalised) – {q.method}; E0 {q.beam_kv:.1f} kV. "
                                 + " ".join(q.notes))
-        self.bottom.setCurrentIndex(0)
 
     def sync_beam_kv(self):
         """Beam energy from the SEM (its remote control reports the accelerating voltage)."""
@@ -1020,7 +1058,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         for m in maps:
             self.m_overlay.addItem(m.label)
         self.m_overlay.blockSignals(False)
-        self.bottom.setCurrentIndex(1)
+        self.bottom.setCurrentWidget(self.maps_area)
 
     def _overlay_changed(self, i):
         if i <= 0 or self.map is None:
@@ -1084,7 +1122,7 @@ class EDSWindow(QtWidgets.QMainWindow):
                            if it.yData is not None and len(it.yData)), default=1.0)
                 self.profile.plot(d, se / np.nanmax(se) * top, pen=pg.mkPen("#bbb", style=QtCore.Qt.DashLine),
                                   name="SE (scaled)")
-        self.bottom.setCurrentIndex(2)
+        self.bottom.setCurrentWidget(self.profile)
 
     # ================================================================ dialogs
     def open_calibration(self):
@@ -1101,8 +1139,10 @@ class EDSWindow(QtWidgets.QMainWindow):
                 kw["region_um"] = self.image.region_um
             return self.ctrl.acquire_spectrum(seconds, **kw)
 
-        d = CalibrationDialog(sp, self.ctrl.energy_calibration, acquire=acquire, parent=self)
+        d = CalibrationDialog(sp, self.ctrl.energy_calibration, acquire=acquire, parent=self,
+                              points=self.settings.calibration_points)
         d.calibrationApplied.connect(self._calibration_applied)
+        d.pointsChanged.connect(self._calibration_points_changed)
         self._calib_dialog = d
         d.show()
 
@@ -1119,19 +1159,18 @@ class EDSWindow(QtWidgets.QMainWindow):
         except Exception as e_:  # noqa: BLE001 - shown to the user
             self.notify(f"min. energy not applied: {e_}")
 
-    def _calibration_applied(self, cal, fwhm_ev, fano):
+    def _calibration_points_changed(self, points: list):
+        self.settings.calibration_points = list(points)
+        self._save_settings()
+
+    def _calibration_applied(self, cal):
         self.ctrl.set_energy_calibration(cal)
         self.settings.energy_calibration = cal
         self.settings.calibration_source = f"{self.ctrl.mca.name} {self.ctrl.mca.info().get('serial', '')}"
-        if np.isfinite(fwhm_ev) and 90 < fwhm_ev < 400:
-            self.settings.fwhm_mn_ev = round(float(fwhm_ev), 1)
-            self.c_fwhm.setValue(self.settings.fwhm_mn_ev)
-        if np.isfinite(fano):
-            self.settings.fano = float(fano)
         self._save_settings()
         self.apply_min_energy()  # the threshold in % depends on the calibration
         self.notify(f"energy calibration applied: offset {cal.offset_kev * 1e3:+.2f} eV, "
-                    f"gain {cal.gain_kev * 1e3:.4f} eV/ch; FWHM@Mn {self.settings.fwhm_mn_ev:g} eV")
+                    f"slope {cal.gain_kev * 1e3:.4f} eV/ch")
         self._show_current()
 
     def open_processor(self):
@@ -1294,6 +1333,8 @@ class EDSWindow(QtWidgets.QMainWindow):
         d = ev.data
         if ev.kind in ("error", "warning", "job_started", "job_done", "settings", "info"):
             self.notify(ev.message)
+        if ev.kind in ("job_started", "job_done"):
+            self._live_prev = self._live_px = None
         if ev.kind == "spectrum":
             sp = d.get("spectrum")
             job = self._job
@@ -1307,7 +1348,7 @@ class EDSWindow(QtWidgets.QMainWindow):
                         self._last_auto = time.monotonic()
                         self.specview.autoscale()
             if sp is not None and sp.real_time > 0:
-                self._show_rates(sp)
+                self._live_from_partial(sp)
         elif ev.kind == "idle_spectrum":
             sp = d.get("spectrum")
             if sp is not None:
@@ -1321,6 +1362,7 @@ class EDSWindow(QtWidgets.QMainWindow):
             sm = d.get("map")
             if sm is not None:
                 self.m_progress.setValue(int(100 * d.get("progress", 0)))
+                self._live_from_map(sm)
                 if time.monotonic() - self._map_live_t > 1.0 and sm.se is not None:
                     self._map_live_t = time.monotonic()
                     se = np.where(sm.done, sm.se, np.nan)
@@ -1382,7 +1424,8 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     def _update_status(self):
         st = self.ctrl.idle_state
-        if st != "live":
+        live_delta = st == "job" and (self._live_prev is not None or self._live_px is not None)
+        if st != "live" and not live_delta:  # a running job shows its own deltas
             txt = {"job": "acquisition running", "off": "live read-out off", "paused": "paused"}.get(st, st)
             self.l_live_t.setText(txt if len(txt) < 48 else txt[:45] + "…")
             self.l_live_t.setToolTip(st)

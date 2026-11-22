@@ -20,7 +20,7 @@ from ... import xray
 from ...xray import generation as gen
 from ..spectrum import Spectrum
 from .background import snip_background
-from .calibration import find_peaks
+from .peaksearch import find_peaks
 from .fitting import SI_KA, fit_spectrum
 
 __all__ = ["Identification", "identify_elements", "COMMON_ELEMENTS", "EXCLUDED_ELEMENTS"]
@@ -52,7 +52,7 @@ def residual_peaks(counts: np.ndarray, model: np.ndarray, cal, det: gen.Detector
                    e_min_kev: float = 0.25, e_max_kev: float | None = None):
     """Peaks the model misses: local maxima of the excess (counts − model) summed over ±FWHM/2,
     in units of its Poisson σ.  Returns [(energy, Peak)]."""
-    from .calibration import Peak
+    from .peaksearch import Peak
 
     y = np.asarray(counts, float)
     m = np.maximum(np.asarray(model, float), 1.0)

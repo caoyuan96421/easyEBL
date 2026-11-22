@@ -21,7 +21,7 @@ def cu():
 
 
 def test_energy_calibration_roundtrip():
-    c = EnergyCalibration(-0.01, 0.0101, 2e-8)
+    c = EnergyCalibration(-0.01, 0.0101)
     k = np.array([0.0, 100.5, 1500.0])
     np.testing.assert_allclose(c.channel(c.energy(k)), k, atol=1e-9)
     assert EnergyCalibration.from_dict(c.to_dict()) == c
@@ -39,31 +39,30 @@ def test_snip_background_follows_the_continuum(cu):
     assert bg[pk].sum() < 0.1 * cu.counts[pk].sum()
 
 
-def test_peak_search_and_two_point_calibration(cu):
+def test_peak_search_and_linear_fit(cu):
     wrong = cu.with_calibration(EnergyCalibration(0.06, 0.0097))
     peaks = A.find_peaks(wrong)
     assert len(peaks) >= 2
-    pairs = A.auto_assign(wrong, A.standard_lines("Cu (L + Kα)"))
-    assert [lab for lab, *_ in pairs] == ["Cu La1", "Cu Ka1"]
-    fit = A.fit_calibration([p.channel for *_, p in pairs], [e for _, e, _ in pairs])
     true = true_calibration()
+    ka = min(peaks, key=lambda p: abs(p.channel - true.channel(8.04)))
+    la = min(peaks, key=lambda p: abs(p.channel - true.channel(0.93)))
+    fit = EnergyCalibration.fit([la.channel, ka.channel], [0.9297, 8.0415])
     for e in (1.0, 5.0, 8.0, 15.0):
-        k = true.channel(e)
-        assert abs(fit.calibration.energy(k) - e) < 0.006  # < 6 eV over the range
-    # resolution from the Cu Kα width
-    ka = min(peaks, key=lambda p: abs(wrong.calibration.energy(p.channel) - 7.78))
-    fwhm_kev = ka.fwhm_ch * fit.calibration.gain_kev
-    mn, fano = A.fit_resolution([(8.04, fwhm_kev)])
-    assert 120 < mn < 150 and fano == pytest.approx(0.115)
+        assert abs(fit.energy(true.channel(e)) - e) < 0.006  # < 6 eV over the range
 
 
-def test_one_point_and_quadratic_fits():
-    f1 = A.fit_calibration([800.0], [8.0])
-    assert f1.calibration.gain_kev == pytest.approx(0.01) and f1.calibration.offset_kev == 0
+def test_linear_fit_one_and_many_points():
+    one = EnergyCalibration.fit([800.0], [8.0])
+    assert one.gain_kev == pytest.approx(0.01) and one.offset_kev == 0
+    one = EnergyCalibration.fit([800.0], [8.0], offset_kev=-0.04)  # the offset is kept
+    assert one.offset_kev == -0.04 and one.energy(800.0) == pytest.approx(8.0)
     ch = np.array([50.0, 300.0, 800.0, 1500.0])
-    true = EnergyCalibration(-0.02, 0.01, 3e-7)
-    f2 = A.fit_calibration(ch, true.energy(ch), order=2)
-    assert f2.rms_ev < 1e-6 and f2.calibration.quad_kev == pytest.approx(3e-7, rel=1e-6)
+    true = EnergyCalibration(-0.02, 0.0101)
+    fit = EnergyCalibration.fit(ch, true.energy(ch))
+    assert fit.offset_kev == pytest.approx(-0.02) and fit.gain_kev == pytest.approx(0.0101)
+    with pytest.raises(ValueError):
+        EnergyCalibration.fit([100.0, 100.0], [1.0, 2.0])
+    assert EnergyCalibration.from_dict({"offset_kev": 0.01, "gain_kev": 0.02, "quad_kev": 1e-7}) ==         EnergyCalibration(0.01, 0.02)  # an old quadratic term is dropped
 
 
 @pytest.mark.parametrize("comp", [STAINLESS, {"Ti": 0.6, "O": 0.4}, {"Na": 0.39, "Cl": 0.61},
@@ -162,15 +161,3 @@ def test_autoid_on_real_dp5_spectra(name):
     found = {i.element for i in A.identify_elements(sp, detector=Detector(fwhm_mn_ev=156))}
     truth = _DP5[name]
     assert found <= truth and truth - found <= {"Mn"}  # Mn (2 wt%) under Cr Kβ is optional
-
-
-def test_calibration_assignment_ignores_a_strong_spurious_peak():
-    """A large artefact peak at low energy (seen once on the DP5) must not be taken for Cu L."""
-    from pathlib import Path
-
-    sp = load_spectrum(Path(__file__).resolve().parents[1] / "data" / "dp5_spectra" / "3_cu_calibrated.msa")
-    k = np.arange(sp.n_channels)
-    c = sp.counts + 31000 * np.exp(-0.5 * ((k - 56.5) / 4) ** 2) / (4 * np.sqrt(2 * np.pi))
-    bad = Spectrum(np.random.default_rng(0).poisson(c), EnergyCalibration(0.0, 0.01), beam_kv=20.0)
-    pairs = A.auto_assign(bad, A.standard_lines("Cu (L + Kα)"))
-    assert [(lab, round(p.channel)) for lab, _, p in pairs] == [("Cu La1", 99), ("Cu Ka1", 849)]

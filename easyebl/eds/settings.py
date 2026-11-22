@@ -27,8 +27,9 @@ def default_settings_path() -> str:
 
 @dataclass
 class EDSSettings:
-    calibration: dict = field(default_factory=lambda: EnergyCalibration(0.0, 0.01).to_dict())
+    calibration: dict = field(default_factory=lambda: EnergyCalibration().to_dict())
     calibration_source: str = ""  # which processor / standard the calibration was made with
+    calibration_points: list = field(default_factory=list)  # pairs of the calibration window (peak ↔ line)
     window: str = "AP3.3"
     fwhm_mn_ev: float = 130.0
     fano: float = 0.115

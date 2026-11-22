@@ -180,6 +180,13 @@ class DAQBackend(ABC):
         (never during a stream).
         """
 
+    def read_ai(self, channels: Sequence[str], samples: int, rate: float,
+                ai_range_v: float | None = None) -> np.ndarray:
+        """Static ADC read: *samples* samples of each AI channel (logical names) at *rate*,
+        with no output stream – the outputs keep their static values.  Returns volts,
+        shape ``(len(channels), samples)``."""
+        raise NotImplementedError(f"{type(self).__name__} cannot read AI statically")
+
     # ------------------------------------------------------------------ streams
     @abstractmethod
     def run_stream(

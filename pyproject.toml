@@ -33,4 +33,5 @@ testpaths = ["tests"]
 markers = [
   "system: subsystem tests running full pipelines on the simulator",
   "gui: GUI smoke tests (offscreen Qt)",
+  "hardware: tests on the real DP5 / S-3000 (skip when not connected)",
 ]

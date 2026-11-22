@@ -1,161 +1,340 @@
-"""Energy calibration dialog: MCA channel → keV from the peaks of a known standard."""
+"""Energy calibration window: a linear channel → energy line from peaks of a known sample.
+
+* **Offset / slope** are shown and can be typed in directly (eV, eV per channel).
+* **Spectrum** of the calibration sample: the current one, or *Acquire*.  Click a peak to
+  put the marker on it (it snaps to the peak centre).
+* **Periodic table**: click the element that made the marked peak.  Its line nearest to the
+  marker (by the current calibration) is paired with the peak; the line can be changed in
+  the table.  One pair sets the slope (offset kept); two or more fit offset and slope.
+* **Pairs persist** across spectra (and sessions): e.g. Si Kα from one sample, then acquire on
+  a Cu sample and add Cu Kα – the fit uses both.  ``pointsChanged(list)`` reports every change
+  (as dicts, see :meth:`CalibrationDialog.points`).
+* **Clear calibration**: offset 0, 10 eV per channel, no pairs.
+
+``calibrationApplied(EnergyCalibration)`` is emitted on *Apply*.
+"""
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
-from ..analysis import STANDARDS, auto_assign, find_peaks, fit_calibration, fit_resolution, line_energy, standard_lines
-from ..spectrum import EnergyCalibration, Spectrum
+from ... import xray
+from ..analysis import find_peaks, refine_peak, snip_background
+from ..spectrum import DEFAULT_GAIN_KEV, EnergyCalibration, Spectrum
+from .views import PeriodicTableWidget
 
-__all__ = ["CalibrationDialog"]
+__all__ = ["CalibrationDialog", "PeakLine", "element_peaks"]
+
+_GREEK = {"a": "α", "b": "β", "g": "γ", "l": "ℓ", "n": "η"}
+
+
+@dataclass(frozen=True)
+class PeakLine:
+    """One peak an element produces on an SDD (lines closer than the resolution merged)."""
+
+    label: str  # "Cu Kα"
+    energy_kev: float
+
+
+def element_peaks(element: str, e_min_kev: float = 0.2, merge_kev: float = 0.06) -> list[PeakLine]:
+    """The resolvable peaks of *element*: lines of one family within *merge_kev* are one peak
+    at their weighted mean energy (Kα1 + Kα2, Lα + Lβ1 …), labelled by the strongest line."""
+    ls = sorted((ln for ln in xray.lines(element, min_weight=0.05) if ln.energy >= e_min_kev),
+                key=lambda ln: ln.energy)
+    groups: list[list] = []
+    for ln in ls:
+        g = groups[-1] if groups else None
+        if g and g[0].family == ln.family and ln.energy - g[-1].energy <= merge_kev:
+            g.append(ln)
+        else:
+            groups.append([ln])
+    out = []
+    for g in groups:
+        w = np.array([ln.weight for ln in g])
+        e = float(np.dot(w, [ln.energy for ln in g]) / w.sum())
+        main = max(g, key=lambda ln: ln.weight)
+        name = main.name[0] + _GREEK.get(main.name[1:2].lower(), main.name[1:2]) if len(main.name) > 1 else main.name
+        out.append(PeakLine(f"{element} {name}", e))
+    return out
+
+
+@dataclass
+class _Pair:
+    element: str
+    line: PeakLine
+    channel: float
+    source: str = ""  # the spectrum the peak was marked in
+
+    def to_dict(self) -> dict:
+        return {"element": self.element, "label": self.line.label, "energy_kev": self.line.energy_kev,
+                "channel": self.channel, "source": self.source}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "_Pair":
+        return cls(str(d["element"]), PeakLine(str(d["label"]), float(d["energy_kev"])), float(d["channel"]),
+                   str(d.get("source", "")))
+
+
+def _source(sp: Spectrum | None) -> str:
+    if sp is None:
+        return ""
+    t = (sp.timestamp or "").replace("T", " ")[5:16]
+    return f"{sp.title or 'spectrum'} {t}".strip()
 
 
 class CalibrationDialog(QtWidgets.QDialog):
-    """Calibrate channels → energy.
+    """Linear energy calibration (see the module docstring)."""
 
-    * spectrum: the current one, or acquire a new one (callback ``acquire(seconds) -> Future[Spectrum]``);
-    * standard: lines expected in the spectrum (or type your own: "Cu Ka1" or a number in keV);
-    * peaks: found automatically, assigned to lines (editable table);
-    * fit: linear (offset + gain) or quadratic; residuals in eV; detector FWHM at Mn Kα.
+    calibrationApplied = QtCore.Signal(object)
+    pointsChanged = QtCore.Signal(list)
 
-    ``calibrationApplied(EnergyCalibration, fwhm_mn_ev, fano)`` is emitted on Apply.
-    """
+    COLS = ["Line", "Energy (keV)", "Channel", "Residual (eV)", "Spectrum"]
 
-    calibrationApplied = QtCore.Signal(object, float, float)
-
-    COLS = ["Use", "Line", "Energy (keV)", "Channel", "FWHM (eV)", "Residual (eV)"]
-
-    def __init__(self, spectrum: Spectrum | None, current: EnergyCalibration, acquire=None, parent=None):
+    def __init__(self, spectrum: Spectrum | None, current: EnergyCalibration, acquire=None, parent=None,
+                 points: list | None = None):
         super().__init__(parent)
         self.setWindowTitle("Energy calibration")
-        self.resize(980, 680)
+        self.resize(1150, 760)
         self.spectrum = spectrum
-        self.current = current
+        self.applied = current
         self.acquire = acquire
-        self._fit = None
+        self.pairs: list[_Pair] = []
+        for d in points or []:
+            try:
+                self.pairs.append(_Pair.from_dict(d))
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.pairs.sort(key=lambda p: p.line.energy_kev)
+        self.marker: float | None = None  # marked peak (fractional channel)
         self._future = None
-        self._peaks = []
+        self._syncing = False
 
-        # --- spectrum source
-        src = QtWidgets.QGroupBox("Calibration spectrum")
-        sl = QtWidgets.QHBoxLayout(src)
+        # --- calibration (offset / slope)
+        g = QtWidgets.QGroupBox("Calibration   E = offset + slope × channel")
+        cl = QtWidgets.QHBoxLayout(g)
+        self.sp_offset = QtWidgets.QDoubleSpinBox()
+        self.sp_offset.setRange(-5000, 5000)
+        self.sp_offset.setDecimals(2)
+        self.sp_offset.setSuffix(" eV")
+        self.sp_slope = QtWidgets.QDoubleSpinBox()
+        self.sp_slope.setRange(0.001, 1000)
+        self.sp_slope.setDecimals(4)
+        self.sp_slope.setSuffix(" eV/ch")
+        for sp in (self.sp_offset, self.sp_slope):
+            sp.setKeyboardTracking(False)
+            sp.setMinimumWidth(130)
+            sp.valueChanged.connect(self._typed)
+        self.b_clear = QtWidgets.QPushButton("Clear calibration")
+        self.b_clear.setToolTip(f"offset 0, {DEFAULT_GAIN_KEV * 1e3:g} eV per channel; removes all pairs")
+        self.b_clear.clicked.connect(self.clear)
+        self.l_applied = QtWidgets.QLabel()
+        self.l_applied.setStyleSheet("color:#9aa")
+        cl.addWidget(QtWidgets.QLabel("Offset"))
+        cl.addWidget(self.sp_offset)
+        cl.addSpacing(12)
+        cl.addWidget(QtWidgets.QLabel("Slope"))
+        cl.addWidget(self.sp_slope)
+        cl.addSpacing(12)
+        cl.addWidget(self.b_clear)
+        cl.addStretch(1)
+        cl.addWidget(self.l_applied)
+
+        # --- spectrum
+        sg = QtWidgets.QGroupBox("Calibration spectrum (click a peak to mark it)")
+        sl = QtWidgets.QVBoxLayout(sg)
+        row = QtWidgets.QHBoxLayout()
         self.l_src = QtWidgets.QLabel()
         self.sp_time = QtWidgets.QDoubleSpinBox()
         self.sp_time.setRange(1, 3600)
-        self.sp_time.setValue(60)
-        self.sp_time.setSuffix(" s")
-        self.b_acq = QtWidgets.QPushButton("Acquire new")
+        self.sp_time.setValue(30)
+        self.sp_time.setSuffix(" s live")
+        self.b_acq = QtWidgets.QPushButton("Acquire")
         self.b_acq.setEnabled(acquire is not None)
         self.b_acq.clicked.connect(self._acquire)
-        sl.addWidget(self.l_src, 1)
-        sl.addWidget(QtWidgets.QLabel("Live:"))
-        sl.addWidget(self.sp_time)
-        sl.addWidget(self.b_acq)
-
-        # --- standard
-        std = QtWidgets.QGroupBox("Standard")
-        stl = QtWidgets.QHBoxLayout(std)
-        self.cb_std = QtWidgets.QComboBox()
-        self.cb_std.addItems(list(STANDARDS))
-        self.b_auto = QtWidgets.QPushButton("Find peaks && assign")
-        self.b_auto.clicked.connect(self.auto)
-        self.b_add = QtWidgets.QPushButton("Add row")
-        self.b_add.clicked.connect(lambda: self._add_row("", float("nan"), float("nan"), float("nan"), True))
-        self.b_del = QtWidgets.QPushButton("Remove row")
-        self.b_del.clicked.connect(self._remove_row)
-        stl.addWidget(self.cb_std, 1)
-        stl.addWidget(self.b_auto)
-        stl.addWidget(self.b_add)
-        stl.addWidget(self.b_del)
-
-        # --- plot (channels)
+        self.cb_log = QtWidgets.QCheckBox("Log")
+        self.cb_log.toggled.connect(lambda on: self.plot.setLogMode(y=on))
+        row.addWidget(self.l_src, 1)
+        row.addWidget(self.cb_log)
+        row.addWidget(self.sp_time)
+        row.addWidget(self.b_acq)
+        sl.addLayout(row)
         self.plot = pg.PlotWidget(background="#1e1f22")
         self.plot.setLabel("bottom", "Channel")
         self.plot.setLabel("left", "Counts")
-        self.plot.setLogMode(y=False)
         self.curve = self.plot.plot([], [], pen=pg.mkPen("#ffd54f", width=1.2), stepMode="center")
-        self.peak_marks = pg.ScatterPlotItem(symbol="t", size=12, brush=pg.mkBrush("#ff6b6b"), pen=None)
-        self.plot.addItem(self.peak_marks)
-        self._labels = []
+        self.mark_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#4fc3f7", width=2,
+                                                                                 style=QtCore.Qt.DashLine))
+        self.mark_line.setVisible(False)
+        self.plot.addItem(self.mark_line, ignoreBounds=True)
+        self._pair_items: list = []
         self.plot.scene().sigMouseClicked.connect(self._plot_click)
+        sl.addWidget(self.plot, 1)
+        self.l_mark = QtWidgets.QLabel("no peak marked")
+        sl.addWidget(self.l_mark)
 
-        # --- table
+        # --- periodic table + pairs
+        pg_ = QtWidgets.QGroupBox("Element of the marked peak")
+        pl = QtWidgets.QVBoxLayout(pg_)
+        self.ptable = PeriodicTableWidget(checkable=False)
+        self.ptable.elementClicked.connect(self.add_element)
+        pl.addWidget(self.ptable)
+        pl.addStretch(1)
+        tg = QtWidgets.QGroupBox("Calibration pairs")
+        tl = QtWidgets.QVBoxLayout(tg)
         self.table = QtWidgets.QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        self.table.itemChanged.connect(lambda *_: self.refit())
-
-        # --- fit
-        fitg = QtWidgets.QGroupBox("Fit")
-        fl = QtWidgets.QGridLayout(fitg)
-        self.cb_order = QtWidgets.QComboBox()
-        self.cb_order.addItems(["Linear (offset + gain)", "Quadratic"])
-        self.cb_order.currentIndexChanged.connect(lambda *_: self.refit())
-        self.l_res = QtWidgets.QLabel("–")
-        self.l_res.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.l_cur = QtWidgets.QLabel(self._cal_text(current))
-        fl.addWidget(QtWidgets.QLabel("Model:"), 0, 0)
-        fl.addWidget(self.cb_order, 0, 1)
-        fl.addWidget(QtWidgets.QLabel("Current:"), 1, 0)
-        fl.addWidget(self.l_cur, 1, 1)
-        fl.addWidget(QtWidgets.QLabel("New:"), 2, 0)
-        fl.addWidget(self.l_res, 2, 1)
+        tl.addWidget(self.table)
+        r = QtWidgets.QHBoxLayout()
+        b = QtWidgets.QPushButton("Remove selected")
+        b.clicked.connect(self.remove_selected)
+        r.addWidget(b)
+        b = QtWidgets.QPushButton("Remove all")
+        b.clicked.connect(self.remove_all)
+        r.addWidget(b)
+        r.addStretch(1)
+        tl.addLayout(r)
+        bottom = QtWidgets.QHBoxLayout()
+        bottom.addWidget(pg_)
+        bottom.addWidget(tg, 1)
 
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Apply | QtWidgets.QDialogButtonBox.Close)
         self.b_apply = bb.button(QtWidgets.QDialogButtonBox.Apply)
-        self.b_apply.setEnabled(False)
         self.b_apply.clicked.connect(self.apply)
         bb.rejected.connect(self.reject)
+        self.l_msg = QtWidgets.QLabel("1. take a spectrum of the calibration sample   2. click a peak   "
+                                      "3. click its element   (one pair: slope; two or more: offset and slope)")
+        self.l_msg.setStyleSheet("color:#9aa")
+        self.l_msg.setWordWrap(True)
 
         lay = QtWidgets.QVBoxLayout(self)
-        lay.addWidget(src)
-        lay.addWidget(std)
-        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        split.addWidget(self.plot)
-        split.addWidget(self.table)
-        split.setSizes([380, 200])
-        lay.addWidget(split, 1)
-        lay.addWidget(fitg)
+        lay.addWidget(g)
+        lay.addWidget(sg, 1)
+        lay.addLayout(bottom)
+        lay.addWidget(self.l_msg)
         lay.addWidget(bb)
-        self.l_hint = QtWidgets.QLabel("Click a peak in the plot to add it; type a line label (\"Cu Ka1\") or an "
-                                       "energy in keV in the Line column.")
-        self.l_hint.setStyleSheet("color:#999")
-        lay.addWidget(self.l_hint)
+
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._poll)
         self._timer.start(200)
-        self._show_spectrum()
+        self._set_spins(current)
+        self._show_applied()
+        self._show_spectrum(mark_strongest=True)
 
-    # ------------------------------------------------------------ helpers
-    @staticmethod
-    def _cal_text(c: EnergyCalibration) -> str:
-        s = f"E = {c.offset_kev * 1e3:+.2f} eV + {c.gain_kev * 1e3:.5f} eV × ch"
-        if c.quad_kev:
-            s += f" {c.quad_kev * 1e3:+.3e} eV × ch²"
-        return s
+    # ------------------------------------------------------------ calibration
+    @property
+    def calibration(self) -> EnergyCalibration:
+        """The calibration shown (not applied yet)."""
+        return EnergyCalibration(self.sp_offset.value() / 1e3, self.sp_slope.value() / 1e3)
 
-    def _show_spectrum(self):
-        sp = self.spectrum
-        if sp is None:
-            self.l_src.setText("No spectrum – acquire one of the standard.")
+    def _set_spins(self, cal: EnergyCalibration) -> None:
+        self._syncing = True
+        try:
+            self.sp_offset.setValue(cal.offset_kev * 1e3)
+            self.sp_slope.setValue(cal.gain_kev * 1e3)
+        finally:
+            self._syncing = False
+        self._refresh()
+
+    def _typed(self, *_):
+        if not self._syncing:
+            self._refresh()
+
+    def _show_applied(self):
+        c = self.applied
+        self.l_applied.setText(f"in use: {c.offset_kev * 1e3:+.2f} eV + {c.gain_kev * 1e3:.4f} eV/ch")
+
+    def points(self) -> list:
+        """The calibration pairs as dicts (element, label, energy_kev, channel, source)."""
+        return [p.to_dict() for p in self.pairs]
+
+    def _pairs_changed(self):
+        self.pointsChanged.emit(self.points())
+
+    def clear(self):
+        self.pairs.clear()
+        self._pairs_changed()
+        self._set_spins(EnergyCalibration())
+        self._msg(f"cleared: offset 0, {DEFAULT_GAIN_KEV * 1e3:g} eV per channel")
+
+    def refit(self) -> None:
+        """Offset and slope from the pairs (one pair: slope only, through the current offset)."""
+        if not self.pairs:
+            self._refresh()
             return
-        self.l_src.setText(f"{sp.title or 'spectrum'}: {sp.total:,} counts, {sp.real_time:.1f} s real, "
-                           f"{sp.n_channels} channels")
-        k = np.arange(sp.n_channels + 1) - 0.5
-        self.curve.setData(k, sp.counts.astype(float))
-        self.plot.autoRange()
+        try:
+            cal = EnergyCalibration.fit([p.channel for p in self.pairs], [p.line.energy_kev for p in self.pairs],
+                                        offset_kev=self.sp_offset.value() / 1e3)
+        except ValueError as e:
+            self._msg(str(e), error=True)
+            self._refresh()
+            return
+        self._set_spins(cal)
 
+    def apply(self):
+        cal = self.calibration
+        self.applied = cal
+        self._show_applied()
+        self.calibrationApplied.emit(cal)
+        self._msg("calibration applied")
+
+    # ------------------------------------------------------------ pairs
+    def add_element(self, element: str):
+        """Pair the marked peak with *element*'s line nearest to it (by the shown calibration)."""
+        if self.spectrum is None or self.marker is None:
+            self._msg("take a spectrum and click a peak first", error=True)
+            return
+        peaks = element_peaks(element)
+        if not peaks:
+            self._msg(f"{element}: no lines above 0.2 keV", error=True)
+            return
+        e_mark = self.calibration.energy(self.marker)
+        line = min(peaks, key=lambda p: abs(p.energy_kev - e_mark))
+        src = _source(self.spectrum)
+        # re-assigning a peak of this spectrum replaces its pair
+        self.pairs = [p for p in self.pairs if not (p.source == src and abs(p.channel - self.marker) <= 1.0)]
+        self.pairs.append(_Pair(element, line, float(self.marker), src))
+        self.pairs.sort(key=lambda p: p.line.energy_kev)
+        self._pairs_changed()
+        self._msg(f"{line.label} ({line.energy_kev:.3f} keV) ↔ channel {self.marker:.2f}")
+        self.refit()
+
+    def remove_selected(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            if 0 <= r < len(self.pairs):
+                del self.pairs[r]
+        self._pairs_changed()
+        self.refit()
+
+    def remove_all(self):
+        self.pairs.clear()
+        self._pairs_changed()
+        self._refresh()
+
+    def _line_changed(self, row: int, combo: QtWidgets.QComboBox):
+        if 0 <= row < len(self.pairs):
+            self.pairs[row].line = combo.currentData()
+            self._pairs_changed()
+            self.refit()
+
+    # ------------------------------------------------------------ spectrum
     def _acquire(self):
         if self.acquire is None or self._future is not None:
             return
         try:
             self._future = self.acquire(float(self.sp_time.value()))
-        except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "Acquire", str(e))
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            self._msg(f"acquire: {e}", error=True)
             return
         self.b_acq.setEnabled(False)
-        self.l_src.setText("Acquiring…")
+        self._msg("acquiring …")
 
     def _poll(self):
         f = self._future
@@ -171,170 +350,109 @@ class CalibrationDialog(QtWidgets.QDialog):
             try:
                 self.spectrum = f.result()
             except Exception as e:  # noqa: BLE001
-                QtWidgets.QMessageBox.warning(self, "Acquire", str(e))
+                self._msg(f"acquire: {e}", error=True)
                 return
-            self._show_spectrum()
-            self.auto()
+            self._show_spectrum(mark_strongest=True)  # the pairs so far are kept
+            self._msg("spectrum acquired: click a peak, then its element (earlier pairs are kept)")
 
-    def _spectrum_now(self) -> Spectrum | None:
+    def _show_spectrum(self, mark_strongest: bool = False):
         sp = self.spectrum
-        return None if sp is None else sp.with_calibration(self.current)
-
-    # ------------------------------------------------------------ table
-    def _add_row(self, label, energy, channel, fwhm_ev, use=True):
-        self.table.blockSignals(True)
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        chk = QtWidgets.QTableWidgetItem()
-        chk.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
-        chk.setCheckState(QtCore.Qt.Checked if use else QtCore.Qt.Unchecked)
-        self.table.setItem(r, 0, chk)
-        vals = [label, "" if not np.isfinite(energy) else f"{energy:.4f}",
-                "" if not np.isfinite(channel) else f"{channel:.3f}",
-                "" if not np.isfinite(fwhm_ev) else f"{fwhm_ev:.0f}", ""]
-        for c, v in enumerate(vals, start=1):
-            it = QtWidgets.QTableWidgetItem(v)
-            if c in (4, 5):
-                it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
-            self.table.setItem(r, c, it)
-        self.table.blockSignals(False)
-
-    def _remove_row(self):
-        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
-        for r in rows or [self.table.rowCount() - 1]:
-            if r >= 0:
-                self.table.removeRow(r)
-        self.refit()
-
-    def rows(self) -> list[dict]:
-        out = []
-        for r in range(self.table.rowCount()):
-            def txt(c):
-                it = self.table.item(r, c)
-                return it.text().strip() if it else ""
-            label, e_txt, ch_txt = txt(1), txt(2), txt(3)
-            energy = float("nan")
-            if e_txt:
-                try:
-                    energy = float(e_txt)
-                except ValueError:
-                    pass
-            if not np.isfinite(energy) and label:
-                try:
-                    energy = float(label)
-                except ValueError:
-                    try:
-                        energy = line_energy(label)
-                    except Exception:  # noqa: BLE001
-                        pass
-            try:
-                ch = float(ch_txt)
-            except ValueError:
-                ch = float("nan")
-            use = self.table.item(r, 0).checkState() == QtCore.Qt.Checked
-            out.append({"row": r, "label": label, "energy": energy, "channel": ch, "use": use})
-        return out
-
-    # ------------------------------------------------------------ actions
-    def auto(self):
-        sp = self._spectrum_now()
         if sp is None:
+            self.l_src.setText("no spectrum – acquire one on the calibration sample")
+            self.curve.setData([], [])
+            self._refresh()
             return
-        self._peaks = find_peaks(sp)
-        lines = standard_lines(self.cb_std.currentText())
-        pairs = auto_assign(sp, lines, peaks=self._peaks)
-        self.table.setRowCount(0)
-        for lab, e, p in pairs:
-            self._add_row(lab, e, p.channel, p.fwhm_ch * sp.calibration.channel_width(p.channel) * 1e3)
-        self._mark_peaks()
-        self.refit()
-        if len(pairs) < 2:
-            self.l_hint.setText("Fewer than two lines matched – click the peaks to add them by hand.")
-
-    def _mark_peaks(self):
-        for t in self._labels:
-            self.plot.removeItem(t)
-        self._labels = []
-        sp = self.spectrum
-        if sp is None or not self._peaks:
-            self.peak_marks.setData([], [])
-            return
-        xs = [p.channel for p in self._peaks]
-        ys = [float(sp.counts[int(round(p.channel))]) for p in self._peaks]
-        self.peak_marks.setData(xs, ys)
-        for x, y in zip(xs, ys):
-            t = pg.TextItem(f"{x:.1f}", color="#ff8787", anchor=(0.5, 1.6))
-            t.setPos(x, y)
-            self.plot.addItem(t)
-            self._labels.append(t)
+        y = np.asarray(sp.counts, dtype=float)
+        x = np.arange(y.size + 1) - 0.5
+        self.curve.setData(x, y)
+        self.l_src.setText(f"{sp.title or 'spectrum'}: {y.size} channels, {int(y.sum()):,} counts, "
+                           f"live {sp.live_time:.1f} s")
+        if mark_strongest:
+            self.marker = None
+            try:
+                pk = find_peaks(sp.with_calibration(self.calibration), min_significance=5.0)
+            except Exception:  # noqa: BLE001 - empty or odd spectrum
+                pk = []
+            if pk:
+                self.marker = float(max(pk, key=lambda p: p.height).channel)
+        self._refresh()
 
     def _plot_click(self, ev):
+        if self.spectrum is None or ev.button() != QtCore.Qt.LeftButton:
+            return
+        vb = self.plot.getPlotItem().vb
+        if not vb.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        self.mark_peak(vb.mapSceneToView(ev.scenePos()).x())
+
+    def mark_peak(self, channel: float) -> float | None:
+        """Put the marker on the peak nearest *channel* (centroid of the local maximum)."""
         sp = self.spectrum
         if sp is None:
-            return
-        p = self.plot.getPlotItem().vb.mapSceneToView(ev.scenePos())
-        from ..analysis import refine_peak
-        from ..analysis.background import snip_background
-
-        bg = snip_background(sp.counts, self.current)
-        k = float(p.x())
-        sig = 0.13 / 2.355 / max(self.current.gain_kev, 1e-6)
-        pk = refine_peak(sp.counts, k, sig, bg)
-        if pk is None:
-            return
-        e_guess = self.current.energy(pk.channel)
-        from ... import xray
-
-        cand = xray.lines_near(e_guess, tol=0.15, min_weight=0.3)
-        lab = cand[0].label if cand else ""
-        self._add_row(lab, line_energy(lab) if lab else float("nan"), pk.channel,
-                      pk.fwhm_ch * self.current.gain_kev * 1e3)
-        self.refit()
-
-    def refit(self):
-        rows = [r for r in self.rows() if r["use"] and np.isfinite(r["energy"]) and np.isfinite(r["channel"])]
-        self.b_apply.setEnabled(False)
-        self._fit = None
-        if not rows:
-            self.l_res.setText("need ≥ 1 assigned peak (≥ 2 for offset + gain)")
-            return
-        order = 2 if self.cb_order.currentIndex() == 1 else 1
-        try:
-            fit = fit_calibration([r["channel"] for r in rows], [r["energy"] for r in rows], order=order,
-                                  labels=[r["label"] for r in rows], name=self.cb_std.currentText())
-        except ValueError as e:
-            self.l_res.setText(str(e))
-            return
-        self._fit = fit
-        self.table.blockSignals(True)
-        for r, res in zip(rows, fit.residuals_ev):
-            self.table.item(r["row"], 5).setText(f"{res:+.1f}")
-        self.table.blockSignals(False)
-        txt = self._cal_text(fit.calibration) + f"   rms {fit.rms_ev:.1f} eV ({len(rows)} peaks)"
-        fw = self._resolution(fit.calibration)
-        if fw is not None:
-            txt += f"   FWHM@Mn Kα ≈ {fw[0]:.0f} eV"
-        self.l_res.setText(txt)
-        self.b_apply.setEnabled(True)
-
-    def _resolution(self, cal: EnergyCalibration):
-        pts = []
-        for r in self.rows():
-            it = self.table.item(r["row"], 4)
-            if r["use"] and it and it.text() and np.isfinite(r["energy"]):
-                try:
-                    fw_ch = float(it.text()) / 1e3 / max(self.current.gain_kev, 1e-9)
-                except ValueError:
-                    continue
-                pts.append((r["energy"], fw_ch * cal.gain_kev))
-        if not pts:
             return None
-        return fit_resolution(pts)
+        y = np.asarray(sp.counts, dtype=float)
+        n = y.size
+        cal = self.calibration
+        k0 = int(np.clip(round(channel), 0, n - 1))
+        # expected peak width: about 130 eV FWHM at Mn Kα, at least 1.5 channels
+        sigma = max(1.5, 0.13 / 2.355 / cal.gain_kev)
+        w = int(max(3, round(2 * sigma)))
+        lo, hi = max(0, k0 - w), min(n, k0 + w + 1)
+        k = lo + int(np.argmax(y[lo:hi]))
+        try:
+            bg = snip_background(y, cal)
+        except Exception:  # noqa: BLE001
+            bg = None
+        p = refine_peak(y, float(k), sigma, bg)
+        self.marker = float(p.channel) if p is not None else float(k)
+        self._refresh()
+        return self.marker
 
-    def apply(self):
-        if self._fit is None:
-            return
-        fw = self._resolution(self._fit.calibration) or (float("nan"), float("nan"))
-        self.calibrationApplied.emit(self._fit.calibration, float(fw[0]), float(fw[1]))
-        self.current = self._fit.calibration
-        self.l_cur.setText(self._cal_text(self.current))
+    # ------------------------------------------------------------ display
+    def _refresh(self):
+        cal = self.calibration
+        # marker
+        if self.marker is not None and self.spectrum is not None:
+            self.mark_line.setPos(self.marker)
+            self.mark_line.setVisible(True)
+            self.l_mark.setText(f"marked peak: channel {self.marker:.2f} = {cal.energy(self.marker):.3f} keV  "
+                                "– now click its element")
+        else:
+            self.mark_line.setVisible(False)
+            self.l_mark.setText("no peak marked")
+        # pair markers in the plot
+        for it in self._pair_items:
+            self.plot.removeItem(it)
+        self._pair_items = []
+        src = _source(self.spectrum)
+        for p in self.pairs:
+            here = p.source == src
+            ln = pg.InfiniteLine(p.channel, angle=90,
+                                 pen=pg.mkPen("#ff6b6b" if here else "#8a6b6b", width=1,
+                                              style=QtCore.Qt.SolidLine if here else QtCore.Qt.DotLine),
+                                 label=p.line.label, labelOpts={"position": 0.92 if here else 0.8,
+                                                                "color": "#ff9b9b" if here else "#a08080"})
+            self.plot.addItem(ln, ignoreBounds=True)
+            self._pair_items.append(ln)
+        # table
+        self.table.setRowCount(len(self.pairs))
+        for r, p in enumerate(self.pairs):
+            combo = QtWidgets.QComboBox()
+            for pl in element_peaks(p.element):
+                combo.addItem(f"{pl.label}  {pl.energy_kev:.3f} keV", pl)
+            labels = [combo.itemData(i).label for i in range(combo.count())]
+            if p.line.label in labels:
+                combo.setCurrentIndex(labels.index(p.line.label))
+            else:  # a line no longer offered: keep it as it is
+                combo.insertItem(0, f"{p.line.label}  {p.line.energy_kev:.3f} keV", p.line)
+                combo.setCurrentIndex(0)
+            combo.currentIndexChanged.connect(lambda _i, r=r, c=combo: self._line_changed(r, c))
+            self.table.setCellWidget(r, 0, combo)
+            res = (cal.energy(p.channel) - p.line.energy_kev) * 1e3
+            for c, txt in ((1, f"{p.line.energy_kev:.4f}"), (2, f"{p.channel:.2f}"), (3, f"{res:+.1f}"),
+                           (4, p.source)):
+                self.table.setItem(r, c, QtWidgets.QTableWidgetItem(txt))
+
+    def _msg(self, text: str, error: bool = False):
+        self.l_msg.setText(text)
+        self.l_msg.setStyleSheet("color:#f77" if error else "color:#9aa")

@@ -165,8 +165,19 @@ class AdvancedDialog(QtWidgets.QDialog):
         f.addRow("Full-scale field", self.field)
         self.inv_x = QtWidgets.QCheckBox("Invert X")
         self.inv_y = QtWidgets.QCheckBox("Invert Y")
+        self.swap_xy = QtWidgets.QCheckBox("Swap X / Y")
+        self.inv_x.setToolTip("reverse the X deflection output")
+        self.inv_y.setToolTip("reverse the Y deflection output")
+        self.swap_xy.setToolTip("image X drives the Y deflection and image Y the X deflection\n"
+                                "(the inversions refer to the outputs, after the swap)")
         f.addRow(self.inv_x)
         f.addRow(self.inv_y)
+        f.addRow(self.swap_xy)
+        orient = QtWidgets.QLabel("Scan orientation applies to this session; the default at start is set in "
+                                  "the easyEBL menu, Hardware → Configure….")
+        orient.setWordWrap(True)
+        orient.setStyleSheet("color:#9aa")
+        f.addRow(orient)
         note = QtWidgets.QLabel("Recalibrate whenever the SEM magnification changes; the scale bar and "
                                 "beam shift use this calibration.")
         note.setWordWrap(True)
@@ -230,6 +241,7 @@ class AdvancedDialog(QtWidgets.QDialog):
         self.field.setValue(cal.field_size_um)
         self.inv_x.setChecked(cal.invert_x)
         self.inv_y.setChecked(cal.invert_y)
+        self.swap_xy.setChecked(cal.swap_xy)
         s = self.save
         self.folder.setText(s.folder)
         self.auto_save.setChecked(s.auto_save)
@@ -243,7 +255,8 @@ class AdvancedDialog(QtWidgets.QDialog):
         try:
             cal = e.calibration
             new_cal = FieldCalibration(self.field.value(), cal.v_full_scale, cal.correction,
-                                       self.inv_x.isChecked(), self.inv_y.isChecked(), cal.name)
+                                       self.inv_x.isChecked(), self.inv_y.isChecked(), cal.name,
+                                       swap_xy=self.swap_xy.isChecked())
             if new_cal != cal:
                 e.set_calibration(new_cal)
             if self.ai_mode.currentData() != e.handle.ai_terminal:

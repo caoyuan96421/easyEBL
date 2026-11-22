@@ -179,9 +179,15 @@ class Task:
             DEVICE.static_do.append(data)
             DEVICE.log.append(("static_do", data))
 
-    def read(self, timeout=1.0):
+    def read(self, number_of_samples_per_channel=None, timeout=1.0):
         _check()
-        return 0.0
+        n_ai = sum(1 for k, _ in self.channels if k == "ai")
+        DEVICE.log.append(("static_ai", (n_ai, number_of_samples_per_channel, self.timing_cfg)))
+        v = getattr(DEVICE, "static_ai_v", 0.0)
+        if number_of_samples_per_channel is None:
+            return v if n_ai == 1 else [v] * n_ai
+        row = [v + 0.001 * (k % 3 - 1) for k in range(number_of_samples_per_channel)]
+        return row if n_ai == 1 else [row] * n_ai
 
     def start(self):
         _check()

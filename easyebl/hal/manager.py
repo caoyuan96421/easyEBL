@@ -351,6 +351,9 @@ class DAQManager:
         self._watchdog.start()
         return self._connected.wait(timeout)
 
+    #: default sample rate of a static AI read (1000 samples = 10 ms)
+    DEFAULT_STATIC_AI_RATE = 100e3
+
     def _call(self, fn, *args):
         """Run a backend call; a lost device is reported and turned into DeviceLostError."""
         try:
@@ -629,6 +632,30 @@ class DAQManager:
         finally:
             self._op_lock.release()
         self._emit("static", {"owner": handle.owner, "x_v": x_v, "y_v": y_v, "blank": blank})
+
+    def _read_ai(self, handle: "DAQHandle", channels, samples: int, rate: float | None,
+                 ai_range_v: float | None) -> np.ndarray:
+        cfg = self.config
+        chans = list(cfg.ai_channels) if channels is None else [channels] if isinstance(channels, str) \
+            else list(channels)
+        unknown = [c for c in chans if c not in cfg.ai_channels]
+        if not chans or unknown:
+            raise ValueError(f"unknown AI channel(s) {unknown}; configured: {list(cfg.ai_channels)}")
+        n = int(samples)
+        if not 1 <= n <= 10_000_000:
+            raise ValueError("samples must be 1 … 10 000 000")
+        top = cfg.max_ai_rate(len(chans))
+        r = min(self.DEFAULT_STATIC_AI_RATE, top) if rate is None else float(rate)
+        if not 0 < r <= top * (1 + 1e-9):
+            raise ValueError(f"AI rate {r:g} S/s outside 0 … {top:g} S/s for {len(chans)} channel(s)")
+        self._check_lease(handle)
+        self._require_connected()
+        if not self._op_lock.acquire(blocking=False):
+            raise DeviceBusyError(f"device busy (stream owned by '{self.active_owner}')")
+        try:
+            return np.asarray(self._call(self.backend.read_ai, chans, n, r, ai_range_v), dtype=float)
+        finally:
+            self._op_lock.release()
 
     def _blank_here(self) -> None:
         """Blank at the current position (park if the position is unknown).  Op lock held."""
@@ -948,6 +975,27 @@ class DAQHandle:
     def set_line(self, name: str, value: bool) -> None:
         self._check()
         self._mgr._set_line(self, name, value)
+
+    # ---------------------------------------------------------- static AI (ADC)
+    def read_ai(self, channels=None, samples: int = 1000, rate: float | None = None,
+                ai_range_v: float | None = None) -> np.ndarray:
+        """Read the AI inputs now, without a stream (the outputs keep their static values).
+
+        *channels*: one logical name, a list, or None = every configured AI channel.
+        *samples* at *rate* S/s (None: 100 kS/s or the device limit).  Returns volts,
+        shape ``(n_channels, samples)``.  Refused while a stream runs."""
+        self._check()
+        return self._mgr._read_ai(self, channels, samples, rate, ai_range_v)
+
+    def read_ai_mean(self, channels=None, samples: int = 1000, rate: float | None = None,
+                     ai_range_v: float | None = None) -> dict:
+        """Average of :meth:`read_ai`: ``{channel: mean volts}`` (e.g. the video signal with the
+        beam parked somewhere: ``park(x, y, blank=False)`` then ``read_ai_mean("video")``)."""
+        cfg = self._mgr.config
+        chans = list(cfg.ai_channels) if channels is None else [channels] if isinstance(channels, str) \
+            else list(channels)
+        data = self.read_ai(chans, samples, rate, ai_range_v)
+        return {c: float(data[i].mean()) for i, c in enumerate(chans)}
 
     # -------------------------------------------------------- aux analog outputs
     def set_aux_output(self, name: str, volts: float) -> None:

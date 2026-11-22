@@ -1,21 +1,26 @@
 """
 dp5.presets - SDD speed presets 1 (fastest) .. 5 (best resolution), derived from the DP5 SDK.
 
-=====  ======  ======  ======  ======  =====  ====  ================================
-speed  TPEA    TFLA    TPFA    THSL    THFA   BLRU  origin
-=====  ======  ======  ======  ======  =====  ====  ================================
-1      1.0us   0.2us   50ns    2.0%    30     2     SDK "SDD High Rate Default DP5"
-2      3.2us   0.2us   100ns   1.25%   30     1     geometric interpolation 1-3
-3      9.6us   0.2us   100ns   1.0%    30     0     SDK "SDD Default DP5"
-4      16.0us  0.2us   200ns   1.0%    30     1     geometric interpolation 3-5
-5      25.6us  0.2us   400ns   1.0%    30     2     SDK "SDD Low Energy Default DP5"
-=====  ======  ======  ======  ======  =====  ====  ================================
+=====  ======  ======  ======  =====  ====  ================================
+speed  TPEA    TFLA    TPFA    THFA   BLRU  origin
+=====  ======  ======  ======  =====  ====  ================================
+1      1.0us   0.2us   100ns   30     0     SDK "SDD High Rate Default DP5" (TPFA 50 -> 100 ns)
+2      3.2us   0.2us   100ns   30     0     geometric interpolation 1-3
+3      9.6us   0.2us   100ns   30     0     SDK "SDD Default DP5"
+4      16.0us  0.2us   200ns   30     0     geometric interpolation 3-5
+5      25.6us  0.2us   400ns   30     0     SDK "SDD Low Energy Default DP5"
+=====  ======  ======  ======  =====  ====  ================================
 
-All speeds: CLCK 80 MHz, PURE ON, RTDE OFF, PDMD NORM, BLRM 1, BLRD 3. CUSP is not set.
-THFA is 30 for all speeds; THSL is 1 % except for the short peaking times (speed 1: 2 %,
-speed 2: 1.25 %), which count noise at 1 % (bench, beam off: ~100 kcps at speed 1, 150 cps at
-speed 2). These are starting values - run ``DP5.auto_threshold()`` with the beam off to set both
-thresholds from the actual noise; the result is remembered per speed.
+All speeds: CLCK 80 MHz, PURE ON, RTDE OFF, PDMD NORM, BLRM 1, BLRD 3, BLRU 0 (one baseline
+restorer setting for every speed, ``SPEED_BLRU``). CUSP is not set.  Speed 1 uses a 100 ns fast
+peaking time instead of the SDK's 50 ns: at 50 ns it did not work reliably.
+THFA is 30 for all speeds - a starting value; ``DP5.auto_threshold()`` (beam off) sets it from
+the actual noise and the result is remembered per speed.
+
+The slow threshold THSL is **not** part of a preset: easyEBL sets it from the EDS minimum
+energy (``EDSController.set_min_energy``).  Note that short peaking times let more noise
+through (bench, beam off, THSL 1 %: ~100 kcps of noise at speed 1, 150 cps at speed 2), so the
+fastest speeds may need a higher minimum energy.
 
 Trade-off: a longer peaking time averages away more noise (better FWHM) but each pulse occupies
 ~2*TPEA+TFLA, so dead time rises with count rate. Peak output rates (at ~63 % dead):
@@ -24,7 +29,7 @@ Trade-off: a longer peaking time averages away more noise (better FWHM) but each
 150 / 50 / 17 / 10 / 6.5 kcps.
 
 Only the shaping keys (SHAPING_KEYS) are written: gain, polarity, input offset, reset lockout,
-channel count etc. are never changed, so switching speed does not move the peaks.
+slow threshold, channel count etc. are never changed, so switching speed does not move the peaks.
 
 ``ALL_SDK_SDD`` keeps verbatim copies of all nine SDK SDD / FastSDD / SuperSDD files for reference.
 """
@@ -85,31 +90,31 @@ ALL_SDK_SDD["SuperSDD Low Energy Default DP5"] = dict(ALL_SDK_SDD["SDD Low Energ
 # Speeds 1, 3 and 5 take the shaping of Amptek's "SDD High Rate", "SDD Default" and
 # "SDD Low Energy" files; 2 and 4 are geometric interpolations (peaking time is a log-scale
 # parameter: sqrt(1.0*9.6) = 3.1 -> 3.2 us, sqrt(9.6*25.6) = 15.7 -> 16.0 us). TPFA only takes
-# discrete values, so it steps 50/100/100/200/400 ns. BLRU (0-3) is interpolated to 1 for 2 and 4.
-# Thresholds: THFA = 30 (fast-channel units, 0-255.93) for all speeds; THSL = 1.0 % of full
-# scale, raised for speeds 1 and 2 whose short peaking time lets noise through at 1 % (measured,
-# beam off, NI simulator: speed 1 counted ~100 kcps of noise at 1 %, ~400 cps at 2 %; speed 2
-# 150 cps at 1 %). DP5.auto_threshold() refines both from the real noise.
+# discrete values, so it steps 100/100/100/200/400 ns (speed 1: one step above the SDK's 50 ns,
+# which did not work reliably).  BLRU (baseline restorer, up) is the same for every speed.
+# Fast threshold: THFA = 30 (fast-channel units, 0-255.93) for all speeds; DP5.auto_threshold()
+# refines it from the real noise.  The slow threshold (THSL) is not a preset setting: it follows
+# the EDS minimum energy.
 # CUSP is not set (left at whatever the DP5 has; this FPGA cannot read it back).
-SPEED_THSL = {1: "2.000", 2: "1.250", 3: "1.000", 4: "1.000", 5: "1.000"}
 SPEED_THFA = "30.00"
+SPEED_BLRU = "0"  # baseline restorer "up" rate (0-3), the same for every speed
 
 
-def _speed(tpea, tpfa, blru, source, thsl):
+def _speed(tpea, tpfa, source):
     return {
         "source": source,
         "config": {"CLCK": "80", "TPEA": f"{tpea:.3f}", "TFLA": "0.200", "TPFA": str(tpfa), "PURE": "ON",
-                   "RTDE": "OFF", "PDMD": "NORM", "THSL": thsl, "THFA": SPEED_THFA,
-                   "BLRM": "1", "BLRD": "3", "BLRU": str(blru)},
+                   "RTDE": "OFF", "PDMD": "NORM", "THFA": SPEED_THFA,
+                   "BLRM": "1", "BLRD": "3", "BLRU": SPEED_BLRU},
     }
 
 
 SPEEDS: dict[int, dict] = {
-    1: _speed(1.0, 50, 2, "SDD High Rate Default DP5", SPEED_THSL[1]),
-    2: _speed(3.2, 100, 1, "interpolated 1-3", SPEED_THSL[2]),
-    3: _speed(9.6, 100, 0, "SDD Default DP5", SPEED_THSL[3]),
-    4: _speed(16.0, 200, 1, "interpolated 3-5", SPEED_THSL[4]),
-    5: _speed(25.6, 400, 2, "SDD Low Energy Default DP5", SPEED_THSL[5]),
+    1: _speed(1.0, 100, "SDD High Rate Default DP5, TPFA 100 ns"),
+    2: _speed(3.2, 100, "interpolated 1-3"),
+    3: _speed(9.6, 100, "SDD Default DP5"),
+    4: _speed(16.0, 200, "interpolated 3-5"),
+    5: _speed(25.6, 400, "SDD Low Energy Default DP5"),
 }
 SPEED_MIN, SPEED_MAX = 1, 5
 
@@ -118,8 +123,8 @@ ALIASES = {"fast": 1, "high_rate": 1, "highrate": 1, "default": 3, "standard": 3
            "high_resolution": 5, "hires": 5, "high_res": 5, "low_energy": 5, "resolution": 5}
 
 # Pulse-processing settings a speed preset writes. Detector-specific settings (gain, polarity,
-# offset, reset lockout, channels, presets, HV/TEC, AUX/scope) are never touched.
-SHAPING_KEYS = ("CLCK", "TPEA", "TFLA", "TPFA", "PURE", "RTDE", "PDMD", "THSL", "THFA",
+# offset, reset lockout, slow threshold, channels, presets, HV/TEC, AUX/scope) are never touched.
+SHAPING_KEYS = ("CLCK", "TPEA", "TFLA", "TPFA", "PURE", "RTDE", "PDMD", "THFA",
                 "BLRM", "BLRD", "BLRU")
 
 # Effective dead time per counted pulse ~ DEADTIME_FACTOR * (2*TPEA + TFLA); 1.07 was measured on
@@ -179,6 +184,6 @@ def describe() -> str:
     for k, p in SPEEDS.items():
         c = p["config"]
         lines.append(f"speed {k}: TPEA {float(c['TPEA']):5.1f} us  TFLA {c['TFLA']} us  TPFA {c['TPFA']:>3s} ns  "
-                     f"THSL {c['THSL']}%  THFA {c['THFA']}  BLRU {c['BLRU']}  "
+                     f"THFA {c['THFA']}  BLRU {c['BLRU']}  "
                      f"max out ~{max_output_rate(k) / 1e3:5.0f} kcps  ({p['source']})")
     return "\n".join(lines)

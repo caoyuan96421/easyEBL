@@ -10,7 +10,7 @@ from ..spectrum import ElectronImage, Spectrum
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
 
-__all__ = ["SpectrumView", "ElectronImageView", "MapTile", "PeriodicTable", "SITE_COLORS"]
+__all__ = ["SpectrumView", "ElectronImageView", "MapTile", "PeriodicTable", "PeriodicTableWidget", "SITE_COLORS"]
 
 SITE_COLORS = ["#ffd54f", "#4fc3f7", "#81c784", "#f06292", "#ba68c8", "#ff8a65", "#a1887f", "#e0e0e0"]
 FAMILY_COLORS = {"K": "#ff6b6b", "L": "#4dabf7", "M": "#69db7c"}
@@ -381,8 +381,11 @@ class MapTile(QtWidgets.QFrame):
             self.clicked.emit(row, col)
 
 
-class PeriodicTable(QtWidgets.QDialog):
-    """Pick elements (toggle buttons in periodic-table layout)."""
+class PeriodicTableWidget(QtWidgets.QWidget):
+    """Element buttons in periodic-table layout.  ``checkable``: toggle a selection;
+    otherwise each click emits ``elementClicked(symbol)``."""
+
+    elementClicked = QtCore.Signal(str)
 
     _LAYOUT = [
         "H . . . . . . . . . . . . . . . . He",
@@ -395,12 +398,13 @@ class PeriodicTable(QtWidgets.QDialog):
         ". . Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu . .",
         ". . Th Pa U Np Pu . . . . . . . . . . .",
     ]
+    DISABLED = ("H", "He", "Li", "Ne", "Ar", "Kr", "Xe", "Rn")
 
-    def __init__(self, selected=(), parent=None):
+    def __init__(self, selected=(), checkable: bool = True, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Elements")
-        grid = QtWidgets.QGridLayout()
+        grid = QtWidgets.QGridLayout(self)
         grid.setSpacing(2)
+        grid.setContentsMargins(0, 0, 0, 0)
         self.buttons = {}
         for r, row in enumerate(self._LAYOUT):
             for c, sym in enumerate(row.split()):
@@ -408,22 +412,35 @@ class PeriodicTable(QtWidgets.QDialog):
                     continue
                 b = QtWidgets.QToolButton()
                 b.setText(sym)
-                b.setCheckable(True)
+                b.setCheckable(checkable)
                 b.setFixedSize(34, 28)
-                b.setChecked(sym in selected)
-                if sym in ("H", "He", "Li", "Ne", "Ar", "Kr", "Xe", "Rn"):
-                    b.setEnabled(False)
+                b.setChecked(checkable and sym in selected)
+                b.setEnabled(sym not in self.DISABLED)
                 b.setStyleSheet("QToolButton:checked{background:#2a82da;color:white;font-weight:bold}")
+                b.clicked.connect(lambda _=False, s=sym: self.elementClicked.emit(s))
                 grid.addWidget(b, r + (1 if r >= 7 else 0), c)
                 self.buttons[sym] = b
         grid.setRowMinimumHeight(7, 8)
+
+    def selected(self) -> list:
+        return [s for s, b in self.buttons.items() if b.isChecked()]
+
+
+class PeriodicTable(QtWidgets.QDialog):
+    """Pick elements (toggle buttons in periodic-table layout)."""
+
+    def __init__(self, selected=(), parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Elements")
+        self.table = PeriodicTableWidget(selected, checkable=True)
+        self.buttons = self.table.buttons
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         clear = bb.addButton("Clear", QtWidgets.QDialogButtonBox.ResetRole)
         clear.clicked.connect(lambda: [b.setChecked(False) for b in self.buttons.values()])
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay = QtWidgets.QVBoxLayout(self)
-        lay.addLayout(grid)
+        lay.addWidget(self.table)
         lay.addWidget(bb)
 
     def selected(self) -> list:

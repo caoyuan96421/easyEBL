@@ -39,6 +39,9 @@ class DAQSection:
     rate: float | None = None  # sample clock (S/s); None: device maximum (500 kS/s on the simulator)
     latency_ms: float = 100.0  # output buffer depth (setting-change latency)
     ai_terminal: str | None = None  # video input mode; None: the preset's
+    invert_x: bool = False  # reverse the X deflection output
+    invert_y: bool = False  # reverse the Y deflection output
+    swap_xy: bool = False  # image X drives the Y deflection (before the inversions)
 
     @property
     def simulated(self) -> bool:

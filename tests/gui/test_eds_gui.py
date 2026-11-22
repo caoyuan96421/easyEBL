@@ -64,12 +64,47 @@ def test_eds_window_workflow(qtbot, eds, tmp_path):
     assert sp is not None and sp.total > 5000
     w.open_calibration()
     d = w._calib_dialog
-    d.cb_std.setCurrentText("Mn / ⁵⁵Fe source (Kα, Kβ)")
-    d.auto()
-    assert d.table.rowCount() >= 2 and d.b_apply.isEnabled()
+    k_ka = d.marker  # the strongest peak is marked: Mn Kα
+    assert k_ka is not None and abs(k_ka - np.argmax(sp.counts)) < 3
+    d.add_element("Mn")  # the calibration is far off (the mock is ≈39 eV/ch): the nearest Mn line is wrong …
+    assert d.pairs[0].line.label != "Mn Kα" and d.table.rowCount() == 1
+    combo = d.table.cellWidget(0, 0)  # … and is corrected in the table
+    combo.setCurrentIndex([combo.itemData(i).label for i in range(combo.count())].index("Mn Kα"))
+    assert d.pairs[0].line.label == "Mn Kα" and abs(d.calibration.energy(k_ka) - 5.8965) < 1e-3
+    # Mn Kβ: click near it, then Mn again
+    true_kb = k_ka * 6.49 / 5.895
+    d.mark_peak(true_kb + 2)
+    d.add_element("Mn")
+    assert [p.line.label for p in d.pairs] == ["Mn Kα", "Mn Kβ"]
+    # a second spectrum (another sample): the pairs so far are kept, the new one is added
+    from easyebl.eds.spectrum import Spectrum as _Sp
+    other = _Sp(np.roll(sp.counts, 40), sp.calibration, title="second sample", timestamp="2026-11-22T10:00:00")
+    d.spectrum = other
+    d._show_spectrum(mark_strongest=True)
+    d.add_element("Mn")
+    assert len(d.pairs) == 3 and {p.source for p in d.pairs} >= {"second sample 11-22 10:00"}
+    saved = EDSSettings.load(w.settings.path).calibration_points
+    assert len(saved) == 3 and {q["label"] for q in saved} == {"Mn Kα", "Mn Kβ"}
+    d.remove_selected()  # nothing selected: no change
+    d.table.selectRow([p.source for p in d.pairs].index("second sample 11-22 10:00"))
+    d.remove_selected()
+    assert len(d.pairs) == 2 and len(EDSSettings.load(w.settings.path).calibration_points) == 2
+    d.spectrum = sp
+    d.refit()
     d.apply()
     cal = w.ctrl.energy_calibration
-    assert abs(cal.energy(int(np.argmax(sp.counts)) + 0.5) - 5.895) < 0.05  # Mn Kα where it belongs
+    assert abs(cal.energy(k_ka) - 5.895) < 0.01  # Mn Kα where it belongs
+    # typing a value and Clear
+    d.sp_slope.setValue(12.5)
+    assert d.calibration.gain_kev == pytest.approx(0.0125)
+    d.close()
+    # reopened: the pairs are back
+    w.open_calibration()
+    d = w._calib_dialog
+    assert [p.line.label for p in d.pairs] == ["Mn Kα", "Mn Kβ"] and d.table.rowCount() == 2
+    d.clear()
+    assert d.calibration == EnergyCalibration() and d.pairs == [] and d.table.rowCount() == 0
+    assert EDSSettings.load(w.settings.path).calibration_points == []
     assert EDSSettings.load(w.settings.path).energy_calibration == cal  # persisted
     d.close()
 
@@ -144,6 +179,36 @@ def test_live_panel_composition_and_beam_sync(qtbot, eds):
     w.b_kv_sync.click()
     assert w.c_kv.value() == 15.0 and w.ctrl.beam_kv == 15.0
     w.c_kv.setValue(20.0)
+
+    # during an acquisition the live panel shows the delta between read-outs, not the running total
+    import re
+    w.sp_autoid.setChecked(False)
+    w.sp_time.setValue(2.0)
+    w.site_list.setCurrentRow(-1)
+    w.b_acquire.click()
+    qtbot.waitUntil(lambda: w._job is not None and w._live_prev is not None
+                    and w._live_prev.real_time > 1.0, timeout=10000)
+    dt = float(re.search(r"Δ ([0-9.]+) s", w.l_live_t.text()).group(1))
+    assert 0.05 < dt < 0.8 and w.l_icr.text() != "ICR –"  # one read-out interval (0.25 s), not > 1 s
+    qtbot.waitUntil(lambda: not w.ctrl.busy and w._job is None and w._analysis is None, timeout=30000)
+    assert w._live_prev is None
+    w.sp_autoid.setChecked(True)
+    # maps: the pixels finished since the last update, summed
+    from easyebl.eds.spectrum import SpectrumMap
+    sm = SpectrumMap.empty(4, 3, 64, w.ctrl.energy_calibration, (0, 0, 10, 10), 0.05)
+    sm.cube[0, :2, 10] = 100
+    sm.real_time[0, :2], sm.live_time[0, :2], sm.fast_count[0, :2] = 0.05, 0.04, 150
+    sm.done[0, :2] = True
+    w._live_px_t = 0.0
+    w._live_from_map(sm)
+    assert w.l_live_t.text().startswith("Δ 0.10 s") and "200 cts" in w.l_live_t.text()
+    assert w.l_icr.text() == "ICR 3.00 kcps" and w.l_ocr.text() == "OCR 2.00 kcps"
+    sm.cube[0, 2, 11] = 7
+    sm.real_time[0, 2], sm.done[0, 2] = 0.05, True
+    w._live_px_t = 0.0
+    w._live_from_map(sm)
+    assert "7 cts" in w.l_live_t.text()  # only the new pixel
+    w._live_px = None
 
     # AutoID only adds to the user's selection, and the selection survives new spectra
     w.set_elements(["Zr", "Mo"])

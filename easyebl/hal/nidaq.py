@@ -230,6 +230,25 @@ class NIDAQBackend(DAQBackend):
             self._write_xy_static(x_v, y_v)
             self._write_blank_static(False)
 
+    def read_ai(self, channels, samples: int, rate: float, ai_range_v: float | None = None) -> np.ndarray:
+        """Finite, hardware-timed AI-only acquisition (no AO / DO task is touched)."""
+        from nidaqmx.constants import AcquisitionType, TerminalConfiguration
+
+        cfg = self.config
+        lim = cfg.ai_range_v if ai_range_v is None else float(ai_range_v)
+        term = getattr(TerminalConfiguration, cfg.ai_terminal, TerminalConfiguration.DIFF)
+        n = int(samples)
+        with self._nidaqmx.Task() as t:
+            for ch in channels:
+                t.ai_channels.add_ai_voltage_chan(self._phys(cfg.ai_channels[ch]), terminal_config=term,
+                                                  min_val=-lim, max_val=lim)
+            if n > 1:
+                t.timing.cfg_samp_clk_timing(float(rate), sample_mode=AcquisitionType.FINITE, samps_per_chan=n)
+                data = t.read(number_of_samples_per_channel=n, timeout=max(2.0, 2.0 * n / float(rate) + 1.0))
+            else:
+                data = t.read(timeout=2.0)
+        return np.asarray(data, dtype=float).reshape(len(channels), n)
+
     def _write_aux(self, physical: str, volts: float) -> None:
         lim = self.config.ao_limit_v
         with self._nidaqmx.Task() as t:

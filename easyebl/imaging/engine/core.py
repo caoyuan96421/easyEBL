@@ -88,12 +88,18 @@ def _boost_thread_priority() -> None:
         pass
 
 
+def _explicit_geometry(changes: dict) -> bool:
+    """The caller set the scan size or position (``height_um=None`` only follows the aspect ratio)."""
+    return "width_um" in changes or "center_um" in changes or changes.get("height_um") is not None
+
+
 def default_scan_config(calibration: FieldCalibration, rate: float, channels=("video",)) -> RasterConfig:
-    """640×480 at 80 % of the field (room for beam shift), Fast 1."""
+    """640×480 over the whole field (±full-scale volts), Fast 1.  The engine narrows it to the widest
+    scan that fits (the line start / flyback overshoot the edges).  Zoom in for room to beam-shift."""
     return RasterConfig(
         nx=640,
         ny=480,
-        width_um=0.8 * calibration.field_size_um,
+        width_um=calibration.field_size_um,
         rate=rate,
         dwell_s=1e-6,
         preline_s=20e-6,
@@ -189,7 +195,11 @@ class ImagingEngine:
         self._cv = threading.Condition(self._lock)
         chans = tuple(self.daq_config.ai_channels)[:1]
         rate = self._resolve_rate(opts, len(chans))
-        cfg = config or default_scan_config(self._cal, rate, chans)
+        if config is None:  # the widest scan that fits (preline / flyback overshoot the edges a little)
+            cfg = default_scan_config(self._cal, rate, chans)
+            cfg = cfg.with_(width_um=self._fit_width(cfg, cfg.width_um))
+        else:
+            cfg = config
         self._cfg = self._normalize(cfg.with_(rate=rate), self._cal)
         self._gen = 1
         self._t_change: float | None = None
@@ -435,7 +445,14 @@ class ImagingEngine:
         changes.pop("frames", None)
         with self._lock:
             self._check_open()
-            new = self._normalize(self._cfg.with_(**changes), self._cal)
+            cand = self._cfg.with_(**changes)
+            try:
+                new = self._normalize(cand, self._cal)
+            except OutOfFieldError:
+                if _explicit_geometry(changes):
+                    raise  # an explicit geometry that does not fit
+                # e.g. fewer / larger pixels overshoot the edges further: narrow the scan to fit
+                new = self._normalize(cand.with_(width_um=self._fit_width(cand, cand.width_um)), self._cal)
             if new == self._cfg:
                 return new
             if tuple(new.ai_channels) != tuple(self._cfg.ai_channels):
@@ -459,17 +476,20 @@ class ImagingEngine:
 
     def set_scan_width(self, width_um: float) -> RasterConfig:
         """Scan field width (µm); clamped so the scan fits the deflection field."""
-        cfg = self.config
+        return self.update(width_um=self._fit_width(self.config, width_um))
+
+    def _fit_width(self, cfg: RasterConfig, width_um: float) -> float:
+        """*width_um*, or the largest width below it at which *cfg* fits the field."""
         lo, hi = 1e-6 * self.calibration.field_size_um, float(width_um)
         if self._fits(cfg.with_(width_um=hi)):
-            return self.update(width_um=hi)
+            return hi
         for _ in range(40):
             mid = 0.5 * (lo + hi)
             if self._fits(cfg.with_(width_um=mid)):
                 lo = mid
             else:
                 hi = mid
-        return self.update(width_um=lo)
+        return lo
 
     def _fits(self, cfg: RasterConfig) -> bool:
         try:
@@ -613,7 +633,13 @@ class ImagingEngine:
         with self._lock:
             self._check_open()
             base = config.with_(rate=self._cfg.rate) if config is not None else self._cfg
-            cfg = self._normalize(base.with_(**changes), self._cal)
+            cand = base.with_(**changes)
+            try:
+                cfg = self._normalize(cand, self._cal)
+            except OutOfFieldError:
+                if config is not None or _explicit_geometry(changes):
+                    raise  # an explicit geometry that does not fit
+                cfg = self._normalize(cand.with_(width_um=self._fit_width(cand, cand.width_um)), self._cal)
             old = self._capture
             req = CaptureRequest(cfg, frames, next(self._cap_ids), fut, time.perf_counter())
             self._capture = req

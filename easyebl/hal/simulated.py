@@ -343,6 +343,27 @@ class SimulatedBackend(DAQBackend):
             self.static_xyb = (float(x_v), float(y_v), bool(blank))
             self._beam = self.volts_to_true_um(np.array([[x_v, y_v]]))[0]
 
+    def read_ai(self, channels, samples: int, rate: float, ai_range_v: float | None = None) -> np.ndarray:
+        """The video signal with the beam held at its static position (blanked: no signal)."""
+        self._require_present("read_ai")
+        p = self.params
+        n = int(samples)
+        with self._lock:
+            x, y, blank = self.static_xyb
+            pos = self.volts_to_true_um(np.array([[x, y]]))[0]
+        sig = 0.0 if blank else float(self.sample.intensity(np.array([pos[0]]), np.array([pos[1]]))[0]) * p.video_gain_v
+        out = np.empty((len(channels), n))
+        for i, ch in enumerate(channels):
+            if ch not in self.config.ai_channels:
+                raise KeyError(ch)
+            s = sig if i == 0 else (p.video_gain_v * 0.5 - 0.5 * sig)
+            out[i] = s + p.video_offset_v + self._rng.normal(0.0, p.noise_sigma, n)
+        out = out + self._float_offset(n, rate)[None, :]
+        if self.params.realtime:
+            time.sleep(n / float(rate))
+        lim = self.config.ai_range_v if ai_range_v is None else ai_range_v
+        return np.clip(out, -lim, lim)
+
     def set_static_line(self, name: str, value: bool) -> None:
         self._require_present("set_static_line")
         if name not in self.config.static_lines:

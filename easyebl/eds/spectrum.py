@@ -14,16 +14,19 @@ import json
 
 import numpy as np
 
-__all__ = ["EnergyCalibration", "Spectrum", "SpectrumMap", "ElectronImage", "load_spectrum", "load_map"]
+__all__ = ["EnergyCalibration", "DEFAULT_GAIN_KEV", "Spectrum", "SpectrumMap", "ElectronImage", "load_spectrum", "load_map"]
+
+
+#: The calibration "Clear" resets to: no offset, 10 eV per channel.
+DEFAULT_GAIN_KEV = 0.010
 
 
 @dataclass(frozen=True)
 class EnergyCalibration:
-    """Channel → energy: ``E(k) = offset + gain·k + quad·k²`` (keV) at the *centre* of channel k."""
+    """Linear channel → energy: ``E(k) = offset + gain·k`` (keV) at the *centre* of channel k."""
 
     offset_kev: float = 0.0
-    gain_kev: float = 0.01
-    quad_kev: float = 0.0
+    gain_kev: float = DEFAULT_GAIN_KEV
     name: str = ""
 
     def __post_init__(self):
@@ -31,34 +34,43 @@ class EnergyCalibration:
             raise ValueError("gain must be positive (keV per channel)")
 
     def energy(self, channel):
-        k = np.asarray(channel, dtype=float)
-        e = self.offset_kev + self.gain_kev * k + self.quad_kev * k * k
+        e = self.offset_kev + self.gain_kev * np.asarray(channel, dtype=float)
         return float(e) if np.ndim(e) == 0 else e
 
     def channel(self, energy_kev):
         """Fractional channel (centre = integer) of *energy_kev*."""
-        e = np.asarray(energy_kev, dtype=float)
-        if self.quad_kev == 0:
-            k = (e - self.offset_kev) / self.gain_kev
-        else:
-            a, b, c = self.quad_kev, self.gain_kev, self.offset_kev - e
-            k = (-b + np.sqrt(np.maximum(b * b - 4 * a * c, 0.0))) / (2 * a)
+        k = (np.asarray(energy_kev, dtype=float) - self.offset_kev) / self.gain_kev
         return float(k) if np.ndim(k) == 0 else k
 
     def energies(self, n: int) -> np.ndarray:
         return self.energy(np.arange(n))
 
     def channel_width(self, channel=0.0):
-        return self.gain_kev + 2 * self.quad_kev * np.asarray(channel, dtype=float)
+        return self.gain_kev + 0.0 * np.asarray(channel, dtype=float)
+
+    @classmethod
+    def fit(cls, channels, energies_kev, offset_kev: float = 0.0) -> "EnergyCalibration":
+        """Least-squares line through (channel, energy) pairs.  With one pair only the gain is
+        fitted (the line goes through *offset_kev* at channel 0)."""
+        ch = np.asarray(channels, dtype=float)
+        en = np.asarray(energies_kev, dtype=float)
+        if ch.size == 0 or ch.size != en.size:
+            raise ValueError("give one energy per channel")
+        if ch.size == 1:
+            if ch[0] <= 0:
+                raise ValueError("a single calibration point must be at a positive channel")
+            return cls(float(offset_kev), float((en[0] - offset_kev) / ch[0]))
+        if np.ptp(ch) <= 0:
+            raise ValueError("the calibration points must be at different channels")
+        gain, offset = np.polyfit(ch, en, 1)
+        return cls(float(offset), float(gain))
 
     def to_dict(self) -> dict:
-        return {"offset_kev": self.offset_kev, "gain_kev": self.gain_kev, "quad_kev": self.quad_kev,
-                "name": self.name}
+        return {"offset_kev": self.offset_kev, "gain_kev": self.gain_kev, "name": self.name}
 
     @classmethod
     def from_dict(cls, d: dict) -> "EnergyCalibration":
-        return cls(float(d.get("offset_kev", 0.0)), float(d.get("gain_kev", 0.01)), float(d.get("quad_kev", 0.0)),
-                   str(d.get("name", "")))
+        return cls(float(d.get("offset_kev", 0.0)), float(d.get("gain_kev", DEFAULT_GAIN_KEV)), str(d.get("name", "")))
 
 
 def _now() -> str:
@@ -147,7 +159,6 @@ class Spectrum:
             ("ELEVANGLE-dg", f"{self.takeoff_deg:g}"),
             ("LIVETIME  -s", f"{self.live_time:.6g}"),
             ("REALTIME  -s", f"{self.real_time:.6g}"),
-            ("#EASYEBL_QUAD", f"{cal.quad_kev:.8g}"),
             ("#EASYEBL_FAST", str(int(self.fast_count))),
             ("#EASYEBL_SLOW", str(int(self.slow_count))),
             ("#EASYEBL_META", json.dumps(_jsonable(self.metadata))),
@@ -220,8 +231,7 @@ class Spectrum:
 
         xunits = hdr.get("XUNITS", "keV").lower()
         scale = 1e-3 if xunits.startswith("ev") else 1.0
-        cal = EnergyCalibration(num("OFFSET") * scale, num("XPERCHAN", default=0.01) * scale,
-                                num("EASYEBL_QUAD"))
+        cal = EnergyCalibration(num("OFFSET") * scale, num("XPERCHAN", default=DEFAULT_GAIN_KEV) * scale)
         meta = {}
         if "EASYEBL_META" in hdr:
             try:

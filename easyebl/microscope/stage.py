@@ -18,6 +18,11 @@ T 3528 /°).
   SEM transaction holds the port) and queued moves are cancelled.
 * ``#STAGE ON`` (the SEM relays stage lines only then) is sent automatically
   before the first stage request.
+* **Hand control** (the default) – the SEM PC drives the stage (its trackball works
+  only with ``#STAGE OFF``; it decides about motor power).  Positions can still be
+  read: each read switches ``#STAGE ON`` for that request only and ``#STAGE OFF``
+  again.  Moves are refused until :meth:`StageControl.engage` (``#STAGE ON``);
+  :meth:`StageControl.release` stops the stage and hands it back.
 
 Coordinates are unsigned until the instrument's encoding of negative values is
 confirmed (driver ``CoordinateCodec``) – a target below 0 is refused.
@@ -73,7 +78,8 @@ class StageControl:
 
     MIN_POLL_S = MIN_POLL_S
 
-    def __init__(self, link: MicroscopeLink, poll_s: float = 30.0, polling: bool = True, move_timeout_s: float = 600.0):
+    def __init__(self, link: MicroscopeLink, poll_s: float = 30.0, polling: bool = True, move_timeout_s: float = 600.0,
+                 hand_control: bool = True):
         self.link = link
         link.stage = self
         self.move_timeout_s = float(move_timeout_s)
@@ -82,6 +88,7 @@ class StageControl:
         self.t_read: dict = {a: None for a in AXES}
         self._lock = threading.RLock()
         self._stage_on = False
+        self._hand = bool(hand_control)  # the SEM PC has the stage (see release())
         self._moves: list = []  # futures of queued / running moves (cancelled by stop)
         self._stop_gen = 0  # incremented by every stop(): a move being sent at that moment is halted too
         self._poll_s = max(self.MIN_POLL_S, float(poll_s))
@@ -155,14 +162,61 @@ class StageControl:
             self._stage_on = True
 
     def _stage_call(self, session, fn):
-        """Run a stage request; if the SEM is not relaying (``#STAGE`` off), switch it on once."""
+        """Run a stage request; if the SEM is not relaying (``#STAGE`` off), switch it on once.
+        Under hand control ``#STAGE OFF`` follows the request (the trackball works again)."""
+        hand = self._hand  # as the request started (release() switches off itself)
         self._ensure_on(session)
         try:
-            return fn()
-        except StageRejectedBySem:
+            try:
+                return fn()
+            except StageRejectedBySem:
+                self._stage_on = False
+                self._ensure_on(session)
+                return fn()
+        finally:
+            if hand:
+                self._stage_off(session)
+
+    def _stage_off(self, session) -> None:
+        session.sem.stage_control(False)
+        self._stage_on = False
+
+    # ------------------------------------------------------------------ hand control
+    @property
+    def hand_control(self) -> bool:
+        """True while the SEM PC has the stage (``#STAGE OFF``): moves are refused."""
+        return self._hand
+
+    def release(self) -> concurrent.futures.Future:
+        """Hand the stage back to the SEM PC: stop, then ``#STAGE OFF`` (the trackball works)."""
+        moving = self.moving
+        halt = self.stop() if moving or self._moves else None  # goes out at once
+        self._hand = True
+
+        def run(session):
+            if halt is not None:
+                try:
+                    halt.result(15)  # every S0 sent before #STAGE OFF
+                except Exception:  # noqa: BLE001 - reported by stop()
+                    pass
+                session.stage.wait_for_motion(list(AXES), timeout=10)
+            self._stage_off(session)
+            self.link.events.emit("stage", "stage handed to the SEM PC (#STAGE OFF)", hand=True)
+            return True
+
+        return self.link.submit(run, STAGE_CMD, "stage release (hand control)")
+
+    def engage(self) -> concurrent.futures.Future:
+        """Back to remote control: ``#STAGE ON``; the next move drives the motors again."""
+
+        def run(session):
+            self._hand = False
             self._stage_on = False
             self._ensure_on(session)
-            return fn()
+            self.link.events.emit("stage", "stage under easyEBL control (#STAGE ON)", hand=False)
+            return True
+
+        return self.link.submit(run, STAGE_CMD, "stage engage (remote control)")
 
     def _read_controller(self, session, u: int) -> dict:
         st = session.stage
@@ -208,10 +262,14 @@ class StageControl:
             raise ValueError("no targets")
         if relative and all(v == 0 for v in tg.values()):
             raise ValueError("relative move of zero")
+        if self._hand:
+            raise RuntimeError("the stage is under hand control (SEM PC): engage() it first")
         outer: concurrent.futures.Future = concurrent.futures.Future()
         desc = ", ".join(f"{a} {'+' if relative and v >= 0 else ''}{v:g} {axis_unit(a)}" for a, v in tg.items())
 
         def start(session):
+            if self._hand:
+                raise RuntimeError("the stage was released for hand control")
             gen = self._stop_gen
             st = session.stage
             pulses = {}
@@ -293,6 +351,9 @@ class StageControl:
         def run():
             try:
                 st = self.link.session.stage
+                if self._hand and not self._stage_on:  # the SEM PC has the stage: S0 would be refused
+                    out.set_result(False)
+                    return
                 if axis is None:
                     problems = st.halt_all()
                     if problems:

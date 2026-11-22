@@ -71,6 +71,15 @@ class TestFieldCalibration:
         v = FieldCalibration(80.0, 5.0, invert_y=True).um_to_volts([[0, 10]])
         assert v[0, 1] < 0
 
+    def test_swap_xy(self):
+        cal = FieldCalibration(100.0, 10.0, swap_xy=True)
+        np.testing.assert_allclose(cal.um_to_volts([[10, -20]]), [[-4, 2]])  # X out = field Y, Y out = field X
+        # the inversions refer to the outputs (after the swap)
+        cal = FieldCalibration(100.0, 10.0, swap_xy=True, invert_x=True)
+        np.testing.assert_allclose(cal.um_to_volts([[10, -20]]), [[4, 2]])
+        p = np.random.default_rng(2).uniform(-40, 40, (10, 2))
+        np.testing.assert_allclose(cal.volts_to_um(cal.um_to_volts(p)), p, atol=1e-10)
+
     def test_out_of_field(self):
         cal = FieldCalibration(100.0, 10.0)
         with pytest.raises(OutOfFieldError):
@@ -86,9 +95,10 @@ class TestFieldCalibration:
         np.testing.assert_allclose(c2.um_to_volts([[0, 0]]), [[0.2, 0]])
 
     def test_json_and_validation(self):
-        cal = FieldCalibration(123.0, 7.0, AffineTransform.from_params(1, 2, 0.1), invert_x=True, name="x")
+        cal = FieldCalibration(123.0, 7.0, AffineTransform.from_params(1, 2, 0.1), invert_x=True, name="x",
+                               swap_xy=True)
         c2 = FieldCalibration.from_json(cal.to_json())
-        assert c2.field_size_um == 123.0 and c2.invert_x and c2.correction == cal.correction
+        assert c2.field_size_um == 123.0 and c2.invert_x and c2.swap_xy and c2.correction == cal.correction
         with pytest.raises(ValueError):
             FieldCalibration(0.0)
         with pytest.raises(ValueError):

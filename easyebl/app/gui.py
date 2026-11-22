@@ -182,6 +182,19 @@ class HardwareDialog(QtWidgets.QDialog):
         f.addRow("Sample clock", self.daq_rate)
         f.addRow("Buffer latency", self.daq_latency)
         f.addRow("Video input", self.daq_ai)
+        self.daq_inv_x = QtWidgets.QCheckBox("Invert X")
+        self.daq_inv_y = QtWidgets.QCheckBox("Invert Y")
+        self.daq_swap = QtWidgets.QCheckBox("Swap X / Y")
+        self.daq_inv_x.setChecked(bool(d.invert_x))
+        self.daq_inv_y.setChecked(bool(d.invert_y))
+        self.daq_swap.setChecked(bool(d.swap_xy))
+        self.daq_swap.setToolTip("image X drives the Y deflection and image Y the X deflection\n"
+                                 "(the inversions refer to the outputs, after the swap)")
+        row2 = QtWidgets.QHBoxLayout()
+        for cb in (self.daq_inv_x, self.daq_inv_y, self.daq_swap):
+            row2.addWidget(cb)
+        row2.addStretch(1)
+        f.addRow("Scan orientation", row2)
         lay.addWidget(g)
         self._daq_hw = (self.daq_device,)
 
@@ -282,7 +295,8 @@ class HardwareDialog(QtWidgets.QDialog):
                       preset=self.daq_preset.currentData(), config_file=self.daq_file.text().strip(),
                       field_um=float(self.daq_field.value()),
                       rate=(self.daq_rate.value() * 1e3) or None, latency_ms=float(self.daq_latency.value()),
-                      ai_terminal=self.daq_ai.currentData())
+                      ai_terminal=self.daq_ai.currentData(), invert_x=self.daq_inv_x.isChecked(),
+                      invert_y=self.daq_inv_y.isChecked(), swap_xy=self.daq_swap.isChecked())
         eds = replace(b.eds, mca=self.eds_mca.currentData(), external_control=self.eds_external.isChecked())
         mic = replace(b.microscope, port=self.port(), baudrate=int(self.mic_baud.currentData()))
         out = SystemConfig(daq, eds, mic)

@@ -424,3 +424,17 @@ def test_ai_terminal_mode_reaches_the_driver(fake):
     with pytest.raises(HALError):
         h.set_ai_terminal("single")
     mgr.close()
+
+
+def test_static_ai_read_touches_no_output(fake):
+    m, be = make(fake)
+    h = m.get_handle("x")
+    fake.static_ai_v = 0.25
+    n_out = len(fake.static_ao) + len(fake.static_do)
+    v = h.read_ai_mean("video", samples=500, rate=50e3)
+    assert v["video"] == pytest.approx(0.25, abs=1e-3)
+    kind, (n_ai, n, timing) = [e for e in fake.log if e[0] == "static_ai"][-1]
+    assert n_ai == 1 and n == 500 and timing is not None  # finite, hardware-timed AI only
+    assert len(fake.static_ao) + len(fake.static_do) == n_out and not fake.ao_running
+    assert h.read_ai("video", samples=1).shape == (1, 1)  # one on-demand sample
+    m.close()

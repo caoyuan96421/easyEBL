@@ -39,7 +39,10 @@ class FieldCalibration:
         where measured scale/rotation/offset errors (from the calibration grid
         or from marker alignment) live.
     invert_x / invert_y:
-        Flip an axis if the SEM's input polarity is reversed.
+        Flip an output (the X / Y deflection voltage) if the SEM's input polarity is reversed.
+    swap_xy:
+        Exchange the outputs: field X drives the Y deflection and field Y the X deflection
+        (applied before the inversions, which always refer to the X / Y outputs).
     name:
         Free-form label (e.g. ``"x1000 @ 15 kV, WD 10"``).
     """
@@ -50,6 +53,7 @@ class FieldCalibration:
     invert_x: bool = False
     invert_y: bool = False
     name: str = ""
+    swap_xy: bool = False
 
     def __post_init__(self):
         if self.field_size_um <= 0:
@@ -72,7 +76,10 @@ class FieldCalibration:
 
     def _nominal(self) -> AffineTransform:
         k = self.volts_per_um
-        return AffineTransform.scaling(-k if self.invert_x else k, -k if self.invert_y else k)
+        sx, sy = (-k if self.invert_x else k), (-k if self.invert_y else k)
+        if self.swap_xy:
+            return AffineTransform(np.array([[0.0, sx, 0.0], [sy, 0.0, 0.0], [0.0, 0.0, 1.0]]))
+        return AffineTransform.scaling(sx, sy)
 
     @property
     def um_to_volts_transform(self) -> AffineTransform:
@@ -117,6 +124,7 @@ class FieldCalibration:
             "correction": self.correction.to_list(),
             "invert_x": self.invert_x,
             "invert_y": self.invert_y,
+            "swap_xy": self.swap_xy,
             "name": self.name,
         }
 

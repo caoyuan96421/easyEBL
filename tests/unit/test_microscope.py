@@ -16,7 +16,7 @@ from easyebl.microscope.s3000 import MotionError
 def mic():
     link = MicroscopeLink.simulated(command_delay_s=0.01)
     sem = SEMControl(link, status_poll_s=0)
-    stage = StageControl(link, polling=False)
+    stage = StageControl(link, polling=False, hand_control=False)
     sem.refresh().result(10)
     stage.refresh().result(10)
     yield link, sem, stage
@@ -126,6 +126,43 @@ def test_stage_moves_relative_and_absolute(mic):
         stage.move({"X": 0.0}, relative=True)
     with pytest.raises(ValueError, match="below the stage zero"):
         stage.move({"X": -1e9}, relative=True).result(30)
+
+
+def test_hand_control_release_and_engage(mic):
+    link, sem, stage = mic
+    sim = link.session.simulator
+    m = stage.move({"X": 20000.0}, relative=True)  # still running when released
+    t0 = time.monotonic()
+    while not stage.moving and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    stage.release().result(15)
+    with pytest.raises((MotionError, concurrent.futures.CancelledError)):
+        m.result(15)
+    assert stage.hand_control and not stage.moving and sim.sem["STAGE"] == "OFF"
+    assert not any("S2" in line for line in sim.received)  # the SEM PC decides about motor power
+    # positions are still read; #STAGE OFF follows each read (the trackball keeps working)
+    sim.axes[(0, 0)].position += 2560  # moved with the trackball: +100 µm
+    x = stage.positions["X"]
+    stage.refresh(["X"]).result(15)
+    assert stage.positions["X"] == pytest.approx(x + 100.0, abs=0.05) and sim.sem["STAGE"] == "OFF"
+    with pytest.raises(RuntimeError, match="hand control"):
+        stage.move({"X": 10.0}, relative=True)
+    stage.engage().result(10)
+    assert not stage.hand_control and sim.sem["STAGE"] == "ON"
+    stage.move({"X": 10.0}, relative=True).result(30)
+
+
+def test_stage_starts_under_hand_control():
+    link = MicroscopeLink.simulated(command_delay_s=0.01)
+    try:
+        stage = StageControl(link, polling=False)
+        assert stage.hand_control
+        stage.refresh().result(10)
+        assert link.session.simulator.sem["STAGE"] == "OFF" and stage.positions["X"] is not None
+        with pytest.raises(RuntimeError):
+            stage.move({"X": 1.0}, relative=True)
+    finally:
+        link.close()
 
 
 @pytest.mark.parametrize("delay", [0.0, 0.03, 0.4])

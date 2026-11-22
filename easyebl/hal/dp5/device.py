@@ -109,7 +109,7 @@ class DP5:
         self.last_preset_skipped: list[str] = []
         self.last_write_skipped: list[str] = []
         self.speed_overrides: dict = {}          # on top of every apply_speed(): {"TPFA": 800} or {1: {"TPFA": 100}}
-        self.auto_thresholds: dict[int, dict] = {}  # speed -> {"THFA", "THSL"} from auto_threshold()
+        self.auto_thresholds: dict[int, dict] = {}  # speed -> {"THFA"} from auto_threshold()
         self._speed: int | None = None
 
     # ===================================================================================
@@ -490,9 +490,9 @@ class DP5:
                     clear: bool = True, verify: bool = True) -> dict:
         """Apply SDD speed preset 1 (fastest) .. 5 (best resolution).
 
-        Only pulse-processing settings are written (TPEA, TFLA, TPFA, thresholds THSL/THFA,
-        BLR, PUR, RTD, clock); gain, polarity, input offset, reset lockout and channel count are
-        kept, so peaks stay put. ``speed`` may also be an old name ("fast"=1, "default"=3,
+        Only pulse-processing settings are written (TPEA, TFLA, TPFA, fast threshold THFA,
+        BLR, PUR, RTD, clock); gain, polarity, input offset, reset lockout, slow threshold (THSL –
+        set from the EDS minimum energy) and channel count are kept, so peaks stay put. ``speed`` may also be an old name ("fast"=1, "default"=3,
         "high_resolution"=5).
 
         overrides  extra settings on top for this call, e.g. {"THFA": 25}.
@@ -746,13 +746,15 @@ class DP5:
             return None
 
     def auto_threshold(self, speeds="current", max_noise_cps: float = 50.0, slow_start: float | None = None,
-                       slow_step: float = 0.25, slow_limit: float = 10.0, seconds: float = 0.5) -> dict:
-        """Set the fast and slow thresholds from the noise - run with the BEAM OFF (no X-rays).
+                       slow_step: float = 0.25, slow_limit: float = 10.0, seconds: float = 0.5,
+                       slow: bool = False) -> dict:
+        """Set the fast threshold from the noise - run with the BEAM OFF (no X-rays).
 
-        For each speed: (1) the DP5's own fast-threshold autoset (THFA, written back so it
-        sticks), then (2) THSL is raised from ``slow_start`` (default: the preset's THSL) in
-        ``slow_step`` % steps until noise alone triggers < ``max_noise_cps`` on the slow
-        channel (each step measured for ``seconds``). The DP5 has no slow-threshold autoset.
+        For each speed: the DP5's own fast-threshold autoset (THFA, written back so it sticks).
+        Only with ``slow=True`` (easyEBL never does: THSL follows the EDS minimum energy) THSL
+        is also raised from ``slow_start`` (default: the present THSL) in ``slow_step`` % steps
+        until noise alone triggers < ``max_noise_cps`` on the slow channel (each step measured
+        for ``seconds``); the DP5 has no slow-threshold autoset.  Otherwise THSL is not touched.
 
         speeds   "current" (the speed in use, or just the present settings if no speed was
                  applied), "all" (1-5), or a list. Afterwards the original shaping is put back:
@@ -761,7 +763,7 @@ class DP5:
         Results are remembered in ``self.auto_thresholds[speed]`` and re-applied by every later
         ``apply_speed()`` / ``auto_speed()``; ``clear_auto_thresholds()`` forgets them.
         A running acquisition is paused and restarted (cleared) afterwards.
-        Returns {speed or None: {"THFA": float, "THSL": float, "noise_cps": float}}.
+        Returns {speed or None: {"THFA": float, "noise_cps": float} (+ "THSL" with slow=True)}.
         """
         from .presets import SHAPING_KEYS, SPEEDS, resolve
         cur = self.current_speed()
@@ -781,22 +783,26 @@ class DP5:
                 if n is not None and (n != cur or len(todo) > 1):
                     self.apply_speed(n, clear=False, verify=False)
                 thfa = self.autoset_fast_threshold()
-                th = float(self.get("THSL")) if slow_start is None else float(slow_start)
-                while True:
-                    self.set("THSL", f"{th:.3f}")
-                    r = self.measure_dead_time(seconds)
-                    log.info("speed %s THSL %.3f %%: noise %.0f cps", n, th, r["ocr"])
-                    if r["ocr"] < max_noise_cps or th + slow_step > slow_limit + 1e-9:
-                        break
-                    th += slow_step
-                if r["ocr"] >= max_noise_cps:
-                    log.warning("speed %s: THSL reached %.2f %% with %.0f cps of noise still counted",
-                                n, th, r["ocr"])
-                res = {"THFA": thfa if thfa is not None else float(self.get("THFA")), "THSL": round(th, 3),
-                       "noise_cps": r["ocr"]}
+                res = {"THFA": thfa if thfa is not None else float(self.get("THFA"))}
+                if slow:
+                    th = float(self.get("THSL")) if slow_start is None else float(slow_start)
+                    while True:
+                        self.set("THSL", f"{th:.3f}")
+                        r = self.measure_dead_time(seconds)
+                        log.info("speed %s THSL %.3f %%: noise %.0f cps", n, th, r["ocr"])
+                        if r["ocr"] < max_noise_cps or th + slow_step > slow_limit + 1e-9:
+                            break
+                        th += slow_step
+                    if r["ocr"] >= max_noise_cps:
+                        log.warning("speed %s: THSL reached %.2f %% with %.0f cps of noise still counted",
+                                    n, th, r["ocr"])
+                    res["THSL"] = round(th, 3)
+                else:
+                    r = self.measure_dead_time(seconds)  # the noise left at the present THSL
+                res["noise_cps"] = r["ocr"]
                 out[n] = res
                 if n is not None:
-                    self.auto_thresholds[n] = {"THFA": f"{res['THFA']:.2f}", "THSL": f"{th:.3f}"}
+                    self.auto_thresholds[n] = {"THFA": f"{res['THFA']:.2f}"}
             if cur is not None and todo[-1] != cur:
                 self.apply_speed(cur, clear=False, verify=False)
             elif cur is None and todo != [None]:

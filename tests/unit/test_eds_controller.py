@@ -29,7 +29,20 @@ def rig():
 
 def test_point_spectrum_presets(rig):
     mgr, dpp, ctrl = rig
-    sp = ctrl.acquire_spectrum(0.3, at_um=(10.0, -10.0)).result(30)
+    job = ctrl.acquire_spectrum(0.3, at_um=(10.0, -10.0))
+    # while counting, the beam is held statically at the point: no stream runs
+    seen = []
+    while not job.done():
+        st = mgr.beam_state
+        if not st.blank:
+            seen.append((mgr.is_busy, round(st.x_v, 6), round(st.y_v, 6)))
+        time.sleep(0.01)
+    sp = job.result(30)
+    v = ctrl.calibration.um_to_volts([[10.0, -10.0]])[0]
+    # only the brief static writes / ADC read lock the device – never a stream for the count
+    assert seen and sum(busy for busy, *_ in seen) <= 3 and len(seen) > 10
+    assert seen[-1][1:] == (round(v[0], 6), round(v[1], 6))
+    assert mgr.beam_state.blank  # blanked again afterwards
     assert sp.real_time == pytest.approx(0.3, abs=5e-3) and sp.total > 0
     assert np.isfinite(sp.metadata["se_v"])
     # live-time preset

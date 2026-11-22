@@ -206,7 +206,7 @@ class EDSController:
         self.mca = mca
         self.daq_config = self.handle.config
         self._cal = calibration or FieldCalibration(100.0, self.daq_config.ao_limit_v)
-        self._ecal = energy_calibration or EnergyCalibration(0.0, 0.01)
+        self._ecal = energy_calibration or EnergyCalibration()
         self.beam_kv = float(beam_kv)
         self.takeoff_deg = float(takeoff_deg)
         self.options = options or EDSOptions()
@@ -471,6 +471,16 @@ class EDSController:
             if self._idle_armed:
                 self._idle_step()
                 t_read = time.monotonic() + self._idle_interval
+        # stopped (abort / stop / close): a step that ran while abort() switched the MCA off
+        # may have armed it again – leave it off
+        if self._mca_lock.acquire(timeout=5.0):
+            try:
+                if self._idle_armed and not self.busy:
+                    self._idle_armed = False
+                    with contextlib.suppress(Exception):
+                        self.mca.disable()
+            finally:
+                self._mca_lock.release()
 
     def _idle_step(self) -> None:
         if self.busy or self._idle_pause or not self.mca.is_open:
@@ -478,7 +488,7 @@ class EDSController:
         if not self._mca_lock.acquire(blocking=False):
             return
         try:
-            if self.busy or self._idle_pause:
+            if self.busy or self._idle_pause or self._idle_stop.is_set():
                 return
             with self.mca.session(self.handle.owner):
                 if not self._idle_armed:
@@ -567,16 +577,38 @@ class EDSController:
         mca.set_preset_real_time(None if live else t_s)
         if volts is None:
             return self._count(job, t_s, live, title, meta)
-        start = tuple(volts[0]) if volts.ndim == 2 else tuple(volts)
+        if volts.ndim == 1 or len(volts) == 1:
+            return self._job_point(job, t_s, tuple(map(float, np.reshape(volts, -1)[:2])), live, title, meta)
+        start = tuple(volts[0])
         with self._beam(job, title, start_v=start) as beam:
-            if volts.ndim == 2 and len(volts) > 1:
-                t = beam.prog.pattern(volts[:, 0], volts[:, 1])
-                i0 = beam.arrive(t, o.settle_s)
-            else:
-                i0 = beam.goto(volts[0], volts[1], o.settle_s) if volts.ndim == 1 else beam.goto(*volts[0], o.settle_s)
+            t = beam.prog.pattern(volts[:, 0], volts[:, 1])
+            i0 = beam.arrive(t, o.settle_s)
             self.last_beam_v = start
             sp = self._count(job, t_s, live, title, meta, beam=beam, i0=i0)
         return sp
+
+    #: SE signal of a point spectrum: static ADC samples averaged (at 100 kS/s: 10 ms)
+    POINT_SE_SAMPLES = 1000
+
+    def _job_point(self, job: EDSJob, t_s, xy_v, live, title, meta):
+        """Point spectrum without any stream: X / Y are written once and stay there while the
+        DP5 counts; the SE signal is read statically (averaged ADC samples) at the start."""
+        o = self.options
+        h = self.handle
+        with h.exclusive(title, timeout=o.lease_timeout_s, external_control=o.external_control):
+            try:
+                h.park(xy_v[0], xy_v[1], blank=False)  # beam on, held at the point
+                self.last_beam_v = xy_v
+                time.sleep(o.settle_s)
+                if o.video_channel is not None:
+                    try:
+                        se = h.read_ai_mean(o.video_channel, samples=self.POINT_SE_SAMPLES)[o.video_channel]
+                        meta = dict(meta, se_v=se)
+                    except Exception:  # noqa: BLE001 - the SE value is optional
+                        pass
+                return self._count(job, t_s, live, title, meta)
+            finally:
+                h.park()  # blanked, at the park position
 
     def _count(self, job, t_s, live, title, meta, beam=None, i0=None) -> Spectrum:
         mca = self.mca

@@ -53,7 +53,7 @@ class ProcessorDialog(QtWidgets.QDialog):
         self.b_read.clicked.connect(self.read)
         self.b_write = QtWidgets.QPushButton("Write changed")
         self.b_write.clicked.connect(self.write)
-        self.b_thr = QtWidgets.QPushButton("Auto thresholds (beam off!)")
+        self.b_thr = QtWidgets.QPushButton("Auto fast threshold (beam off!)")
         self.b_thr.setVisible(hasattr(mca, "auto_threshold"))
         self.b_thr.clicked.connect(self._auto_thr)
         self.msg = QtWidgets.QLabel()

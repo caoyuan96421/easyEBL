@@ -148,7 +148,7 @@ class DAQConfig:
             device=device,
             ao_x="ao0",
             ao_y="ao1",
-            ao_limit_v=5.0,
+            ao_limit_v=10.0,  # S-3000 X-IN / Y-IN: ±10 V = full deflection
             blank_line="port0/line23",
             blank_active_high=False,
             timed_lines={},

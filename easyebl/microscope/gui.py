@@ -314,23 +314,39 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self.stop_all)
         lay.addWidget(self.b_stop)
 
-        g = QtWidgets.QGroupBox("Position")
-        v = QtWidgets.QVBoxLayout(g)
-        self.pos_table = QtWidgets.QTableWidget(len(AXES), 4)
-        self.pos_table.setHorizontalHeaderLabels(["Axis", "Position", "State", "Read"])
-        self.pos_table.verticalHeader().setVisible(False)
-        self.pos_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.pos_table.setWordWrap(False)
-        self.pos_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        names = {"X": "X", "Y": "Y", "Z": "Z (height)", "R": "R (rotation)", "T": "T (tilt)"}
+        # --- who drives the stage: easyEBL (#STAGE ON) or the SEM PC (#STAGE OFF)
+        self.b_enable = QtWidgets.QPushButton()
+        self.b_enable.setCheckable(True)
+        self.b_enable.setMinimumHeight(44)
+        self.b_enable.setToolTip("Enabled: easyEBL drives the stage (#STAGE ON).\n"
+                                 "Disabled: the SEM PC has it (#STAGE OFF) – its trackball works and it\n"
+                                 "decides about motor power; positions are still read.")
+        self.b_enable.toggled.connect(self._motion_enabled)
+        lay.addWidget(self.b_enable)
+
+        # --- DRO
+        g = QtWidgets.QGroupBox("Position  (double-click an axis to move it)")
+        grid = QtWidgets.QGridLayout(g)
+        self.dro, self.dro_state = {}, {}
         for i, a in enumerate(AXES):
-            self.pos_table.setItem(i, 0, QtWidgets.QTableWidgetItem(names[a]))
-            for c in (1, 2, 3):
-                self.pos_table.setItem(i, c, QtWidgets.QTableWidgetItem("—"))
-            self.pos_table.item(i, 1).setFont(QtGui.QFont("Consolas", 10))
-        self.pos_table.setFixedHeight(self.pos_table.verticalHeader().length() +
-                                      self.pos_table.horizontalHeader().height() + 4)
-        v.addWidget(self.pos_table)
+            big = a != "T"
+            name = QtWidgets.QLabel(a)
+            name.setStyleSheet(f"font-size:{30 if big else 16}px;font-weight:bold;color:#9cf")
+            val = DROLabel("—")
+            val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            val.setFont(QtGui.QFont("Consolas", 30 if big else 15, QtGui.QFont.Bold))
+            val.setStyleSheet("background:#111;color:#7f7;border:1px solid #333;padding:2px 8px")
+            val.setMinimumWidth(300 if big else 200)
+            val.setToolTip(f"double-click: move {a}")
+            val.double_clicked.connect(lambda a=a: self.open_move_dialog(a))
+            state = QtWidgets.QLabel("—")
+            state.setStyleSheet("color:#bbb")
+            grid.addWidget(name, i, 0)
+            grid.addWidget(val, i, 1)
+            grid.addWidget(QtWidgets.QLabel(st.unit(a)), i, 2)
+            grid.addWidget(state, i, 3)
+            self.dro[a], self.dro_state[a] = val, state
+        grid.setColumnStretch(1, 1)
         r = QtWidgets.QHBoxLayout()
         b = QtWidgets.QPushButton("Read now")
         b.clicked.connect(self.refresh_stage)
@@ -345,42 +361,11 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
                                                                               st.set_poll_interval(s_)))
         r.addWidget(self.poll_s)
         r.addStretch(1)
-        v.addLayout(r)
+        self.l_read = QtWidgets.QLabel("")
+        self.l_read.setStyleSheet(_NOTE)
+        r.addWidget(self.l_read)
+        grid.addLayout(r, len(AXES), 0, 1, 4)
         lay.addWidget(g)
-
-        self.cb_enable = QtWidgets.QCheckBox("Enable stage motion")
-        self.cb_enable.setStyleSheet("QCheckBox{font-weight:bold}")
-        self.cb_enable.setToolTip("interlock: moves and jogs work only while this is ticked")
-        self.cb_enable.toggled.connect(self._motion_enabled)
-        lay.addWidget(self.cb_enable)
-
-        # --- move
-        self.g_move = QtWidgets.QGroupBox("Move")
-        f = QtWidgets.QGridLayout(self.g_move)
-        self.rb_rel = QtWidgets.QRadioButton("Relative (by)")
-        self.rb_abs = QtWidgets.QRadioButton("Absolute (to)")
-        self.rb_rel.setChecked(True)
-        self.rb_abs.toggled.connect(self._move_mode)
-        f.addWidget(self.rb_rel, 0, 0, 1, 2)
-        f.addWidget(self.rb_abs, 0, 2, 1, 2)
-        self.mv_check, self.mv_val = {}, {}
-        for i, a in enumerate(AXES):
-            cb = QtWidgets.QCheckBox(a)
-            unit = st.unit(a)
-            sp = _dspin(-1e6, 1e6, 1 if unit == "µm" else 3, 0.0, 10.0 if unit == "µm" else 1.0, f" {unit}")
-            sp.valueChanged.connect(lambda _v, c=cb: c.setChecked(True))
-            self.mv_check[a], self.mv_val[a] = cb, sp
-            f.addWidget(cb, 1 + i, 0)
-            f.addWidget(sp, 1 + i, 1, 1, 2)
-        b = QtWidgets.QPushButton("Fill current")
-        b.setToolTip("absolute mode: fill the fields with the last read positions")
-        b.clicked.connect(self._fill_current)
-        f.addWidget(b, 1, 3)
-        self.b_move = QtWidgets.QPushButton("Move")
-        self.b_move.setStyleSheet("QPushButton{background:#2e7d32;color:white;font-weight:bold;padding:6px}")
-        self.b_move.clicked.connect(self.move_from_panel)
-        f.addWidget(self.b_move, 1 + len(AXES), 0, 1, 4)
-        lay.addWidget(self.g_move)
 
         # --- jog
         self.g_jog = QtWidgets.QGroupBox("Jog")
@@ -392,7 +377,8 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
         def jb(text, axis, sign, tip):
             b = QtWidgets.QToolButton(text=text)
-            b.setFixedSize(40, 32)
+            b.setFixedSize(48, 40)
+            b.setStyleSheet("font-size:16px")
             b.setToolTip(tip)
             b.clicked.connect(lambda _=False: self.jog(axis, sign))
             return b
@@ -497,46 +483,47 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
     # ================================================================ stage actions
     def stop_all(self):
+        if self.stage.hand_control:
+            self.notify("STOP not sent: the SEM PC has the stage (use its controls)")
+            return
         self.stage.stop()
         self.notify("STOP sent to all axes")
 
+    @property
+    def motion_enabled(self) -> bool:
+        return self.b_enable.isChecked()
+
     def _motion_enabled(self, on: bool):
-        self.g_move.setEnabled(on)
+        """Enabled: easyEBL drives the stage (#STAGE ON).  Disabled: stop, then #STAGE OFF –
+        the SEM PC (trackball) has the stage."""
+        self.b_enable.setText("STAGE: easyEBL control  –  click to hand back to the SEM PC" if on else
+                              "STAGE: SEM PC (trackball)  –  click to enable easyEBL control")
+        self.b_enable.setStyleSheet("QPushButton{font-size:15px;font-weight:bold;"
+                                    + ("background:#2e7d32;color:white}" if on else "background:#455a64;color:#ddd}"))
         self.g_jog.setEnabled(on)
+        try:  # a failure is reported through the link's error events (log)
+            self.stage.engage() if on else self.stage.release()
+        except Exception as e:  # noqa: BLE001 - link closed
+            self.notify(f"stage: {e}")
 
-    def _move_mode(self, absolute: bool):
-        if absolute:
-            self._fill_current()
-        else:
-            for sp in self.mv_val.values():
-                sp.blockSignals(True)
-                sp.setValue(0.0)
-                sp.blockSignals(False)
-        for cb in self.mv_check.values():
-            cb.setChecked(False)
-
-    def _fill_current(self):
-        for a, sp in self.mv_val.items():
-            p = self.stage.positions.get(a)
-            if p is not None:
-                sp.blockSignals(True)
-                sp.setValue(p)
-                sp.blockSignals(False)
-
-    def move_from_panel(self):
-        targets = {a: self.mv_val[a].value() for a, cb in self.mv_check.items() if cb.isChecked()}
-        if not targets:
-            self.notify("tick the axes to move")
-            return
-        self.move(targets, relative=self.rb_rel.isChecked())
+    def open_move_dialog(self, axis: str):
+        """Direct move of one axis (double-click on its readout)."""
+        if not self.motion_enabled:
+            self.notify("stage motion is not enabled (the SEM PC has the stage)")
+            return None
+        d = MoveDialog(axis, self.stage.unit(axis), self.stage.positions.get(axis), self)
+        d.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        d.accepted.connect(lambda: self.move({axis: d.value()}, relative=d.relative(), confirm=False))
+        d.open()
+        return d
 
     def jog(self, axis: str, sign: int):
         step = self.jog_um.value() if self.stage.unit(axis) == "µm" else self.jog_deg.value()
         self.move({axis: sign * step}, relative=True, confirm=False)
 
     def move(self, targets: dict, relative: bool, confirm: bool | None = None):
-        if not self.cb_enable.isChecked():
-            self.notify("stage motion is not enabled")
+        if not self.motion_enabled:
+            self.notify("stage motion is not enabled (the SEM PC has the stage)")
             return None
         desc = ", ".join(f"{a} {'by ' if relative else 'to '}{v:+g} {self.stage.unit(a)}" if relative else
                          f"{a} to {v:g} {self.stage.unit(a)}" for a, v in targets.items())
@@ -595,18 +582,16 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         finally:
             self._syncing = False
         st = self.stage
-        for i, a in enumerate(AXES):
+        for a in AXES:
             p = st.positions.get(a)
-            unit = st.unit(a)
-            self.pos_table.item(i, 1).setText("—" if p is None else
-                                              (f"{p:,.1f} µm" if unit == "µm" else f"{p:.3f}°"))
+            self.dro[a].setText("—" if p is None else (f"{p:,.1f}" if st.unit(a) == "µm" else f"{p:.3f}"))
             state = st.motion_state(a)
-            it = self.pos_table.item(i, 2)
-            it.setText(state)
-            it.setForeground(QtGui.QColor({"moving": "#fb4", "completed": "#4c4", "halted": "#f90",
-                                           "limit": "#f55", "fault": "#f55", "uncertain": "#f55"}.get(state, "#bbb")))
-            t = st.t_read.get(a)
-            self.pos_table.item(i, 3).setText(time.strftime("%H:%M:%S", time.localtime(t)) if t else "—")
+            self.dro_state[a].setText(state)
+            self.dro_state[a].setStyleSheet("color:" + {"moving": "#fb4", "completed": "#4c4", "halted": "#f90",
+                                                        "limit": "#f55", "fault": "#f55",
+                                                        "uncertain": "#f55"}.get(state, "#bbb"))
+        t = max((v for v in st.t_read.values() if v), default=None)
+        self.l_read.setText("read " + time.strftime("%H:%M:%S", time.localtime(t)) if t else "not read yet")
         state = self.link.state
         self.l_link.setText(f"<b style='color:{STATE_COLORS.get(state, '#ccc')}'>{state.upper()}</b> "
                             f"{self.link.port}" + (f" – {self.link.error}" if self.link.error else ""))
@@ -629,6 +614,64 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         if self.owns_link:
             self.link.close()
         super().closeEvent(ev)
+
+
+# ==================================================================== stage widgets
+class DROLabel(QtWidgets.QLabel):
+    """A digital-readout value; double-click opens the move dialog."""
+
+    double_clicked = QtCore.Signal()
+
+    def mouseDoubleClickEvent(self, ev):  # noqa: N802
+        self.double_clicked.emit()
+        super().mouseDoubleClickEvent(ev)
+
+
+class MoveDialog(QtWidgets.QDialog):
+    """Move one axis: to a position (pre-filled with the current one) or by a distance."""
+
+    def __init__(self, axis: str, unit: str, current: float | None, parent=None):
+        super().__init__(parent)
+        self.axis, self.current = axis, current
+        self.setWindowTitle(f"Move {axis}")
+        lay = QtWidgets.QFormLayout(self)
+        cur = QtWidgets.QLabel("—" if current is None else
+                               (f"{current:,.1f} {unit}" if unit == "µm" else f"{current:.3f} {unit}"))
+        cur.setFont(QtGui.QFont("Consolas", 14, QtGui.QFont.Bold))
+        lay.addRow("Current", cur)
+        self.rb_abs = QtWidgets.QRadioButton("to")
+        self.rb_rel = QtWidgets.QRadioButton("by")
+        r = QtWidgets.QHBoxLayout()
+        r.addWidget(self.rb_abs)
+        r.addWidget(self.rb_rel)
+        r.addStretch(1)
+        lay.addRow("Move", r)
+        self.val = _dspin(-1e6, 1e6, 1 if unit == "µm" else 3, 0.0, 10.0 if unit == "µm" else 1.0, f" {unit}")
+        self.val.setFont(QtGui.QFont("Consolas", 14))
+        lay.addRow(axis, self.val)
+        self.rb_abs.toggled.connect(self._mode)
+        if current is None:
+            self.rb_rel.setChecked(True)
+            self.rb_abs.setEnabled(False)  # position not read yet: relative only
+        else:
+            self.rb_abs.setChecked(True)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Move")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addRow(bb)
+        self.val.setFocus()
+        self.val.selectAll()
+
+    def _mode(self, absolute: bool):
+        self.val.setValue(self.current if absolute and self.current is not None else 0.0)
+        self.val.selectAll()
+
+    def relative(self) -> bool:
+        return self.rb_rel.isChecked()
+
+    def value(self) -> float:
+        return self.val.value()
 
 
 # ==================================================================== beam presets

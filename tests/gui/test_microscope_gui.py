@@ -14,6 +14,8 @@ from easyebl.imaging.engine import EngineOptions, ImagingEngine  # noqa: E402
 from easyebl.microscope import MicroscopeLink, SEMControl, StageControl  # noqa: E402
 from easyebl.microscope.bundle import MicroscopeBundle  # noqa: E402
 from easyebl.microscope.settings import MicroscopeSettings  # noqa: E402
+from PySide6 import QtCore  # noqa: E402
+from easyebl.microscope.gui import MoveDialog  # noqa: E402
 
 
 @pytest.fixture
@@ -35,7 +37,7 @@ def test_microscope_window(qtbot, bundle):
     qtbot.addWidget(w)
     w.show()
     qtbot.waitUntil(lambda: w.l_mag.text() == "×1k" and "20 kV" in w.l_hv.text(), timeout=3000)
-    assert "CONNECTED" in w.l_link.text() and w.pos_table.item(0, 1).text().endswith("µm")
+    assert "CONNECTED" in w.l_link.text() and w.dro["X"].text() not in ("", "—")
     # SEM settings from the controls
     w.mag_combo.setCurrentIndex(w.mag_combo.findData(5000))
     w.mag_combo.activated.emit(w.mag_combo.currentIndex())
@@ -52,25 +54,43 @@ def test_microscope_window(qtbot, bundle):
     qtbot.waitUntil(lambda: w.wd.value() == 22, timeout=2000)
     time.sleep(0.3)
     assert len(bundle.link.session.simulator.received) == n_sent + 1  # only the R WD read
-    # stage: interlocked until enabled
+    # stage: the SEM PC has it (#STAGE OFF) until enabled
+    sim = bundle.link.session.simulator
+    assert sim.sem["STAGE"] == "OFF" and bundle.stage.hand_control and not w.g_jog.isEnabled()
     x0 = bundle.stage.positions["X"]
-    assert w.move({"X": 100}, relative=True) is None and not w.g_move.isEnabled()
-    w.cb_enable.setChecked(True)
+    assert w.dro["X"].text() == f"{x0:,.1f}"
+    assert w.move({"X": 100}, relative=True) is None and w.open_move_dialog("X") is None
+    w.b_enable.click()
+    qtbot.waitUntil(lambda: sim.sem["STAGE"] == "ON" and not bundle.stage.hand_control, timeout=5000)
     w.jog("X", +1)  # default jog step 100 µm
     qtbot.waitUntil(lambda: abs(bundle.stage.positions["X"] - (x0 + w.jog_um.value())) < 0.05, timeout=10000)
-    w.rb_abs.setChecked(True)
-    w.mv_val["Y"].setValue(30000.0)
-    w.move_from_panel()
+    # double-click on the Y readout: move to a position
+    qtbot.mouseDClick(w.dro["Y"], QtCore.Qt.LeftButton)
+    d = w.findChild(MoveDialog)
+    assert d is not None and not d.relative() and d.value() == pytest.approx(bundle.stage.positions["Y"], abs=0.1)
+    d.val.setValue(30000.0)
+    d.accept()
     qtbot.waitUntil(lambda: abs(bundle.stage.positions["Y"] - 30000.0) < 0.05, timeout=15000)
-    qtbot.waitUntil(lambda: w.pos_table.item(1, 1).text().startswith("30,000.0"), timeout=2000)
-    # STOP ALL during a long move
-    w.rb_rel.setChecked(True)
-    w.mv_val["X"].setValue(20000.0)
-    w.move_from_panel()
+    qtbot.waitUntil(lambda: w.dro["Y"].text() == "30,000.0", timeout=2000)
+    # STOP ALL during a long (relative) move
+    d = w.open_move_dialog("X")
+    d.rb_rel.setChecked(True)
+    assert d.value() == 0.0
+    d.val.setValue(20000.0)
+    d.accept()
     qtbot.waitUntil(lambda: bundle.stage.moving, timeout=5000)
     w.b_stop.click()
     qtbot.waitUntil(lambda: not bundle.stage.moving, timeout=5000)
     qtbot.waitUntil(lambda: "halted" in w.log.toPlainText() or "Halted" in w.log.toPlainText(), timeout=5000)
+    # disable: back to the SEM PC (#STAGE OFF, the trackball works); a running move is stopped
+    d = w.open_move_dialog("X")
+    d.rb_rel.setChecked(True)
+    d.val.setValue(20000.0)
+    d.accept()
+    qtbot.waitUntil(lambda: bundle.stage.moving, timeout=5000)
+    w.b_enable.click()
+    qtbot.waitUntil(lambda: sim.sem["STAGE"] == "OFF" and not bundle.stage.moving, timeout=8000)
+    assert bundle.stage.hand_control and not w.g_jog.isEnabled() and "SEM PC" in w.b_enable.text()
     # the poll interval cannot go below 20 s
     w.poll_s.setValue(5)
     assert w.poll_s.value() == 20 and bundle.stage.poll_interval_s == 20

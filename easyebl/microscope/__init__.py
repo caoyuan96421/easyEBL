@@ -14,6 +14,7 @@ Quick start (simulator)::
     from easyebl.microscope import open_microscope
     link, sem, stage = open_microscope("sim")
     sem.set_magnification(2000).result()
+    stage.engage().result()          # take the stage from the SEM PC (#STAGE ON)
     stage.move({"X": 100}, relative=True).result()
     link.close()
 
