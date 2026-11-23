@@ -21,7 +21,8 @@ class MicroscopeBundle:
         self.link, self.stage = link, stage
         self.sem = sem if sem is not None else StubMicroscope()
         self.settings = settings or MicroscopeSettings()
-        self.follower = None
+        #: the global field calibration (field = K / magnification), see :meth:`tie_field`
+        self.field_scale = None
         #: ``opener()`` shows the microscope window (set by the easyEBL app, which manages the windows)
         self.opener = None
         self._window = None
@@ -37,16 +38,19 @@ class MicroscopeBundle:
             d.update(self.stage.snapshot())
         return d
 
-    def follow_magnification(self, targets, sim_backend=None, notify=None):
-        """Tie the field calibration of *targets* (imaging engine, EDS controller) to the magnification."""
-        if self.link is None:
-            return None
-        from .coupling import FieldFollower
+    def tie_field(self, targets, sim_backend=None, persist: bool = True, notify=None):
+        """The global field calibration for *targets* (imaging engine, EDS controller): their field is
+        ``K / magnification`` (the manual magnification while the microscope reports none).  With
+        *persist* (and a real microscope or none) ``K`` is kept in the settings file; simulators keep it
+        in memory so they never overwrite the instrument's calibration."""
+        from .coupling import FieldScale
 
-        # the simulator's K is kept in memory: it must not overwrite the instrument's calibration on disk
-        settings = None if self.link.simulated else self.settings
-        self.follower = FieldFollower(self.sem, targets, settings, sim_backend=sim_backend, notify=notify)
-        return self.follower
+        if self.field_scale is not None:
+            self.field_scale.close()
+        keep = persist and not (self.link is not None and self.link.simulated)
+        self.field_scale = FieldScale(self.sem, targets, self.settings if keep else None,
+                                      sim_backend=sim_backend, notify=notify)
+        return self.field_scale
 
     def window(self, parent=None):
         """A microscope window of its own (when no app manages the windows)."""
@@ -70,8 +74,8 @@ class MicroscopeBundle:
         return w
 
     def close(self) -> None:
-        if self.follower is not None:
-            self.follower.close()
+        if self.field_scale is not None:
+            self.field_scale.close()
         if self._window is not None:
             self._window.close()
         if self.link is not None:

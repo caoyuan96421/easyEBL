@@ -1,4 +1,5 @@
-"""Pulse-processor dialog: device info, shaping preset, channel count and raw DP5 parameters."""
+"""Pulse-processor dialog: device info and the raw DP5 parameters (advanced, by hand).
+The speed preset is chosen in the EDS window's Acquire tab."""
 from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
@@ -36,15 +37,6 @@ class ProcessorDialog(QtWidgets.QDialog):
         info = mca.info()
         self.l_info = QtWidgets.QLabel("<br>".join(f"<b>{k}</b>: {v}" for k, v in info.items()))
         self.l_info.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.cb_speed = QtWidgets.QComboBox()
-        self.speeds = mca.speeds()
-        for k, d in self.speeds.items():
-            self.cb_speed.addItem(d, k)
-        cur = mca.current_speed()
-        if cur in self.speeds:
-            self.cb_speed.setCurrentIndex(list(self.speeds).index(cur))
-        self.b_speed = QtWidgets.QPushButton("Apply preset")
-        self.b_speed.clicked.connect(self._apply_speed)
         self.table = QtWidgets.QTableWidget(len(PARAMS), 3)
         self.table.setHorizontalHeaderLabels(["Parameter", "Meaning", "Value"])
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
@@ -53,23 +45,15 @@ class ProcessorDialog(QtWidgets.QDialog):
         self.b_read.clicked.connect(self.read)
         self.b_write = QtWidgets.QPushButton("Write changed")
         self.b_write.clicked.connect(self.write)
-        self.b_thr = QtWidgets.QPushButton("Auto fast threshold (beam off!)")
-        self.b_thr.setVisible(hasattr(mca, "auto_threshold"))
-        self.b_thr.clicked.connect(self._auto_thr)
         self.msg = QtWidgets.QLabel()
         self.msg.setWordWrap(True)
         top = QtWidgets.QGroupBox("Device")
         QtWidgets.QVBoxLayout(top).addWidget(self.l_info)
-        sp = QtWidgets.QGroupBox("Shaping (speed vs resolution)")
-        sl = QtWidgets.QHBoxLayout(sp)
-        sl.addWidget(self.cb_speed, 1)
-        sl.addWidget(self.b_speed)
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(top)
-        lay.addWidget(sp)
         lay.addWidget(self.table, 1)
         row = QtWidgets.QHBoxLayout()
-        for b in (self.b_read, self.b_write, self.b_thr):
+        for b in (self.b_read, self.b_write):
             row.addWidget(b)
         lay.addLayout(row)
         lay.addWidget(self.msg)
@@ -123,30 +107,3 @@ class ProcessorDialog(QtWidgets.QDialog):
             self.channelsChanged.emit(old, self.mca.channels)
         self.read()
         self.msg.setText("written: " + ", ".join(f"{k}={v}" for k, v in changes.items()))
-
-    def _apply_speed(self):
-        if self._busy():
-            return
-        k = self.cb_speed.currentData()
-        try:
-            self.mca.apply_speed(int(k))
-        except MCAError as e:
-            self.msg.setText(str(e))
-            return
-        self.read()
-        self.msg.setText(f"speed preset {k} applied (peak positions are kept; re-check the calibration)")
-
-    def _auto_thr(self):
-        if self._busy():
-            return
-        if QtWidgets.QMessageBox.question(self, "Auto thresholds",
-                                          "Blank the beam / no X-rays on the detector.  Continue?") != \
-                QtWidgets.QMessageBox.Yes:
-            return
-        try:
-            res = self.mca.auto_threshold()
-        except Exception as e:  # noqa: BLE001
-            self.msg.setText(str(e))
-            return
-        self.read()
-        self.msg.setText(f"thresholds: {res}")

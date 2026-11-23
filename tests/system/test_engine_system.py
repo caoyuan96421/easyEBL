@@ -71,7 +71,7 @@ def test_settings_change_without_restarting_hardware(make_engine, quiet_params):
     eng.run()
     eng.wait_frame(complete=True, timeout=10)
     eng.update(nx=40, ny=30, width_um=60.0, center_um=(5.0, -3.0))
-    eng.set_speed(2e-6)  # the 20 µs ramp lead-in now overscans 10 px: still inside the field
+    eng.update(dwell_s=2e-6)  # the 20 µs ramp lead-in now overscans 10 px: still inside the field
     deadline = time.monotonic() + 10
     while True:
         f = eng.wait_frame(complete=True, timeout=10)
@@ -103,8 +103,10 @@ def test_invalid_settings_raise_in_caller_and_keep_scanning(make_engine):
 
 def test_beam_shift_is_clamped_to_the_field(make_engine):
     eng, _ = make_engine()
+    assert eng.set_beam_shift(1e4, 0).center_um[0] < 5  # the scan starts at (nearly) the full field
+    eng.zoom(2)  # half the width: room to move
     c = eng.set_beam_shift(1e4, 0)
-    assert 0 < c.center_um[0] < 50
+    assert 20 < c.center_um[0] < 50
     eng.update()  # still valid
     w = eng.set_scan_width(1e4)
     assert w.width_um <= 100.0
@@ -151,7 +153,7 @@ def test_capture_integrates_and_keeps_live_settings(make_engine, quiet_params):
     eng.run()
     eng.wait_frame(complete=True, timeout=10)
     live_cfg = eng.config
-    fut = eng.capture(frames=3, nx=80, ny=60, speed=8e-6)
+    fut = eng.capture(frames=3, nx=80, ny=60, dwell_s=8e-6)
     photo = fut.result(timeout=30)
     assert photo.kind == "capture" and photo.frames_averaged == 3 and photo.image.shape == (60, 80)
     np.testing.assert_allclose(photo.image, truth(mgr.backend, photo), atol=1e-5)
@@ -161,7 +163,7 @@ def test_capture_integrates_and_keeps_live_settings(make_engine, quiet_params):
 
 def test_stop_cancels_capture(make_engine):
     eng, _ = make_engine(realtime=True)
-    fut = eng.capture(frames=50, nx=256, ny=256, speed=20e-6)
+    fut = eng.capture(frames=50, nx=256, ny=256, dwell_s=20e-6)
     assert wait_state(eng, {EngineState.CAPTURE})
     eng.stop()
     with pytest.raises(RuntimeError):
@@ -254,7 +256,7 @@ def test_concurrent_command_storm(make_engine):
                 elif op == 2:
                     eng.single()
                 elif op == 3:
-                    eng.set_speed(rnd.choice([2e-6, 4e-6, 6e-6]))
+                    eng.update(dwell_s=rnd.choice([2e-6, 4e-6, 6e-6]))
                 elif op == 4:
                     eng.shift_beam(rnd.uniform(-5, 5), rnd.uniform(-5, 5))
                 elif op == 5:

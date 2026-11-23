@@ -553,6 +553,12 @@ class StageClient:
     e0_after_queries:
         Query op codes that are followed by ``uE0``. Defaults to the observed
         S-3000 behaviour (R0, R4).
+    halt_lock_timeout:
+        How long S0 waits for the transaction on the bus before it is written
+        anyway.  Longer than *ack_timeout*: on the S-3000 a line written while
+        the SEM relays another stage transaction is dropped (observed: S0 sent
+        while C0 awaited its acknowledgement did not halt the move), so S0
+        waits for the bus unless something holds it unusually long.
     """
 
     def __init__(
@@ -564,7 +570,7 @@ class StageClient:
         query_timeout: float = 2.0,
         extra_ack_window: float = 0.3,
         expected_ack_timeout: float = 1.5,
-        halt_lock_timeout: float = 0.2,
+        halt_lock_timeout: float = 2.5,
         e0_after_queries: Iterable[str] = OBSERVED_E0_AFTER_QUERIES,
     ):
         self.channel = channel
@@ -823,8 +829,10 @@ class StageClient:
     def halt(self, axis) -> None:
         """Send S0 for one axis. Never blocked for long by another transaction.
 
-        If the bus is busy (e.g. a long SEM photograph on a shared port) S0 is
-        sent anyway; its acknowledgement is then logged as possibly ambiguous.
+        It waits for the transaction on the bus (*halt_lock_timeout*): the SEM drops
+        a line written while it relays another.  If the bus stays busy longer (e.g. a
+        long SEM photograph on a shared port) S0 is sent anyway; its acknowledgement
+        is then logged as possibly ambiguous.
         """
         a = _ax(axis)
         text = cmd_halt(a)

@@ -28,10 +28,11 @@ class MicroscopeSettings:
     port: str = "COM4"
     stage_poll_s: float = 30.0  # never below StageControl.MIN_POLL_S (20 s)
     sem_status_poll_s: float = 10.0  # MAG / HV / WD background read (0: off)
-    #: DAQ full-scale field × magnification (µm): field_um = this / magnification.
-    #: None until the first calibration at a known magnification.
-    field_mag_product_um: float | None = None
-    follow_magnification: bool = True  # imaging / EDS field follows the SEM magnification
+    #: the global field calibration: the field (µm) the full deflection range sweeps at ×1;
+    #: the field at magnification M is this / M (easyebl.microscope.coupling.FieldScale)
+    field_at_1x_um: float = 100_000.0
+    #: the magnification used while the microscope does not report one (not connected)
+    manual_magnification: float = 1000.0
     jog_step_um: float = 100.0
     jog_step_deg: float = 1.0
     #: named beam presets: [{"name": ..., "beam_coarse": ..., "beam_fine": ..., "stig_x": ...,
@@ -47,6 +48,8 @@ class MicroscopeSettings:
             with open(path, encoding="utf-8") as fh:
                 d = json.load(fh)
             known = {f.name for f in fields(cls)} - {"path"}
+            if "field_at_1x_um" not in d and d.get("field_mag_product_um"):  # the same constant, renamed
+                d["field_at_1x_um"] = d["field_mag_product_um"]
             for k, v in d.items():
                 if k in known:
                     setattr(s, k, v)

@@ -301,7 +301,7 @@ def test_engine_run_while_disconnected_starts_when_back(engine):
 
 def test_capture_fails_cleanly_on_unplug(engine):
     eng, mgr, be = engine()
-    fut = eng.capture(frames=20, nx=128, ny=96, speed=8e-6)
+    fut = eng.capture(frames=20, nx=128, ny=96, dwell_s=8e-6)
     assert wait_for(lambda: eng.state == EngineState.CAPTURE, 5)
     be.unplug()
     with pytest.raises(RuntimeError, match="lost"):
@@ -369,7 +369,7 @@ def test_command_storm_with_random_unplugs(engine):
                 elif op == 1:
                     eng.freeze()
                 elif op == 2:
-                    eng.set_speed(rnd.choice([2e-6, 4e-6]))
+                    eng.update(dwell_s=rnd.choice([2e-6, 4e-6]))
                 elif op == 3:
                     eng.shift_beam(rnd.uniform(-2, 2), rnd.uniform(-2, 2))
                 elif op == 4:

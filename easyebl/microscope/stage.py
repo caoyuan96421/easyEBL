@@ -91,6 +91,9 @@ class StageControl:
         self._hand = bool(hand_control)  # the SEM PC has the stage (see release())
         self._moves: list = []  # futures of queued / running moves (cancelled by stop)
         self._stop_gen = 0  # incremented by every stop(): a move being sent at that moment is halted too
+        # one halt sequence at a time: S0 lines interleaved on the port (a second STOP, or the re-halt
+        # of a move whose start was on the wire) make the SEM drop an acknowledgement
+        self._halt_lock = threading.Lock()
         self._poll_s = max(self.MIN_POLL_S, float(poll_s))
         self._polling = bool(polling)
         self._t_next_poll = time.monotonic()  # first read right away
@@ -287,12 +290,15 @@ class StageControl:
             self._stage_call(session, lambda: st.move(pulses, hold_partners=True, wait=False))
             moved = sorted({ax.name for ax in Axis if ax.controller in {_CONTROLLER[a] for a in pulses}})
             if self._stop_gen != gen:  # STOP arrived while M0 / C0 were on the wire: halt what C0 started
-                for a in moved:
-                    st.halt(a)
+                with self._halt_lock:  # after STOP's own halts, never interleaved with them
+                    for a in moved:
+                        st.halt(a)
             self.link.events.emit("stage", f"stage move: {desc}", moving=moved, targets=dict(tg), relative=relative)
             return moved
 
         fut = self.link.submit(start, STAGE_CMD, f"stage move {desc}")
+        # C0 starts both motors of a controller: every axis on an involved controller may move
+        outer._axes = tuple(a for a in AXES if _CONTROLLER[a] in {_CONTROLLER[t] for t in tg})
         with self._lock:
             self._moves.append(outer)
 
@@ -335,8 +341,18 @@ class StageControl:
             if fut in self._moves:
                 self._moves.remove(fut)
 
+    def _halt_axes(self) -> list[str]:
+        """Axes STOP halts: those of the moves in progress and any the controllers report moving;
+        every axis when none is known to move (motion started elsewhere, state unknown)."""
+        st = self.link.session.stage
+        with self._lock:
+            busy = {a for m in self._moves for a in getattr(m, "_axes", ())}
+        busy |= {ax.name for ax, s in st.motion_states().items()
+                 if s in (MotionState.MOVING, MotionState.UNCERTAIN)}
+        return [a for a in AXES if a in busy] or list(AXES)
+
     def stop(self, axis: str | None = None) -> concurrent.futures.Future:
-        """Halt one axis or all of them *now* (bypasses the queue); queued moves are cancelled,
+        """Halt one axis or the moving ones *now* (bypasses the queue); queued moves are cancelled,
         and a move being sent right now is halted as soon as it has started."""
         with self._lock:
             self._stop_gen += 1
@@ -354,12 +370,15 @@ class StageControl:
                 if self._hand and not self._stage_on:  # the SEM PC has the stage: S0 would be refused
                     out.set_result(False)
                     return
-                if axis is None:
-                    problems = st.halt_all()
-                    if problems:
-                        raise MotionError("halt: " + "; ".join(problems))
-                else:
-                    st.halt(axis.upper())
+                problems = []
+                with self._halt_lock:
+                    for a in ([axis.upper()] if axis is not None else self._halt_axes()):
+                        try:
+                            st.halt(a)
+                        except Exception as exc:  # noqa: BLE001 - keep going: every axis gets its S0
+                            problems.append(f"{a}: {exc}")
+                if problems:
+                    raise MotionError("halt: " + "; ".join(problems))
                 out.set_result(True)
             except BaseException as e:  # noqa: BLE001
                 out.set_exception(e)

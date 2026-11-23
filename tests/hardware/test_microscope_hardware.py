@@ -185,19 +185,22 @@ def test_stop_halts_a_move(microscope):
     from easyebl.microscope.s3000 import MotionError
 
     link, sem, stage = microscope
+    # the SEM relays each stage line in ~0.8 s, so S0 reaches the controller ~1.6 s after C0
+    # (C0's acknowledgement first): a 500 µm move is over by then; 2 mm is still under way
+    dist = 2000.0
     x0 = _read(stage, ["X"])["X"]
-    m = stage.move({"X": 500.0}, relative=True)
+    m = stage.move({"X": dist}, relative=True)
     try:
         t0 = time.monotonic()
         while not stage.moving and time.monotonic() - t0 < 10:
             time.sleep(0.02)
         assert stage.moving, "the move did not start"
-        time.sleep(0.2)
         stage.stop().result(10)
-        with pytest.raises((MotionError, Exception)):
-            m.result(30)
+        assert link.state == "connected"  # every S0 acknowledged
+        with pytest.raises(MotionError, match="halted"):
+            m.result(60)
         x = _read(stage, ["X"])["X"]
-        assert x0 - 1.0 <= x < x0 + 500.0 - 1.0  # stopped part-way
+        assert x0 - 1.0 <= x < x0 + dist - 1.0  # stopped part-way
     finally:
         stage.acknowledge()
         stage.move({"X": x0}).result(60)

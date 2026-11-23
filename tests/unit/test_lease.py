@@ -1,4 +1,6 @@
 """Exclusive DAQ lease, preemption of the live SEM image, and the cross-process device lock."""
+import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -162,18 +164,28 @@ def test_device_lock_across_processes(tmp_path):
         sys.path.insert(0, {repr(str(__import__('pathlib').Path(__file__).resolve().parents[2]))})
         from easyebl.hal.devlock import DeviceLock
         DeviceLock("NI-Dev9", directory={repr(str(tmp_path))}).acquire()
-        print("held", flush=True)
+        import os
+        print("held", os.getpid(), flush=True)
         time.sleep(30)
     """)
     p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
     try:
-        assert p.stdout.readline().strip() == "held"
+        word, pid = p.stdout.readline().split()
+        assert word == "held"  # the holder's own PID: a venv python.exe is a launcher (p.pid is not it)
         lk = DeviceLock("NI-Dev9", directory=str(tmp_path))
-        with pytest.raises(DeviceBusyError, match=str(p.pid)):
+        with pytest.raises(DeviceBusyError, match=pid):
             lk.acquire()
+        os.kill(int(pid), signal.SIGTERM)  # the holder itself (TerminateProcess on Windows)
         p.kill()
         p.wait(10)
-        lk.acquire()  # released by the OS when the holder dies
+        t0 = time.monotonic()
+        while True:  # released by the OS when the holder dies
+            try:
+                lk.acquire()
+                break
+            except DeviceBusyError:
+                assert time.monotonic() - t0 < 10, "the lock was not released after the holder died"
+                time.sleep(0.05)
         other = DeviceLock("NI-Dev9", directory=str(tmp_path))
         other.acquire()  # same process: shared
         other.release()

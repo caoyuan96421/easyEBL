@@ -53,7 +53,8 @@ class DAQConfig:
     device: str = "Dev1"
     ao_x: str = "ao0"
     ao_y: str = "ao1"
-    ao_limit_v: float = 10.0
+    ao_limit_v: float = 10.0  # hard limit of every AO sample (waveform incl. pre-line / rotation overshoot)
+    scan_limit_v: float = 10.0  # the scan field: ±this is the full field of view (≤ ao_limit_v)
     blank_line: str = "port0/line0"
     blank_active_high: bool = True
     timed_lines: dict = field(default_factory=dict)
@@ -81,9 +82,14 @@ class DAQConfig:
     abort_drain_timeout_s: float = 3.0  # abort: max wait for the safe tail to play out
     write_timeout_s: float = 10.0
 
+    @property
+    def full_scale_v(self) -> float:
+        """Deflection voltage at the edge of the full field of view (scan size limit)."""
+        return min(self.scan_limit_v, self.ao_limit_v)
+
     def validate(self) -> None:
-        if self.ao_limit_v <= 0:
-            raise ValueError("ao_limit_v must be positive")
+        if self.ao_limit_v <= 0 or self.scan_limit_v <= 0:
+            raise ValueError("ao_limit_v and scan_limit_v must be positive")
         if not (abs(self.park_x_v) <= self.ao_limit_v and abs(self.park_y_v) <= self.ao_limit_v):
             raise ValueError("park position outside AO limits")
         port = self.blank_line.split("/")[0]
@@ -148,7 +154,10 @@ class DAQConfig:
             device=device,
             ao_x="ao0",
             ao_y="ao1",
-            ao_limit_v=10.0,  # S-3000 X-IN / Y-IN: ±10 V = full deflection
+            # DAQmx refuses AO samples beyond ±10 V on the 6363, and its DAC ends at ±10.097 V even in
+            # raw codes (calibration: 3245 codes/V, measured on S/N 23131635): no room beyond the field
+            ao_limit_v=10.0,
+            scan_limit_v=10.0,  # S-3000 X-IN / Y-IN: ±10 V = full deflection (full field of view)
             blank_line="port0/line23",
             blank_active_high=False,
             timed_lines={},

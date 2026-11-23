@@ -35,7 +35,6 @@ class DAQSection:
     device: str = "Dev1"
     preset: str = "usb6363"  # wiring preset: "usb6363" or "default"
     config_file: str = ""  # optional DAQConfig JSON; replaces the preset
-    field_um: float = 100.0  # field covered by the full AO range at the current magnification
     rate: float | None = None  # sample clock (S/s); None: device maximum (500 kS/s on the simulator)
     latency_ms: float = 100.0  # output buffer depth (setting-change latency)
     ai_terminal: str | None = None  # video input mode; None: the preset's

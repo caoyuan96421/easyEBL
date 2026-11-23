@@ -44,9 +44,11 @@ class DeviceLock:
         return self._held
 
     def holder_pid(self) -> int | None:
+        # unbuffered: a buffered read asks for a whole buffer (8 KiB), which overlaps the locked byte
+        # at _LOCK_OFFSET and is refused on Windows; 64 bytes stay clear of it
         try:
-            with open(self.path, encoding="ascii", errors="ignore") as fh:
-                txt = fh.read(64).strip()
+            with open(self.path, "rb", buffering=0) as fh:
+                txt = fh.read(64).decode("ascii", "ignore").strip()
             return int(txt.split()[0]) if txt else None
         except (OSError, ValueError, IndexError):
             return None

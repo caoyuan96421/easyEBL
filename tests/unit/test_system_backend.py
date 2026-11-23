@@ -31,7 +31,7 @@ def test_backend_on_simulators(tmp_path):
         st = b.status()
         assert {k: s.state for k, s in st.items()} == {"daq": "sim", "eds": "sim", "microscope": "sim"}
         assert b.engine.handle.manager is b.manager and b.eds.handle.manager is b.manager  # one DAQ for every subsystem
-        assert b.microscope.follower is not None and b.busy == []
+        assert b.microscope.field_scale is not None and b.busy == []
         b.microscope.sem.set_magnification(2000).result(10)  # the field follows the magnification
         assert b.engine.calibration.field_size_um == 50.0
     finally:

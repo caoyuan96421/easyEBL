@@ -205,7 +205,7 @@ class EDSController:
         self.handle = manager.get_handle(owner) if hasattr(manager, "get_handle") else manager
         self.mca = mca
         self.daq_config = self.handle.config
-        self._cal = calibration or FieldCalibration(100.0, self.daq_config.ao_limit_v)
+        self._cal = calibration or FieldCalibration(100.0, self.daq_config.full_scale_v)
         self._ecal = energy_calibration or EnergyCalibration()
         self.beam_kv = float(beam_kv)
         self.takeoff_deg = float(takeoff_deg)
@@ -356,6 +356,17 @@ class EDSController:
         self.events.emit("settings", f"min. energy {float(min_energy_kev):.3f} keV → slow threshold {thsl:.3f} %",
                          min_energy_kev=float(min_energy_kev), thsl=thsl)
         return thsl
+
+    def set_speed(self, speed: int) -> int | None:
+        """Pulse-processor speed preset 1 (fastest) … 5 (best resolution).  Refused while a job
+        runs.  Returns the speed the processor reports afterwards."""
+        if self.busy:
+            raise RuntimeError("the processor speed cannot change during an acquisition")
+        with self.idle_paused(), self.mca.session(self.handle.owner):
+            self.mca.apply_speed(int(speed))
+            now = self.mca.current_speed()
+        self.events.emit("settings", f"processor speed {speed}", speed=now)
+        return now
 
     def abort(self) -> None:
         """Stop counting at once (e.g. the window closes): cancel the job, end the live

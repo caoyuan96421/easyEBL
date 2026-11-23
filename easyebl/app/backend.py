@@ -80,10 +80,11 @@ class SystemBackend:
                 cfg.device = c.device
             if c.ai_terminal:
                 cfg.ai_terminal = c.ai_terminal
-            cal = FieldCalibration(float(c.field_um), cfg.ao_limit_v, invert_x=bool(c.invert_x),
+            # the field itself is set by the global field calibration (FieldScale) once the microscope is open
+            cal = FieldCalibration(100.0, cfg.full_scale_v, invert_x=bool(c.invert_x),
                                    invert_y=bool(c.invert_y), swap_xy=bool(c.swap_xy))
             if c.simulated:
-                be = SimulatedBackend(cfg, SimParams(field_size_um=float(c.field_um), v_full_scale=cfg.ao_limit_v,
+                be = SimulatedBackend(cfg, SimParams(field_size_um=100.0, v_full_scale=cfg.full_scale_v,
                                                      realtime=True, noise_sigma=0.05))
             else:
                 be = create_backend(c.backend, cfg)
@@ -137,8 +138,8 @@ class SystemBackend:
             return
         targets = [t for t in (self.engine, self.eds) if t is not None]
         sim_be = self.manager.backend if self.manager is not None and self.config.daq.simulated else None
-        if self.microscope.connected and targets:
-            self.microscope.follow_magnification(targets, sim_backend=sim_be)
+        if targets:  # also without a microscope: then the manual magnification is used
+            self.microscope.tie_field(targets, sim_backend=sim_be, persist=not self.config.daq.simulated)
 
     def close(self) -> None:
         """Stop and disconnect everything (the end of the easyEBL session)."""

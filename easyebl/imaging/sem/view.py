@@ -3,7 +3,12 @@
 Mouse:
 * double-click – move the beam so that the clicked point becomes the centre
 * drag (left button) – beam shift, the image follows the mouse
-* wheel – magnification (emitted; the SEM control is a stub for now)
+* wheel – zoom: the swept range narrows / widens (the column magnification is not touched)
+* Measure mode (:attr:`SEMImageView.measure_mode`): drag draws a line instead; its length is shown on
+  the image.  The line is kept in field µm, so it stays on the feature while the scan pans or zooms.
+
+The data bar shows the image magnification (column magnification × full field / scan
+width); the inset in the lower-left corner shows the scanned region within the full field.
 """
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..export import to_uint8
-from .display import display_magnification, format_length, nice_scale_bar
+from .display import display_magnification, format_length, image_magnification, nice_scale_bar
 
 __all__ = ["SEMImageView", "render_annotated"]
 
@@ -29,6 +34,38 @@ def _pixel_to_field(cfg, col: float, row: float) -> tuple[float, float]:
     return (cfg.center_um[0] + c * u - s * v, cfg.center_um[1] + s * u + c * v)
 
 
+def _field_to_pixel(cfg, x: float, y: float) -> tuple[float, float]:
+    """Inverse of :func:`_pixel_to_field`: (col, row) of a field point (may be outside the image)."""
+    pw, ph = cfg.pixel_size_um
+    dx, dy = x - cfg.center_um[0], y - cfg.center_um[1]
+    c, s = math.cos(cfg.rotation_rad), math.sin(cfg.rotation_rad)
+    u, v = c * dx + s * dy, -s * dx + c * dy
+    return (u + cfg.width_um / 2) / pw - 0.5, (cfg.height / 2 - v) / ph - 0.5
+
+
+def _draw_measure(p: QtGui.QPainter, a: QtCore.QPointF, b: QtCore.QPointF, label: str) -> None:
+    """The measuring line: yellow on a dark outline, end ticks, the length in a box at the middle."""
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    d = b - a
+    n = math.hypot(d.x(), d.y())
+    tick = QtCore.QPointF(-d.y() / n * 7, d.x() / n * 7) if n > 0 else QtCore.QPointF(0, 7)
+    lines = [QtCore.QLineF(a, b), QtCore.QLineF(a - tick, a + tick), QtCore.QLineF(b - tick, b + tick)]
+    for pen in (QtGui.QPen(QtGui.QColor(0, 0, 0, 180), 4), QtGui.QPen(QtGui.QColor(255, 220, 0), 2)):
+        pen.setCapStyle(QtCore.Qt.FlatCap)
+        p.setPen(pen)
+        p.drawLines(lines)
+    font = QtGui.QFont("Segoe UI", 10, QtGui.QFont.Bold)
+    p.setFont(font)
+    fm = QtGui.QFontMetrics(font)
+    m = (a + b) / 2
+    box = QtCore.QRectF(0, 0, fm.horizontalAdvance(label) + 10, fm.height() + 4)
+    box.moveCenter(m + QtCore.QPointF(0, -(box.height() / 2 + 6)))
+    p.fillRect(box, QtGui.QColor(0, 0, 0, 190))
+    p.setPen(QtGui.QColor(255, 220, 0))
+    p.drawText(box, QtCore.Qt.AlignCenter, label)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+
+
 def _draw_data_bar(p: QtGui.QPainter, rect: QtCore.QRectF, frame, info: dict) -> None:
     p.fillRect(rect, QtGui.QColor(0, 0, 0))
     cfg = frame.config if frame is not None else None
@@ -41,7 +78,8 @@ def _draw_data_bar(p: QtGui.QPainter, rect: QtCore.QRectF, frame, info: dict) ->
     items = [
         info.get("kv", "-- kV"),
         info.get("wd", "WD --"),
-        display_magnification(cfg.width_um) if cfg else "×—",
+        display_magnification(image_magnification(info.get("column_mag"), info.get("field_um"), cfg.width_um)
+                              if cfg else None),
         info.get("detector", "SE"),
     ]
     x = rect.left() + 8
@@ -75,6 +113,33 @@ def _draw_data_bar(p: QtGui.QPainter, rect: QtCore.QRectF, frame, info: dict) ->
         p.drawText(QtCore.QPointF(rect.right() - 8 - fm.horizontalAdvance(ts), y), ts)
 
 
+def scan_corners(center_um, width_um: float, height_um: float, rotation_rad: float) -> np.ndarray:
+    """Corners (4, 2) of a scan rectangle in field µm."""
+    u = np.array([-1, 1, 1, -1]) * width_um / 2
+    v = np.array([1, 1, -1, -1]) * height_um / 2
+    c, s = math.cos(rotation_rad), math.sin(rotation_rad)
+    return np.column_stack([center_um[0] + c * u - s * v, center_um[1] + s * u + c * v])
+
+
+def _draw_fov_inset(p: QtGui.QPainter, image_rect: QtCore.QRectF, field_um: float, scan) -> None:
+    """Lower-left corner of the image: the full field of view and the scanned region in it."""
+    size = max(48.0, min(110.0, 0.22 * min(image_rect.width(), image_rect.height())))
+    box = QtCore.QRectF(image_rect.left() + 8, image_rect.bottom() - 8 - size, size, size)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    p.fillRect(box, QtGui.QColor(0, 0, 0, 150))
+    p.setPen(QtGui.QPen(QtGui.QColor(200, 200, 200, 220), 1))
+    p.drawRect(box)
+    center, w, h, rot = scan
+    pts = scan_corners(center, w, h, rot)
+    poly = QtGui.QPolygonF([QtCore.QPointF(box.left() + (x / field_um + 0.5) * size,
+                                           box.top() + (0.5 - y / field_um) * size) for x, y in pts])
+    p.setBrush(QtGui.QColor(255, 210, 0, 70))
+    p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 0), 1.5))
+    p.drawPolygon(poly)
+    p.setBrush(QtCore.Qt.NoBrush)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+
+
 def render_annotated(frame, levels, info: dict | None = None) -> QtGui.QImage:
     """Full-resolution image with the data bar burned in (for 'Save with data bar')."""
     u8 = to_uint8(frame.image, levels)
@@ -95,8 +160,9 @@ def render_annotated(frame, levels, info: dict | None = None) -> QtGui.QImage:
 class SEMImageView(QtWidgets.QWidget):
     centerRequested = QtCore.Signal(float, float)  # absolute beam shift target (µm)
     shiftDragged = QtCore.Signal(float, float)  # incremental beam shift (µm)
-    wheelSteps = QtCore.Signal(int)  # magnification steps (stub)
+    zoomSteps = QtCore.Signal(int)  # wheel notches: + zoom in, − zoom out (the scan range, not the column)
     pointerMoved = QtCore.Signal(object)  # (x_um, y_um) or None
+    measureChanged = QtCore.Signal(object)  # the measuring line ((x0, y0), (x1, y1)) in field µm, or None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -110,6 +176,10 @@ class SEMImageView(QtWidgets.QWidget):
         self.info: dict = {}
         self.show_scan_line = True
         self.show_crosshair = False
+        self.show_fov_inset = True
+        self._measure_mode = False
+        self._line = None  # measuring line: [(x0, y0), (x1, y1)] in field µm
+        self._drawing = False
         self._drag = None
         self._paint_ms = 0.0
 
@@ -127,6 +197,54 @@ class SEMImageView(QtWidgets.QWidget):
     def clear(self) -> None:
         self._frame = self._qimg = self._u8 = None
         self.update()
+
+    # ------------------------------------------------------------- measure
+    @property
+    def measure_mode(self) -> bool:
+        return self._measure_mode
+
+    @measure_mode.setter
+    def measure_mode(self, on: bool) -> None:
+        """On: left drag draws the measuring line (no beam shift).  Off: the line is removed."""
+        self._measure_mode = bool(on)
+        if on:
+            self.setCursor(QtCore.Qt.CrossCursor)
+        else:
+            self.unsetCursor()
+            self._drawing = False
+            self.clear_measure()
+
+    def measure_line(self):
+        """((x0, y0), (x1, y1)) in field µm, or None."""
+        return None if self._line is None else (tuple(self._line[0]), tuple(self._line[1]))
+
+    def measure_length_um(self) -> float | None:
+        if self._line is None:
+            return None
+        (x0, y0), (x1, y1) = self._line
+        return math.hypot(x1 - x0, y1 - y0)
+
+    def set_measure_line(self, a, b) -> None:
+        self._line = [tuple(map(float, a)), tuple(map(float, b))]
+        self.update()
+        self.measureChanged.emit(self.measure_line())
+
+    def clear_measure(self) -> None:
+        if self._line is not None:
+            self._line = None
+            self.update()
+            self.measureChanged.emit(None)
+
+    def scale_measure(self, r: float) -> None:
+        """All field µm changed by *r* (a new field calibration): keep the line on the same feature."""
+        if self._line is not None:
+            self.set_measure_line(*[(x * r, y * r) for x, y in self._line])
+
+    def _widget_point(self, x: float, y: float) -> QtCore.QPointF:
+        cfg, r = self._frame.config, self.image_rect()
+        col, row = _field_to_pixel(cfg, x, y)
+        return QtCore.QPointF(r.left() + (col + 0.5) / cfg.nx * r.width(),
+                              r.top() + (row + 0.5) / cfg.ny * r.height())
 
     # ------------------------------------------------------------ geometry
     def image_rect(self) -> QtCore.QRectF:
@@ -164,10 +282,25 @@ class SEMImageView(QtWidgets.QWidget):
                 p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 0, 200), 1))
                 p.drawLine(QtCore.QPointF(r.left(), y), QtCore.QPointF(r.right(), y))
             if self.show_crosshair:
-                p.setPen(QtGui.QPen(QtGui.QColor(0, 220, 255, 160), 1, QtCore.Qt.DashLine))
+                # solid, with a dark outline so it reads on bright and dark specimens alike
                 c = r.center()
-                p.drawLine(QtCore.QPointF(c.x() - 20, c.y()), QtCore.QPointF(c.x() + 20, c.y()))
-                p.drawLine(QtCore.QPointF(c.x(), c.y() - 20), QtCore.QPointF(c.x(), c.y() + 20))
+                arm = max(40.0, 0.08 * min(r.width(), r.height()))
+                lines = (QtCore.QLineF(c.x() - arm, c.y(), c.x() + arm, c.y()),
+                         QtCore.QLineF(c.x(), c.y() - arm, c.x(), c.y() + arm))
+                for pen in (QtGui.QPen(QtGui.QColor(0, 0, 0, 170), 4),
+                            QtGui.QPen(QtGui.QColor(0, 230, 255, 235), 2)):
+                    pen.setCapStyle(QtCore.Qt.FlatCap)
+                    p.setPen(pen)
+                    p.drawLines(lines)
+            if self._line is not None and f is not None:
+                p.save()
+                p.setClipRect(r)
+                _draw_measure(p, self._widget_point(*self._line[0]), self._widget_point(*self._line[1]),
+                              format_length(self.measure_length_um(), 4))
+                p.restore()
+            field, scan = self.info.get("field_um"), self.info.get("scan")
+            if self.show_fov_inset and field and scan is not None:
+                _draw_fov_inset(p, r, float(field), scan)
         else:
             p.setPen(QtGui.QColor(120, 120, 120))
             p.drawText(self.rect().adjusted(0, 0, 0, -BAR_H), QtCore.Qt.AlignCenter, "No image – press Run")
@@ -184,17 +317,32 @@ class SEMImageView(QtWidgets.QWidget):
     # --------------------------------------------------------------- mouse
     def mouseDoubleClickEvent(self, ev):  # noqa: N802
         px = self._to_pixel(ev.position())
-        if px is not None and self._frame is not None:
+        if px is not None and self._frame is not None and not self._measure_mode:
             self.centerRequested.emit(*_pixel_to_field(self._frame.config, *px))
 
     def mousePressEvent(self, ev):  # noqa: N802
-        if ev.button() == QtCore.Qt.LeftButton and self._frame is not None:
-            self._drag = ev.position()
-            self.setCursor(QtCore.Qt.ClosedHandCursor)
+        if ev.button() != QtCore.Qt.LeftButton or self._frame is None:
+            return
+        if self._measure_mode:
+            px = self._to_pixel(ev.position())
+            if px is not None:
+                xy = _pixel_to_field(self._frame.config, *px)
+                self._drawing = True
+                self.set_measure_line(xy, xy)
+            return
+        self._drag = ev.position()
+        self.setCursor(QtCore.Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, ev):  # noqa: N802
         f = self._frame
-        if self._drag is not None and f is not None:
+        if self._drawing and f is not None:
+            r = self.image_rect()
+            pos = QtCore.QPointF(min(max(ev.position().x(), r.left()), r.right() - 1e-6),
+                                 min(max(ev.position().y(), r.top()), r.bottom() - 1e-6))
+            px = self._to_pixel(pos)
+            if px is not None:
+                self.set_measure_line(self._line[0], _pixel_to_field(f.config, *px))
+        elif self._drag is not None and f is not None:
             d = ev.position() - self._drag
             r = self.image_rect()
             if r.width() > 0 and (abs(d.x()) + abs(d.y())) >= 3:
@@ -208,13 +356,21 @@ class SEMImageView(QtWidgets.QWidget):
         self.pointerMoved.emit(None if px is None or f is None else _pixel_to_field(f.config, *px))
 
     def mouseReleaseEvent(self, ev):  # noqa: N802
+        if self._drawing:
+            self._drawing = False
+            if (self.measure_length_um() or 0.0) <= 0.0:
+                self.clear_measure()  # a click without a drag
+            return
         self._drag = None
-        self.unsetCursor()
+        if self._measure_mode:
+            self.setCursor(QtCore.Qt.CrossCursor)
+        else:
+            self.unsetCursor()
 
     def wheelEvent(self, ev):  # noqa: N802
         steps = int(round(ev.angleDelta().y() / 120))
         if steps:
-            self.wheelSteps.emit(steps)
+            self.zoomSteps.emit(steps)
 
     def leaveEvent(self, ev):  # noqa: N802
         self.pointerMoved.emit(None)

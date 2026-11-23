@@ -108,8 +108,9 @@ def test_sem_window_with_microscope(qtbot, bundle, tmp_path):
     mgr = DAQManager(be).open()
     eng = ImagingEngine(mgr, FieldCalibration(100, 10), options=EngineOptions(rate=500e3))
     eng.update(nx=128, ny=96, dwell_s=2e-6)
+    bundle.tie_field([eng], sim_backend=be)
     w = SEMWindow(eng, simulated=True, microscope_bundle=bundle)
-    bundle.follow_magnification([eng], sim_backend=be)
+    assert w.field_scale is bundle.field_scale
     w.save_settings.folder = str(tmp_path)
     qtbot.addWidget(w)
     w.show()
@@ -118,8 +119,20 @@ def test_sem_window_with_microscope(qtbot, bundle, tmp_path):
         qtbot.waitUntil(lambda: w.view.info.get("kv") == "20 kV" and w.view.info.get("wd") == "WD 15 mm",
                         timeout=3000)
         assert "×1k" in w.column.l_mag.text() or "×1000" in w.column.l_mag.text()
-        # the mouse wheel on the image changes the SEM magnification; the field follows
-        w.view.wheelSteps.emit(1)
+        # the mouse wheel zooms the swept range only: the column magnification stays
+        from easyebl.imaging.sem.display import image_magnification
+        w._update_status()
+        m0 = image_magnification(w.view.info["column_mag"], w.view.info["field_um"], eng.config.width_um)
+        assert m0 == pytest.approx(1000 * 100.0 / eng.config.width_um)  # ×1k at the full field
+        w0 = eng.config.width_um
+        w.view.zoomSteps.emit(3)
+        assert eng.config.width_um == pytest.approx(w0 / 2) and bundle.sem.magnification() == 1000
+        w._update_status()
+        m1 = image_magnification(w.view.info["column_mag"], w.view.info["field_um"], eng.config.width_um)
+        assert m1 == pytest.approx(2 * m0)
+        eng.full_field()
+        # the column's own magnification (the column panel); the field follows
+        w.column._call(lambda: bundle.sem.step_magnification(1))
         qtbot.waitUntil(lambda: bundle.sem.magnification() == 1200, timeout=5000)
         qtbot.waitUntil(lambda: abs(eng.calibration.field_size_um - 100.0 / 1.2) < 1e-6, timeout=3000)
         assert be.params.field_size_um == pytest.approx(100.0 / 1.2)  # the simulated SEM zooms too

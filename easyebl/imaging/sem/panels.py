@@ -1,15 +1,19 @@
-"""Control panels of the SEM window (scan, image, beam shift, column)."""
+"""Control panels of the SEM window (scan, capture, image, field of view, column)."""
 from __future__ import annotations
 
+import math
 from typing import Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..engine import RESOLUTIONS, SCAN_SPEEDS, EngineState, ImagingEngine
+from ..engine import RESOLUTIONS, SCAN_SPEEDS, EngineState, ImagingEngine, speed_of
 from ...microscope.control import MicroscopeControl, NotAvailable
 from .display import ContrastBrightness
 
-__all__ = ["ScanPanel", "ImagePanel", "BeamShiftPanel", "ColumnPanel", "CapturePanel"]
+__all__ = ["ScanPanel", "ImagePanel", "FieldOfViewPanel", "ColumnPanel", "CapturePanel", "ZOOM_STEP"]
+
+#: one wheel notch / zoom button: ×2 every three steps
+ZOOM_STEP = 2 ** (1 / 3)
 
 Notify = Callable[[str], None]
 
@@ -29,9 +33,19 @@ def _group(title: str) -> tuple[QtWidgets.QGroupBox, QtWidgets.QGridLayout]:
     return g, lay
 
 
-def _speed_index(dwell_s: float) -> int:
-    best = min(range(len(SCAN_SPEEDS)), key=lambda i: abs(SCAN_SPEEDS[i].dwell_s - dwell_s))
-    return best if abs(SCAN_SPEEDS[best].dwell_s - dwell_s) < 1e-12 else -1
+def _speed_index(cfg) -> int:
+    sp = speed_of(cfg)
+    return -1 if sp is None else SCAN_SPEEDS.index(sp)
+
+
+def _dspin(lo, hi, dec, suffix, step):
+    s = QtWidgets.QDoubleSpinBox()
+    s.setRange(lo, hi)
+    s.setDecimals(dec)
+    s.setSuffix(suffix)
+    s.setSingleStep(step)
+    s.setKeyboardTracking(False)
+    return s
 
 
 # ======================================================================= scan
@@ -59,8 +73,8 @@ class ScanPanel(QtWidgets.QGroupBox):
         lay.addWidget(QtWidgets.QLabel("Speed"), 1, 0)
         self.speed = QtWidgets.QComboBox()
         for s in SCAN_SPEEDS:
-            self.speed.addItem(s.name, s.dwell_s)
-        self.speed.addItem("Custom", None)
+            self.speed.addItem(s.name, s.name)
+        self.speed.addItem("Custom", None)  # a dwell set from the console
         self.speed.activated.connect(self._speed_chosen)
         b_faster = QtWidgets.QToolButton(text="◀")
         b_faster.setToolTip("Faster scan (F3)")
@@ -74,7 +88,7 @@ class ScanPanel(QtWidgets.QGroupBox):
         sp_row.addWidget(b_slower)
         lay.addLayout(sp_row, 1, 1, 1, 2)
 
-        lay.addWidget(QtWidgets.QLabel("Scan size"), 2, 0)
+        lay.addWidget(QtWidgets.QLabel("Pixels"), 2, 0)
         self.res = QtWidgets.QComboBox()
         for w, h in RESOLUTIONS:
             self.res.addItem(f"{w} × {h}", f"{w}x{h}")
@@ -103,7 +117,7 @@ class ScanPanel(QtWidgets.QGroupBox):
         self.sync()
 
     def step_speed(self, step: int):
-        i = _speed_index(self.engine.config.dwell_s)
+        i = _speed_index(self.engine.config)
         if i < 0:
             i = 0
         i = max(0, min(len(SCAN_SPEEDS) - 1, i + step))
@@ -118,7 +132,7 @@ class ScanPanel(QtWidgets.QGroupBox):
 
     def sync(self):
         cfg = self.engine.config
-        i = _speed_index(cfg.dwell_s)
+        i = _speed_index(cfg)
         self.speed.setCurrentIndex(i if i >= 0 else self.speed.count() - 1)
         j = self.res.findData(f"{cfg.nx}x{cfg.ny}")
         self.res.setCurrentIndex(j if j >= 0 else self.res.count() - 1)
@@ -126,9 +140,7 @@ class ScanPanel(QtWidgets.QGroupBox):
             ft = self.engine.frame_time_s()
         except Exception:  # noqa: BLE001
             ft = float("nan")
-        self.info.setText(
-            f"dwell {cfg.actual_dwell_s * 1e6:g} µs · {cfg.samples_per_pixel} samples/px · frame {ft:.3g} s"
-        )
+        self.info.setText(f"frame {ft:.3g} s")
 
     def sync_state(self, st: EngineState):
         if st == EngineState.FREEZING:
@@ -163,7 +175,7 @@ class CapturePanel(QtWidgets.QGroupBox):
         lay.addWidget(QtWidgets.QLabel("Speed"), 1, 0)
         self.speed = QtWidgets.QComboBox()
         for s in SCAN_SPEEDS:
-            self.speed.addItem(s.label(), s.dwell_s)
+            self.speed.addItem(s.label(), s.name)
         self.speed.setCurrentIndex(5)  # Slow 3
         lay.addWidget(self.speed, 1, 1, 1, 2)
         lay.addWidget(QtWidgets.QLabel("Integrate"), 2, 0)
@@ -189,7 +201,7 @@ class CapturePanel(QtWidgets.QGroupBox):
 
     def request(self):
         w, h = (int(v) for v in self.res.currentData().split("x"))
-        self.captureRequested.emit({"nx": w, "ny": h, "dwell_s": self.speed.currentData(),
+        self.captureRequested.emit({"nx": w, "ny": h, "speed": self.speed.currentData(),
                                     "frames": self.frames.value()})
 
 
@@ -271,62 +283,118 @@ class ImagePanel(QtWidgets.QGroupBox):
         self._labels()
 
 
-# ================================================================ beam shift
-class BeamShiftPanel(QtWidgets.QGroupBox):
+# ============================================================== field of view
+class FieldOfViewPanel(QtWidgets.QGroupBox):
+    """Scan size (the swept range: zoom without touching the column), scan position
+    (beam shift) and scan rotation."""
+
     def __init__(self, engine: ImagingEngine, notify: Notify, parent=None):
-        super().__init__("Beam shift", parent)
+        super().__init__("Field of view", parent)
         self.engine = engine
         self.notify = notify
         lay = QtWidgets.QGridLayout(self)
         lay.setContentsMargins(8, 10, 8, 8)
+        lay.setHorizontalSpacing(6)
+
+        # --- size
+        lay.addWidget(QtWidgets.QLabel("Size"), 0, 0)
+        self.size = _dspin(1e-4, 1e7, 3, " µm", 1.0)
+        self.size.setToolTip("Scan width: the swept range.  The wheel on the image zooms (the column "
+                             "magnification is not changed); at most the full field of view.")
+        self.size.valueChanged.connect(lambda v: self._do(self.engine.set_field_of_view, v))
+        lay.addWidget(self.size, 0, 1, 1, 2)
+        row = QtWidgets.QHBoxLayout()
+        for txt, tip, fn in (("−", "zoom out", lambda: self.zoom(-1)), ("+", "zoom in", lambda: self.zoom(+1)),
+                             ("Full", "the whole field of view, centred", lambda: self._do(self.engine.full_field))):
+            b = QtWidgets.QToolButton(text=txt)
+            b.setToolTip(tip)
+            b.setMinimumWidth(28)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            row.addWidget(b)
+        lay.addLayout(row, 0, 3)
+        self.l_zoom = QtWidgets.QLabel()
+        self.l_zoom.setStyleSheet("color:#9aa")
+        lay.addWidget(self.l_zoom, 1, 1, 1, 3)
+
+        # --- position (beam shift)
+        lay.addWidget(QtWidgets.QLabel("Position"), 2, 0)
+        self.px = _dspin(-1e7, 1e7, 3, " µm", 0.1)
+        self.py = _dspin(-1e7, 1e7, 3, " µm", 0.1)
+        self.px.setPrefix("X ")
+        self.py.setPrefix("Y ")
+        self.px.valueChanged.connect(lambda v: self._do(self.engine.set_beam_shift, v, self.engine.config.center_um[1]))
+        self.py.valueChanged.connect(lambda v: self._do(self.engine.set_beam_shift, self.engine.config.center_um[0], v))
+        lay.addWidget(self.px, 2, 1, 1, 2)
+        lay.addWidget(self.py, 3, 1, 1, 2)
         pad = QtWidgets.QGridLayout()
-        pad.setSpacing(2)
+        pad.setSpacing(1)
         for (r, c, txt, dx, dy) in [(0, 1, "▲", 0, 1), (1, 0, "◀", -1, 0), (1, 2, "▶", 1, 0), (2, 1, "▼", 0, -1)]:
             b = QtWidgets.QToolButton(text=txt)
-            b.setFixedSize(30, 26)
+            b.setFixedSize(22, 20)
             b.setAutoRepeat(True)
             b.setAutoRepeatInterval(120)
             b.clicked.connect(lambda _=False, dx=dx, dy=dy: self.step(dx, dy))
             pad.addWidget(b, r, c)
         b0 = QtWidgets.QToolButton(text="●")
-        b0.setFixedSize(30, 26)
-        b0.setToolTip("Reset beam shift")
-        b0.clicked.connect(self.reset)
+        b0.setFixedSize(22, 20)
+        b0.setToolTip("centre the scan (beam shift 0)")
+        b0.clicked.connect(lambda: self._do(self.engine.reset_beam_shift))
         pad.addWidget(b0, 1, 1)
-        lay.addLayout(pad, 0, 0, 3, 1)
-        lay.addWidget(QtWidgets.QLabel("Step"), 0, 1)
+        lay.addLayout(pad, 2, 3, 3, 1)
+        lay.addWidget(QtWidgets.QLabel("Step"), 4, 0)
         self.stepc = QtWidgets.QComboBox()
         for pct in (1, 2, 5, 10, 25):
-            self.stepc.addItem(f"{pct} % of field", pct / 100)
+            self.stepc.addItem(f"{pct} % of size", pct / 100)
         self.stepc.setCurrentIndex(2)
-        lay.addWidget(self.stepc, 0, 2)
-        self.pos = QtWidgets.QLabel()
-        lay.addWidget(self.pos, 1, 1, 1, 2)
-        hint = QtWidgets.QLabel("Drag the image or double-click a point to centre it.")
+        lay.addWidget(self.stepc, 4, 1, 1, 2)
+
+        # --- rotation
+        lay.addWidget(QtWidgets.QLabel("Rotation"), 5, 0)
+        self.rot = _dspin(-180, 180, 2, " °", 1.0)
+        self.rot.setWrapping(True)
+        self.rot.valueChanged.connect(lambda v: self._do(self.engine.set_rotation_deg, v))
+        lay.addWidget(self.rot, 5, 1, 1, 2)
+        b = QtWidgets.QToolButton(text="0°")
+        b.setToolTip("no scan rotation")
+        b.clicked.connect(lambda: self._do(self.engine.set_rotation_deg, 0.0))
+        lay.addWidget(b, 5, 3)
+
+        hint = QtWidgets.QLabel("Image: wheel zooms, drag pans, double-click centres a point.")
         hint.setStyleSheet("color:#9aa")
         hint.setWordWrap(True)
-        lay.addWidget(hint, 2, 1, 1, 2)
+        lay.addWidget(hint, 6, 0, 1, 4)
         self.sync()
+
+    def _do(self, fn, *a):
+        try:
+            fn(*a)
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"error: {e}")
+        self.sync()
+
+    def zoom(self, steps: int):
+        self._do(self.engine.zoom, ZOOM_STEP ** steps)
 
     def step(self, dx, dy):
-        cfg = self.engine.config
-        s = self.stepc.currentData() * cfg.width_um
-        try:
-            self.engine.shift_beam(dx * s, dy * s)
-        except Exception as e:  # noqa: BLE001
-            self.notify(f"error: {e}")
-        self.sync()
-
-    def reset(self):
-        try:
-            self.engine.reset_beam_shift()
-        except Exception as e:  # noqa: BLE001
-            self.notify(f"error: {e}")
-        self.sync()
+        s = self.stepc.currentData() * self.engine.config.width_um
+        self._do(self.engine.shift_beam, dx * s, dy * s)
 
     def sync(self):
-        cx, cy = self.engine.config.center_um
-        self.pos.setText(f"X {cx:+.3f} µm   Y {cy:+.3f} µm")
+        cfg, cal = self.engine.config, self.engine.calibration
+        field = cal.field_size_um
+        dec = max(0, min(4, 3 - int(math.floor(math.log10(max(field, 1e-6))))))
+        for sp, v in ((self.size, cfg.width_um), (self.px, cfg.center_um[0]), (self.py, cfg.center_um[1]),
+                      (self.rot, math.degrees(cfg.rotation_rad))):
+            if sp.hasFocus():
+                continue
+            sp.blockSignals(True)
+            if sp is not self.rot:
+                sp.setDecimals(dec)
+                sp.setSingleStep(10 ** -dec * 10)
+            sp.setValue(v)
+            sp.blockSignals(False)
+        self.size.setMaximum(self.engine.max_width_um())
+        self.l_zoom.setText(f"zoom ×{self.engine.zoom_factor:.3g} of the full field ({field:.4g} µm)")
 
 
 # ================================================================== column

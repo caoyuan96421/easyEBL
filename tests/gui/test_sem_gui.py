@@ -7,6 +7,7 @@ import pytest
 pytest.importorskip("PySide6")
 pytestmark = pytest.mark.gui
 
+from PySide6 import QtCore  # noqa: E402
 from easyebl.core import FieldCalibration  # noqa: E402
 from easyebl.hal import DAQConfig, DAQManager, SimParams, SimulatedBackend  # noqa: E402
 from easyebl.imaging.engine import EngineOptions, EngineState, ImagingEngine  # noqa: E402
@@ -41,10 +42,36 @@ def test_sem_window_live_controls_capture(qtbot, sem, tmp_path):
     w.scan.res.setCurrentIndex(w.scan.res.findData("256x256"))
     w.scan._res_chosen(w.scan.res.currentIndex())
     assert (eng.config.nx, eng.config.ny) == (256, 256)
-    w.shift.step(1, 0)
+    # field of view: the scan starts at the full field; the wheel zooms the swept range
+    # (the widest scan whose pre-line overshoot still fits the AO range: at most the full field)
+    full = eng.max_width_um()
+    w_full = eng.config.width_um
+    assert w_full <= full + 1e-9 and eng.zoom_factor >= 1.0
+    w.view.zoomSteps.emit(3)  # three notches: ×2
+    assert eng.config.width_um == pytest.approx(w_full / 2)
+    w.fov.step(1, 0)
     assert eng.config.center_um[0] > 0
     w.view.centerRequested.emit(0.0, 0.0)
     assert eng.config.center_um == (0.0, 0.0)
+    w.fov.py.setValue(10.0)
+    assert eng.config.center_um[1] == pytest.approx(10.0)
+    w.fov.rot.setValue(30.0)  # the rotated scan must stay inside the AO range: it may shrink
+    assert eng.config.rotation_rad == pytest.approx(np.radians(30.0))
+    w.view.zoomSteps.emit(-20)  # zooming out stops at the full field; the position recentres
+    assert eng.config.width_um <= full + 1e-9
+    w.fov.rot.setValue(0.0)
+    w.fov._do(eng.full_field)
+    assert w_full - 1e-9 <= eng.config.width_um <= full + 1e-9 and eng.config.center_um == (0.0, 0.0)
+    w.fov.size.setValue(full / 4)
+    assert eng.zoom_factor == pytest.approx(4.0)
+    # the data bar: column magnification at the full field × zoom (no column: unknown); the inset
+    w._update_status()
+    assert w.view.info["field_um"] == eng.calibration.field_size_um and w.view.info["scan"][1] == eng.config.width_um
+    from easyebl.imaging.sem.display import display_magnification, image_magnification
+    assert display_magnification(image_magnification(1000, 100.0, 25.0)) == "×4k"
+    assert display_magnification(image_magnification(None, 100.0, 25.0)) == "×—"
+    # speed presets set the line timing (shown in the status bar, not adjustable)
+    assert "pre-line 20 µs" in w.l_timing.text() and "flyback 40 µs" in w.l_timing.text()
     w.auto_contrast()
     lo, hi = w.levels()
     assert hi > lo
@@ -87,19 +114,29 @@ def test_sem_window_run_freeze_cycle(qtbot, sem):
     assert eng.handle.manager.beam_state.blank
 
 
-def test_external_scan_toggle(qtbot, sem):
+def test_external_scan_follows_scanning(qtbot, sem):
+    """No manual switch: scanning claims the SEM's external scan, stopping gives it back."""
     w, eng = sem, sem.engine
     mgr = eng.handle.manager
+    assert mgr.external_control is not True
     w.scan.b_run.click()
     qtbot.waitUntil(lambda: eng.state == EngineState.LIVE, timeout=10000)
-    w.cb_ext.setChecked(True)
     assert mgr.external_control is True and mgr.backend.external_control is True
-    qtbot.waitUntil(lambda: eng.state == EngineState.LIVE, timeout=10000)  # resumed
-    w.cb_ext.setChecked(False)
-    assert mgr.external_control is False and not w.cb_ext.isChecked()
-    w.cb_ext.setChecked(True)
-    w.close()  # closing the SEM window hands the scan back to the SEM
+    w._update_status()
+    assert "EXT SCAN" in w.l_ext.text()
+    eng.update(nx=160, ny=120)  # a restart of the stream keeps it
+    qtbot.waitUntil(lambda: eng.state == EngineState.LIVE, timeout=10000)
+    assert mgr.external_control is True
+    eng.stop()
+    qtbot.waitUntil(lambda: mgr.external_control is False, timeout=5000)
     assert mgr.backend.external_control is False
+    eng.single()
+    qtbot.waitUntil(lambda: mgr.external_control is True, timeout=5000)
+    qtbot.waitUntil(lambda: eng.state == EngineState.FROZEN and mgr.external_control is False, timeout=15000)
+    w.scan.b_run.click()
+    qtbot.waitUntil(lambda: mgr.external_control is True, timeout=5000)
+    w.close()  # closing the SEM window hands the scan back to the SEM
+    qtbot.waitUntil(lambda: mgr.backend.external_control is False, timeout=5000)
 
 
 def test_sem_view_annotated_render():
@@ -158,3 +195,50 @@ def test_saturation_shown_and_input_mode_fix(qtbot):
     finally:
         w.close()
         mgr.close()
+
+
+def test_measure_line_and_global_calibration(qtbot, sem):
+    w, eng = sem, sem.engine
+    fs = w.field_scale
+    assert not fs.from_microscope and fs.magnification == 1000  # no column: the manual magnification
+    assert fs.k_um == pytest.approx(100.0 * 1000)
+    w.scan.b_run.click()
+    qtbot.waitUntil(lambda: w.view.frame() is not None and w.view.frame().complete, timeout=15000)
+    eng.freeze()
+    w.a_measure.setChecked(True)
+    assert w.view.measure_mode
+    # drag a line across the image: its length in field µm
+    v = w.view
+    r = v.image_rect()
+    a, b = QtCore.QPoint(int(r.left() + 0.2 * r.width()), int(r.center().y())), \
+        QtCore.QPoint(int(r.left() + 0.7 * r.width()), int(r.center().y()))
+    c0 = eng.config.center_um
+    qtbot.mousePress(v, QtCore.Qt.LeftButton, pos=a)
+    qtbot.mouseMove(v, b)
+    qtbot.mouseRelease(v, QtCore.Qt.LeftButton, pos=b)
+    length = v.measure_length_um()
+    assert length == pytest.approx(0.5 * v.frame().config.width_um, rel=0.03)
+    assert eng.config.center_um == c0  # measuring does not drag the beam
+    assert w.l_meas.text().startswith("line")
+    # the calibration tab: global value, magnification, field; calibrate with the line
+    w.open_advanced()
+    d = w._adv
+    d._refresh_cal()
+    assert d.mag.isEnabled() and "enter" in d.l_mag_src.text()
+    assert d.b_cal.isEnabled() and d.l_field.text().startswith("100 µm")
+    d.true_len.setValue(round(length * 1.25, 4))
+    d.calibrate_from_line()
+    assert fs.k_um == pytest.approx(125000.0, rel=1e-4)
+    assert eng.calibration.field_size_um == pytest.approx(125.0, rel=1e-4)
+    assert v.measure_length_um() == pytest.approx(length * 1.25, rel=1e-6)  # the line keeps its feature
+    # the frozen image was taken at the old field: no second calibration from it
+    d._refresh_cal()
+    assert not d.b_cal.isEnabled() and "new image" in d.l_line.text()
+    # manual magnification and the global value, through Apply
+    d.mag.setValue(500)
+    d.k_field.setValue(100000.0)
+    d.apply()
+    assert eng.calibration.field_size_um == pytest.approx(200.0)
+    d.close()
+    w.a_measure.setChecked(False)
+    assert v.measure_line() is None and w.l_meas.text() == ""

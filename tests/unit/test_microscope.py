@@ -8,7 +8,7 @@ import pytest
 from easyebl.core import FieldCalibration
 from easyebl.microscope import (MAGNIFICATIONS, POLL, SEM_SET, MicroscopeLink, NotAvailable, SEMControl,
                                 StageControl, StubMicroscope)
-from easyebl.microscope.coupling import FieldFollower
+from easyebl.microscope.coupling import FieldScale
 from easyebl.microscope.s3000 import MotionError
 
 
@@ -224,23 +224,37 @@ class _Target:
         self.calibration = cal
 
 
-def test_field_follows_magnification(mic):
+def test_global_field_calibration_follows_the_magnification(mic, tmp_path):
+    from easyebl.microscope.settings import MicroscopeSettings
+
     link, sem, stage = mic
     eng, eds = _Target(100.0), _Target(80.0)
-    events = link.events.subscribe()
-    f = FieldFollower(sem, [eng, eds])
-    assert f.k_um == pytest.approx(100.0 * 1000)  # adopted from the field at the current ×1k
+    f = FieldScale(sem, [eng, eds])  # in memory: K keeps the present field at the current ×1k
+    assert f.k_um == pytest.approx(100.0 * 1000) and f.from_microscope
+    assert eds.calibration.field_size_um == pytest.approx(100.0)  # every target on K / magnification
     sem.set_magnification(2000).result(10)
     assert eng.calibration.field_size_um == pytest.approx(50.0)
     assert eds.calibration.field_size_um == pytest.approx(50.0)
-    # the field is calibrated by hand at ×2k: K follows
-    eng.calibration = FieldCalibration(60.0, 5.0)
-    f.adopt()
-    assert f.k_um == pytest.approx(120000.0) and eds.calibration.field_size_um == pytest.approx(60.0)
+    assert f.um_per_volt() == pytest.approx(50.0 / 10.0)  # ±5 V full scale
+    # calibrated with a line: measured 10 µm, really 12 µm -> K × 1.2, at every magnification
+    assert f.calibrate(10.0, 12.0) == pytest.approx(1.2)
+    assert f.k_um == pytest.approx(120000.0) and eng.calibration.field_size_um == pytest.approx(60.0)
     sem.set_magnification(500).result(10)
     assert eng.calibration.field_size_um == pytest.approx(240.0)
-    assert any("field" in ev.message for ev in events.drain() if ev.kind == "info")
+    with pytest.raises(ValueError):
+        f.calibrate(0.0, 1.0)
     f.close()
+    # with settings: K and the manual magnification persist; no microscope -> the manual magnification
+    st = MicroscopeSettings(path=str(tmp_path / "m.json"))
+    st.field_at_1x_um = 50000.0
+    g = FieldScale(None, [eng], st)
+    assert not g.from_microscope and g.magnification == 1000 and eng.calibration.field_size_um == pytest.approx(50.0)
+    g.set_manual_magnification(250)
+    assert eng.calibration.field_size_um == pytest.approx(200.0)
+    g.set_k(80000.0)
+    again = MicroscopeSettings.load(st.path)
+    assert again.field_at_1x_um == 80000.0 and again.manual_magnification == 250
+    g.close()
 
 
 def test_beam_presets(mic, tmp_path):
@@ -257,8 +271,10 @@ def test_beam_presets(mic, tmp_path):
               "contrast": 1800, "brightness": 1900}
     n0 = len(sim.received)
     assert sem.apply_preset(preset).result(10)["beam_coarse"] == 60
-    sent = sim.received[n0:]
-    assert sent == ["BEAM C 60", "BEAM F 10", "STG X 2000", "STG Y 2050", "CONT 1800", "BRT 1900"]
+    sent = [c for c in sim.received[n0:] if not c.startswith("R ")]  # (the stigmator is read back)
+    # each stigmator value is written twice: a single one-step write drifts on the S-3000
+    assert sent == ["BEAM C 60", "BEAM F 10", "STG X 2000", "STG X 2000", "STG Y 2050", "STG Y 2050",
+                    "CONT 1800", "BRT 1900"]
     assert {k: sem.state[k] for k in PRESET_KEYS} == {k: preset[k] for k in PRESET_KEYS}
     # a bad or incomplete preset is refused before anything is sent
     n0 = len(sim.received)

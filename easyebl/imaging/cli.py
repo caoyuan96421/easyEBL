@@ -113,7 +113,7 @@ class ImagingShell(cmd.Cmd):
             sp = speed_by_name(a)
             self.engine.set_speed(sp)
         except KeyError:
-            self.engine.set_speed(float(a) * 1e-6)
+            self.engine.update(dwell_s=float(a) * 1e-6)  # a custom dwell (µs)
         c = self.engine.config
         self.say(f"dwell {c.actual_dwell_s * 1e6:g} µs ({c.samples_per_pixel} samples/pixel), "
                  f"frame {self.engine.frame_time_s():.3f} s")

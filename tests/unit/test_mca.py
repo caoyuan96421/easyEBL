@@ -82,8 +82,8 @@ def test_create_pulse_processor():
         create_pulse_processor("sim")
 
 
-def test_speed_presets_and_auto_threshold_leave_the_slow_threshold_alone(dp5):
-    """THSL follows the EDS minimum energy only: no preset or auto threshold writes it."""
+def test_speed_presets_leave_the_slow_threshold_alone(dp5):
+    """THSL follows the EDS minimum energy only: no speed preset writes it."""
     from easyebl.hal.dp5.presets import SHAPING_KEYS, SPEEDS
 
     assert "THSL" not in SHAPING_KEYS and all("THSL" not in s["config"] for s in SPEEDS.values())
@@ -91,9 +91,6 @@ def test_speed_presets_and_auto_threshold_leave_the_slow_threshold_alone(dp5):
     for speed in (1, 5, 3):
         dp5.apply_speed(speed)
         assert float(dp5.get_settings(["THSL"])["THSL"]) == pytest.approx(3.0, abs=0.01)
-    res = dp5.auto_threshold()
-    assert "THFA" in next(iter(res.values())) and "THSL" not in next(iter(res.values()))
-    assert float(dp5.get_settings(["THSL"])["THSL"]) == pytest.approx(3.0, abs=0.01)
 
 
 def test_speed_preset_table():

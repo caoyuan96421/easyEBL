@@ -187,10 +187,13 @@ class RasterPlan:
     order index.  ``line_rows[j]`` is the row scanned as line *j*.
     """
 
-    def __init__(self, cfg: RasterConfig, calibration: FieldCalibration):
+    def __init__(self, cfg: RasterConfig, calibration: FieldCalibration, limit_v: float | None = None):
+        """``limit_v``: the voltage the line ends (pre-line, overscan) may reach (default: the
+        calibration's full scale)."""
         cfg.validate()
         self.cfg = cfg
         self.cal = calibration
+        self.limit_v = limit_v
         self.spp = cfg.samples_per_pixel
         self.n_fb = cfg.n(cfg.flyback_s)
         self.n_pre = cfg.n(cfg.preline_s)
@@ -294,7 +297,7 @@ class RasterPlan:
                 v = float(self._v_of_row(self.line_rows[line]))
                 for col in (col_first, col_last):
                     pts.append(self._to_field(np.array([self._u_of_index(col)]), np.array([v]))[0])
-        self.cal.um_to_volts(np.array(pts))  # raises OutOfFieldError
+        self.cal.um_to_volts(np.array(pts), limit_v=self.limit_v)  # raises OutOfFieldError
 
     # -------------------------------------------------------------- samples
     def line_start_sample(self, frame: int, line: int) -> int:

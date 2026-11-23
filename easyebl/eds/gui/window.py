@@ -91,6 +91,16 @@ class EDSWindow(QtWidgets.QMainWindow):
         self._quant = None
         self._maps: list = []
         self._map_live_t = 0.0
+        # element maps: computed in their own worker, during a map scan too; any change of the
+        # inputs (elements, kind, binning, oxides, calibration) or new pixels triggers a refresh
+        self._maps_pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="easyebl-eds-maps")
+        self._maps_fut = None  # (future, inputs generation, map)
+        self._maps_gen = 0  # incremented on every input change
+        self._maps_done_gen = -1  # generation of the maps shown
+        self._maps_px = -1  # scanned pixels of the maps shown
+        self._maps_t = 0.0  # when the last computation started
+        self._maps_dt = 0.0  # how long it took
+        self._map_running = None  # the SpectrumMap of a running map scan
         self._live_prev = None  # last cumulative partial spectrum of the running job (for the live delta)
         self._live_px = None  # map pixels already counted into the live delta
         self._live_px_t = 0.0
@@ -285,6 +295,13 @@ class EDSWindow(QtWidgets.QMainWindow):
         self._emin_timer.timeout.connect(self.apply_min_energy)
         self.sp_emin.valueChanged.connect(lambda *_: self._emin_timer.start())
         f.addRow("Min. energy", self.sp_emin)
+        self.sp_speed = QtWidgets.QComboBox()
+        self.sp_speed.setToolTip("pulse-processor shaping: 1 = fastest (high count rates, wider peaks) … "
+                                 "5 = best resolution (low count rates).  Written to the processor at once.")
+        self._speed_pending = None
+        self._fill_speeds()
+        self.sp_speed.activated.connect(self._speed_chosen)
+        f.addRow("Processor speed", self.sp_speed)
         hint = QtWidgets.QLabel("Draw a point or area on the image (or select a site), then Acquire. "
                                 "With no site selected the whole image is measured.")
         hint.setWordWrap(True)
@@ -413,6 +430,10 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.l_dead = QtWidgets.QProgressBar()
         self.l_dead.setRange(0, 100)
         self.l_dead.setFormat("dead time %p %")
+        self.l_dead.setAlignment(QtCore.Qt.AlignCenter)
+        self.l_dead.setToolTip("green zone 5–50 %: good count rate; red above 50 %: too much current")
+        self._dead_zone = None
+        self._style_dead(0)
         grid.addWidget(self.l_dead, 1, 0, 1, 3)
         v.addLayout(grid)
         r = QtWidgets.QHBoxLayout()
@@ -438,12 +459,33 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.settings.idle_update_s = float(v)
         self.ctrl.set_idle_interval(float(v))
 
+    #: dead-time bar zones (%): below the green zone the count rate is low; above it, too high
+    DEAD_GREEN = (5, 50)
+
+    def _style_dead(self, pct: int) -> None:
+        """Zones behind the bar (grey < 5 %, green 5–50 %, red > 50 %); the fill takes the colour
+        of the zone the dead time is in."""
+        g0, g1 = (v / 100 for v in self.DEAD_GREEN)
+        zone = 0 if pct < self.DEAD_GREEN[0] else (1 if pct <= self.DEAD_GREEN[1] else 2)
+        if zone == self._dead_zone:
+            return
+        self._dead_zone = zone
+        fill = ("rgba(200,200,200,150)", "rgba(80,200,90,210)", "rgba(240,70,60,220)")[zone]
+        self.l_dead.setStyleSheet(
+            "QProgressBar{border:1px solid #555;border-radius:3px;color:white;font-weight:bold;"
+            "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            f"stop:0 #2a2c30,stop:{g0:.4f} #2a2c30,stop:{g0 + 1e-4:.4f} #1f4d27,stop:{g1:.4f} #1f4d27,"
+            f"stop:{g1 + 1e-4:.4f} #5a1f1f,stop:1 #5a1f1f)}}"
+            f"QProgressBar::chunk{{background:{fill};border-radius:2px}}")
+
     def _show_rates(self, sp: Spectrum):
         if sp is None or sp.real_time <= 0:
             return
         self.l_icr.setText(f"ICR {sp.icr / 1e3:.2f} kcps")
         self.l_ocr.setText(f"OCR {sp.ocr / 1e3:.2f} kcps")
-        self.l_dead.setValue(int(round(100 * min(max(sp.dead_fraction, 0.0), 1.0))))
+        pct = int(round(100 * min(max(sp.dead_fraction, 0.0), 1.0)))
+        self.l_dead.setValue(pct)
+        self._style_dead(pct)
 
     def _live_from_partial(self, sp: Spectrum):
         """During a spectrum acquisition: the live panel shows what arrived since the previous
@@ -553,10 +595,16 @@ class EDSWindow(QtWidgets.QMainWindow):
         f = QtWidgets.QFormLayout(g)
         self.m_kind = QtWidgets.QComboBox()
         self.m_kind.addItems(["Window (fast)", "Fitted (deconvolved)", "Quantitative (wt%)"])
+        self.m_kind.currentIndexChanged.connect(lambda *_: self._maps_changed())
         f.addRow("Maps", self.m_kind)
         self.m_bin = QtWidgets.QSpinBox()
         self.m_bin.setRange(1, 16)
+        self.m_bin.valueChanged.connect(lambda *_: self._maps_changed())
         f.addRow("Binning", self.m_bin)
+        self.m_live = QtWidgets.QCheckBox("Update maps while scanning")
+        self.m_live.setChecked(True)
+        self.m_live.setToolTip("element maps are recomputed about once a second from the pixels scanned so far")
+        f.addRow(self.m_live)
         self.b_maps = QtWidgets.QPushButton("Compute maps")
         self.b_maps.clicked.connect(self.compute_maps)
         f.addRow(self.b_maps)
@@ -619,7 +667,8 @@ class EDSWindow(QtWidgets.QMainWindow):
         f = QtWidgets.QFormLayout(g)
         self.q_oxide = QtWidgets.QCheckBox("oxygen by stoichiometry (oxides)")
         self.q_oxide.setChecked(self.settings.oxygen_by_stoichiometry)
-        self.q_oxide.toggled.connect(lambda on: setattr(self.settings, "oxygen_by_stoichiometry", on))
+        self.q_oxide.toggled.connect(lambda on: (setattr(self.settings, "oxygen_by_stoichiometry", on),
+                                                 self._maps_changed()))
         f.addRow(self.q_oxide)
         b = QtWidgets.QPushButton("Fit && quantify")
         b.clicked.connect(lambda: self.analyse(autoid=False))
@@ -870,7 +919,11 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     # ================================================================ analysis
     def set_elements(self, els):
-        self.elements = sorted(set(els), key=xray.z_of)
+        new = sorted(set(els), key=xray.z_of)
+        changed = new != getattr(self, "elements", None)
+        self.elements = new
+        if changed:
+            self._maps_changed()
         self.el_label.setText(" ".join(self.elements) if self.elements else "–")
         self.specview.set_markers(self.elements, self._kv())
         self.specview.autoscale()
@@ -971,6 +1024,7 @@ class EDSWindow(QtWidgets.QMainWindow):
                     sp.beam_kv = s.beam_kv
         self.specview.set_markers(self.elements, self._kv())
         self._show_e0()
+        self._maps_changed()
 
     # ================================================================ maps
     def _map_elements(self):
@@ -981,36 +1035,86 @@ class EDSWindow(QtWidgets.QMainWindow):
         return list(self.elements)
 
     def compute_maps(self):
-        if self.map is None:
+        """Recompute the element maps now (of the finished map, or of the running one)."""
+        if self.map is None and self._map_running is None:
             self.notify("no map acquired")
             return
-        sm = self.map
-        sm = SpectrumMap(sm.cube, self.ctrl.energy_calibration, sm.region_um, sm.dwell_s, sm.real_time, sm.live_time,
-                         sm.fast_count, sm.se, sm.done, sm.beam_kv, self.ctrl.takeoff_deg, sm.timestamp,
-                         sm.metadata)
+        self._maps_changed()
+        self._update_maps(force=True)
+
+    def _maps_changed(self):
+        """An input of the maps changed: the next refresh recomputes them."""
+        self._maps_gen += 1
+
+    #: live maps: at least this long between two computations (longer if a computation is slow)
+    LIVE_MAPS_S = 1.0
+
+    def _update_maps(self, force: bool = False):
+        """Start a map computation when there is something new: pixels scanned since the
+        maps shown, or changed inputs.  One computation at a time, in its own worker."""
+        if self._maps_fut is not None:
+            return
+        running = self._map_running is not None
+        sm = self._map_running if running else self.map
+        if sm is None or (running and not self.m_live.isChecked() and not force):
+            return
+        px = int(sm.done.sum()) if sm.done is not None else int(np.prod(sm.shape))
+        if px == 0 or (not force and self._maps_gen == self._maps_done_gen and px == self._maps_px):
+            return
+        now = time.monotonic()
+        if running and not force and now - self._maps_t < max(self.LIVE_MAPS_S, 2.0 * self._maps_dt):
+            return
+        done = None if sm.done is None else sm.done.copy()  # the pixels this computation covers
+        sm = SpectrumMap(sm.cube, self.ctrl.energy_calibration, sm.region_um, sm.dwell_s, sm.real_time,
+                         sm.live_time, sm.fast_count, sm.se, done, sm.beam_kv, self.ctrl.takeoff_deg,
+                         sm.timestamp, sm.metadata)
         kind, binning, det = self.m_kind.currentIndex(), self.m_bin.value(), self.detector
-        oxide = self.q_oxide.isChecked()
+        oxide, els0 = self.q_oxide.isChecked(), list(self.elements)
+        cal = self.ctrl.energy_calibration
+        gen = self._maps_gen
 
         def work():
+            t0 = time.perf_counter()
             m = A.bin_map(sm, binning)
-            els = self._map_elements()
+            els = els0
+            if not els:  # nothing selected: AutoID on the sum (once enough counts arrived)
+                s = m.sum_spectrum().with_calibration(cal)
+                els = [i.element for i in A.identify_elements(s, detector=det)] if s.total > 5000 else []
             if not els:
-                return els, []
+                return els, [], time.perf_counter() - t0
             if kind == 0:
                 maps = A.window_maps(m, els, det)
             elif kind == 1:
                 maps, _ = A.fitted_maps(m, els, det)
             else:
                 maps, _ = A.quant_maps(m, els, det, oxygen_by_stoichiometry=oxide)
-            return els, maps
+            if m.done is not None and not m.done.all():
+                for mp in maps:  # pixels not scanned yet: blank
+                    mp.data = np.where(m.done, mp.data, np.nan)
+            return els, maps, time.perf_counter() - t0
 
-        def done(res):
-            els, maps = res
-            if els and not self.elements:
-                self.set_elements(els)
+        self._maps_t = now
+        self._maps_fut = (self._maps_pool.submit(work), gen, px)
+
+    def _maps_poll(self):
+        f = self._maps_fut
+        if f is None or not f[0].done():
+            return
+        self._maps_fut = None
+        fut, gen, px = f
+        try:
+            els, maps, dt = fut.result()
+        except Exception as e:  # noqa: BLE001 - e.g. too few counts for a fit early in a scan
+            if self._map_running is None:
+                self.notify(f"maps failed: {type(e).__name__}: {e}")
+            self._maps_done_gen, self._maps_px = gen, px  # do not retry the same inputs at once
+            return
+        self._maps_dt = dt
+        self._maps_done_gen, self._maps_px = gen, px
+        if els and not self.elements:
+            self.set_elements(els)  # AutoID result (bumps the generation: recomputed with them)
+        if maps:
             self._show_maps(maps)
-
-        self._run_analysis(work, done, "computing maps")
 
     def compute_phases(self):
         if not self._maps:
@@ -1037,14 +1141,29 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     def _show_maps(self, maps):
         self._maps = list(maps)
+        sm = self._map_running if self._map_running is not None else self.map
+        tiles = []
+        if sm is not None and sm.se is not None:
+            se = sm.se if self.m_bin.value() <= 1 else None
+            if se is not None:
+                tiles.append(("SE", np.where(sm.done, se, np.nan) if sm.done is not None else se))
+        tiles += [(m.label, m.data) for m in maps]
+        cur = getattr(self, "_tiles", [])
+        if [t.label for t in cur] == [lbl for lbl, _ in tiles]:  # same maps: new data in place
+            for t, (_, d) in zip(cur, tiles):
+                t.set_data(d)
+            self._refresh_overlay()
+            return
+        self._tiles = []
         while self.maps_grid.count():
             it = self.maps_grid.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
         cols = 4
         tiles = []
-        if self.map is not None and self.map.se is not None:
-            tiles.append(("SE", self.map.se, "V", (220, 220, 220)))
+        if sm is not None and sm.se is not None and self.m_bin.value() <= 1:
+            se = np.where(sm.done, sm.se, np.nan) if sm.done is not None else sm.se
+            tiles.append(("SE", se, "V", (220, 220, 220)))
         for i, m in enumerate(maps):
             col = (255, 255, 255) if m.unit == "phase" else MAP_COLORS[i % len(MAP_COLORS)]
             tiles.append((m.label, m.data, m.unit, col))
@@ -1052,6 +1171,7 @@ class EDSWindow(QtWidgets.QMainWindow):
             t = MapTile(lbl, d, unit, col)
             t.clicked.connect(self._map_pixel)
             self.maps_grid.addWidget(t, i // cols, i % cols)
+            self._tiles.append(t)
         self.m_overlay.blockSignals(True)
         self.m_overlay.clear()
         self.m_overlay.addItem("(no overlay)")
@@ -1059,6 +1179,12 @@ class EDSWindow(QtWidgets.QMainWindow):
             self.m_overlay.addItem(m.label)
         self.m_overlay.blockSignals(False)
         self.bottom.setCurrentWidget(self.maps_area)
+
+    def _refresh_overlay(self):
+        """Live maps: the element overlay on the image follows the new data."""
+        i = self.m_overlay.currentIndex()
+        if i > 0 and self._map_running is None:
+            self._overlay_changed(i)
 
     def _overlay_changed(self, i):
         if i <= 0 or self.map is None:
@@ -1072,9 +1198,9 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.imgview.set_overlay(m.data, region, col)
 
     def _map_pixel(self, row, col):
-        if self.map is None:
+        sm = self._map_running if self._map_running is not None else self.map
+        if sm is None:
             return
-        sm = self.map
         b = self.m_bin.value()
         r0, c0 = row * b, col * b
         mask = np.zeros(sm.shape, bool)
@@ -1146,6 +1272,46 @@ class EDSWindow(QtWidgets.QMainWindow):
         self._calib_dialog = d
         d.show()
 
+    def _fill_speeds(self):
+        """The speed presets, with the one the processor is on selected ("custom" otherwise)."""
+        try:
+            speeds = self.ctrl.mca.speeds()
+            cur = self.ctrl.mca.current_speed()
+        except Exception:  # noqa: BLE001 - a processor without presets
+            speeds, cur = {}, None
+        self.sp_speed.blockSignals(True)
+        self.sp_speed.clear()
+        for k, desc in speeds.items():
+            label = {min(speeds): " – fastest", max(speeds): " – best resolution"}.get(k, "")
+            self.sp_speed.addItem(f"{desc}{label}", k)
+        if cur in speeds:
+            self.sp_speed.setCurrentIndex(self.sp_speed.findData(cur))
+        else:
+            self.sp_speed.addItem("custom (set in the processor dialog)", None)
+            self.sp_speed.setCurrentIndex(self.sp_speed.count() - 1)
+        self.sp_speed.setEnabled(bool(speeds))
+        self.sp_speed.blockSignals(False)
+
+    def _speed_chosen(self, i: int):
+        k = self.sp_speed.itemData(i)
+        if k is None:
+            return
+        if self.ctrl.busy:  # written when the acquisition is done
+            self._speed_pending = k
+            self.notify(f"processor speed {k}: applied after the acquisition")
+            return
+        self._apply_speed(k)
+
+    def _apply_speed(self, k: int):
+        self._speed_pending = None
+        try:
+            now = self.ctrl.set_speed(k)
+            self.notify(f"processor speed {now if now is not None else k} "
+                        "(peak positions are kept; the slow threshold follows Min. energy)")
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            self.notify(f"processor speed not applied: {e}")
+        self._fill_speeds()
+
     def apply_min_energy(self):
         """Write the slow threshold for the minimum energy (deferred while an acquisition runs)."""
         e = float(self.sp_emin.value())
@@ -1165,6 +1331,7 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     def _calibration_applied(self, cal):
         self.ctrl.set_energy_calibration(cal)
+        self._maps_changed()
         self.settings.energy_calibration = cal
         self.settings.calibration_source = f"{self.ctrl.mca.name} {self.ctrl.mca.info().get('serial', '')}"
         self._save_settings()
@@ -1181,7 +1348,8 @@ class EDSWindow(QtWidgets.QMainWindow):
             f"MCA channels {o} → {n}: the energy calibration changed – recalibrate (Tools → Energy calibration)"))
         with self.ctrl.idle_paused():  # the dialog owns the processor while it is open
             d.exec()
-        self.apply_min_energy()  # channels may have changed (or THSL written by hand / auto thresholds)
+        self.apply_min_energy()  # channels may have changed (or THSL written by hand)
+        self._fill_speeds()  # the shaping may have been changed by hand
 
     # ================================================================ files
     def _folder(self):
@@ -1313,6 +1481,10 @@ class EDSWindow(QtWidgets.QMainWindow):
         if job is not None and job.done():
             self._job = None
             self._job_done(job)
+        self._maps_poll()
+        if self._job is None and self._map_running is not None:
+            self._map_running = None  # the map job ended without a result (cancelled / failed)
+        self._update_maps()
         a = self._analysis
         if a is not None and a[0].done():
             self._analysis = None
@@ -1363,6 +1535,11 @@ class EDSWindow(QtWidgets.QMainWindow):
             if sm is not None:
                 self.m_progress.setValue(int(100 * d.get("progress", 0)))
                 self._live_from_map(sm)
+                job = self._job
+                if job is not None and job.kind == "map" and d.get("job") in (None, job.id):
+                    if self._map_running is not sm:
+                        self._map_running = sm
+                        self._maps_changed()
                 if time.monotonic() - self._map_live_t > 1.0 and sm.se is not None:
                     self._map_live_t = time.monotonic()
                     se = np.where(sm.done, sm.se, np.nan)
@@ -1394,6 +1571,7 @@ class EDSWindow(QtWidgets.QMainWindow):
             self.image = res
             self.imgview.set_image(res)
         elif job.kind == "map" and isinstance(res, SpectrumMap):
+            self._map_running = None
             self._map_beam_kv(res)
             self.map = res
             self._map_done(res)
@@ -1402,6 +1580,8 @@ class EDSWindow(QtWidgets.QMainWindow):
             self.map = res
             self._show_linescan(res)
         self.p_job.setValue(1000)
+        if self._speed_pending is not None:
+            self._apply_speed(self._speed_pending)
         if self._emin_pending:
             self.apply_min_energy()
 
@@ -1420,7 +1600,8 @@ class EDSWindow(QtWidgets.QMainWindow):
         oh = sm.metadata.get("overhead_s")
         self.notify(f"map {sm.shape[1]}×{sm.shape[0]}: {int(sm.done.sum())} px, "
                     f"{sm.sum_spectrum().total:,} counts" + (f", overhead {oh * 1e3:.0f} ms/px" if oh else ""))
-        self.compute_maps()
+        self._maps_changed()  # final maps of the whole scan (E0 from its sum spectrum)
+        self._update_maps(force=True)
 
     def _update_status(self):
         st = self.ctrl.idle_state
@@ -1449,6 +1630,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         if self.ctrl.busy:
             self.ctrl.cancel()
         self._pool.shutdown(wait=False, cancel_futures=True)
+        self._maps_pool.shutdown(wait=False, cancel_futures=True)
         self._sub.close()
         if self.owns_controller:
             self.ctrl.close()

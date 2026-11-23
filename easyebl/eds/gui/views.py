@@ -125,13 +125,13 @@ class SpectrumView(pg.PlotWidget):
                 for ln in xray.lines(el, fam, kv, min_weight=0.05):
                     item = pg.PlotCurveItem([ln.energy, ln.energy], [0, 1], pen=pg.mkPen(col, width=1.2))
                     item._weight = ln.weight
-                    self.addItem(item)
+                    self.addItem(item, ignoreBounds=True)  # sized from the view: must not drive auto-range
                     self._markers.append(item)
                 main = xray.main_line(el, fam)
                 if main is not None and main.energy < kv:
                     t = pg.TextItem(f"{el} {fam}", color=col, anchor=(0.5, 1.0))
                     t._energy = main.energy
-                    self.addItem(t)
+                    self.addItem(t, ignoreBounds=True)
                     self._labels.append(t)
         self._place_labels()
 
@@ -358,19 +358,28 @@ class MapTile(QtWidgets.QFrame):
         self.img = pg.ImageItem()
         self.vb.addItem(self.img)
         lay.addWidget(self.gw)
-        self.data = np.asarray(data, float)
         self.color = color
-        d = np.nan_to_num(self.data)
-        hi = np.percentile(d, 99.5) if d.size else 1.0
-        lo = min(0.0, float(np.percentile(d, 0.5)))
-        lut = np.zeros((256, 3), np.ubyte)
+        self.label, self.unit = label, unit
+        self._lut = np.zeros((256, 3), np.ubyte)
         t = np.linspace(0, 1, 256)
         for i in range(3):
-            lut[:, i] = (t * color[i]).astype(np.ubyte)
-        self.img.setImage(d[::-1], levels=(lo, hi if hi > lo else lo + 1), lut=lut)
-        self.vb.autoRange(padding=0)
+            self._lut[:, i] = (t * color[i]).astype(np.ubyte)
+        self.data = np.zeros((1, 1))
+        self.set_data(data)
         self.setMinimumSize(150, 150)
         self.gw.scene().sigMouseClicked.connect(self._click)
+
+    def set_data(self, data: np.ndarray) -> None:
+        """New values (a running map: pixels not scanned yet are NaN and stay black)."""
+        new_shape = np.shape(data) != self.data.shape
+        self.data = np.asarray(data, float)
+        fin = self.data[np.isfinite(self.data)]
+        hi = float(np.percentile(fin, 99.5)) if fin.size else 1.0
+        lo = min(0.0, float(np.percentile(fin, 0.5))) if fin.size else 0.0
+        d = np.where(np.isfinite(self.data), self.data, lo)
+        self.img.setImage(d[::-1], levels=(lo, hi if hi > lo else lo + 1), lut=self._lut)
+        if new_shape:
+            self.vb.autoRange(padding=0)
 
     def _click(self, ev):
         p = self.vb.mapSceneToView(ev.scenePos())

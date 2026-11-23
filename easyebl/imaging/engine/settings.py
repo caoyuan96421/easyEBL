@@ -17,6 +17,7 @@ __all__ = [
     "RESOLUTIONS",
     "EngineOptions",
     "speed_by_name",
+    "speed_of",
     "valid_rates",
     "AI_RANGES_V",
 ]
@@ -24,12 +25,24 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ScanSpeed:
+    """A scan speed preset: the pixel dwell and the line / frame timing that goes with it.
+    These are not user knobs – choosing a speed sets all of them."""
+
     name: str
     dwell_s: float  # pixel dwell time
+    preline_s: float = 20e-6  # lead-in before the first pixel of a line
+    flyback_s: float = 40e-6  # blanked return to the line start
+    frame_settle_s: float = 200e-6  # blanked wait at the first line of a frame
+    settle_samples: int = 0  # samples discarded at the start of every pixel
 
     def label(self) -> str:
         d = self.dwell_s * 1e6
         return f"{self.name}  ({d:g} µs)"
+
+    def fields(self) -> dict:
+        """The RasterConfig fields this preset sets."""
+        return {"dwell_s": self.dwell_s, "preline_s": self.preline_s, "flyback_s": self.flyback_s,
+                "frame_settle_s": self.frame_settle_s, "settle_samples": self.settle_samples}
 
 
 #: Commercial-SEM-like speed ladder: TV (live focusing) → fast → slow → photo.
@@ -60,6 +73,14 @@ RESOLUTIONS: tuple = (
 #: Input ranges of the X-series AI (±V); a range matching the video swing uses
 #: the full 16-bit resolution.
 AI_RANGES_V: tuple = (10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1)
+
+
+def speed_of(cfg) -> ScanSpeed | None:
+    """The preset whose dwell the scan uses (None: a custom dwell)."""
+    for s in SCAN_SPEEDS:
+        if abs(s.dwell_s - cfg.dwell_s) < 1e-12:
+            return s
+    return None
 
 
 def speed_by_name(name: str) -> ScanSpeed:
@@ -108,6 +129,8 @@ class EngineOptions:
     publish_hz: float = 20.0
     restart_on_change: bool = True
     auto_recover: bool = True
+    # switch the SEM to external (DAQ) scan while scanning and give the scan back when stopped
+    auto_external_control: bool = True
     max_recoveries: int = 5  # consecutive failed (re)starts before giving up
     device_timeout_s: float = 2.0  # wait for another module's stream to finish
     # Python hands the GIL between threads every "switch interval" (default 5 ms).  The scan

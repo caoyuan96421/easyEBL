@@ -60,8 +60,8 @@ microscope, whether it is connected (green), simulated (blue), waiting or needin
   vector and GDS lithography, the dose calculator, alignment, the raster debug GUI and HAL debug.
   A subsystem whose hardware is missing is greyed out (the tooltip says why).
 * **Hardware → Configure…** chooses each device and its address: NI-DAQmx device name or the
-  simulator, wiring preset or a DAQConfig JSON, start field, sample clock, buffer latency, video
-  input mode; DP5 (USB), its mock device or none; the microscope's serial port (listed), the
+  simulator, wiring preset or a DAQConfig JSON, scan orientation (invert / swap X/Y), sample clock,
+  buffer latency, video input mode; DP5 (USB), its mock device or none; the microscope's serial port (listed), the
   simulator or none, and the baud rate.  *Apply & reconnect* saves it to
   `%APPDATA%\easyEBL\system.json` and reconnects; *All simulators* fills in the simulators.
   **Reconnect all** reopens everything with the same settings.
@@ -107,17 +107,42 @@ report = LithoWriter(mgr.get_handle("litho"), cal).expose(pattern, params, trans
 Open → *SEM imaging*.  The window looks and works like a commercial SEM screen:
 
 * **Run / Freeze** (F5): Freeze finishes the frame; press again to stop at once. **Single** (F6).
-* **Speed**: TV · Fast 1–2 · Slow 1–3 · Photo 1–3 (0.5–160 µs per pixel; F3/F4 step faster or slower). **Scan size**: 320×240 to 2560×1920.
+* **Speed**: TV · Fast 1–2 · Slow 1–3 · Photo 1–3 (0.5–160 µs per pixel; F3/F4 step faster or slower). A
+  speed preset also sets the pre-line, flyback and settling times; they are shown in the status bar, not
+  adjustable. **Pixels**: 320×240 to 2560×1920.
 * **Capture** (F9): photo scan at its own size, speed and integration. Saved automatically as a 16‑bit TIFF (raw volts), a PNG, a PNG with the data bar, and JSON metadata.
 * **Contrast / Brightness**, **Auto C/B** (Ctrl+A, one-shot or continuous), and running **averaging**.
-* **Beam shift**: arrow pad, drag the image, or double-click a point to centre it. It is clamped to the field.
-* **Data bar** with the scale bar, field magnification and date. There is also a scan-line marker during slow scans.
-* **Magnification, focus/WD, stigmation, gun alignment** go to the SEM over RS-232; the
-  mouse wheel on the image steps the magnification and the field calibration follows it (see
-  [Microscope](#microscope-hitachi-s-3000-rs-232)).  The data bar shows the SEM's kV and WD, and captures
+* **Field of view** group: **size** (the swept range), **position** (beam shift) and **rotation**.  The
+  mouse wheel on the image zooms by changing the swept range (×2 per three notches; Ctrl+± / Ctrl+0) – the
+  column magnification is never touched; zooming out stops at the full field of view.  Drag the image to
+  pan, double-click a point to centre it.  The inset in the lower-left corner shows the scanned region
+  within the full field.
+* **Measure** (toolbar, M): drag a line on the image; its length is shown on the line and, with Δx, Δy
+  and the angle, in the status bar.  While measuring, dragging draws instead of panning.  The line is
+  kept in field µm, so it stays on its feature while the scan pans or zooms; switching Measure off
+  removes it.
+* **Data bar** with the scale bar, the image magnification (the column's magnification is that of the
+  full field of view; zooming in multiplies it by full field / scan width) and date. There is also a
+  scan-line marker during slow scans.
+* **Magnification, focus/WD, stigmation, gun alignment** go to the SEM over RS-232 (the Column group); the
+  field follows the column magnification (see *Field calibration* below).  The data bar shows the SEM's kV and WD, and captures
   store the column and stage readbacks in their metadata.  **Microscope…** opens the stage window.
-* **Advanced…**: sample rate, buffer/latency, video input range, flyback, pre-line, settle, lag compensation, field calibration, and save options.
-* **External scan** (toolbar) switches the SEM between its own scan and this program (HAL external control).
+* **External scan is automatic**: scanning switches the SEM to the DAQ's X/Y, stopping (freeze, single
+  frame done, stop) gives the scan back to the SEM.  The status bar shows *EXT SCAN* while it is claimed.
+* **Deflection range**: the full field of view is ±`scan_limit_v`; every waveform sample – pre-line
+  overshoot, flyback, rotated corners – must stay within ±`ao_limit_v`.  On the 6363 both are ±10 V (DAQmx
+  refuses AO samples beyond ±10 V; the DAC itself ends at ±10.1 V), so a scan whose pre-line or rotation
+  would leave the range is narrowed to the widest that fits (zoom readout slightly above ×1).
+* **Advanced…**: sample rate, buffer/latency, video input range, serpentine scan, pre-line mode, blank
+  during pre-line, flyback shape, lag compensation, field calibration, and save options.
+* **Field calibration** is global – one value for every magnification: `K`, the field the full
+  deflection range sweeps at a hypothetical ×1 (shown also as µm/V).  The field at magnification M is
+  `K / M`.  *Advanced… → Calibration* shows `K`, the magnification (from the SEM; entered by hand while
+  the SEM does not report one) and the resulting field and µm/V.  To calibrate, draw a measuring line
+  across a feature of known size, enter its real length and press *Calibrate*: `K` is scaled by
+  real / measured.  `K` and the manual magnification are kept in `%APPDATA%\easyEBL\microscope.json`
+  (in memory only with the simulators).  The scan orientation (invert / swap X/Y) is wiring and is set in
+  *Hardware → Configure…*.
 
 The engine can also be driven by text commands from Python
 (`easyebl.imaging.cli.ImagingShell(engine).run_commands("run; wait frames=5; capture shot frames=2")`).
@@ -179,10 +204,14 @@ elements are identified (AutoID, or pick them on the periodic table) and quantif
 (standardless ZA, optional oxygen by stoichiometry).  Draw a map area or a line for spectrum
 maps and line scans; maps can be shown as window, fitted (deconvolved) or quantitative
 (wt %) maps and clustered into phases.  Spectra save as EMSA `.msa`, maps as `.npz`.
-**Tools → Energy calibration** fits channel → keV from the peaks of a standard (Cu L + Cu Kα,
-Al + Cu, Mn Kα/Kβ …; auto-assigned or clicked), reports residuals and the detector FWHM, and
-stores the result per user.  **Tools → Pulse processor** sets the DP5 shaping preset and
-parameters.
+Element maps are computed **while the map scans** (about once a second, from the pixels
+scanned so far; unscanned pixels stay blank) and follow any change of the elements, map type,
+binning or oxide mode – during the scan and after it.
+**Tools → Energy calibration**: linear offset + slope, editable, or fitted from peaks you mark
+in calibration spectra and name on the periodic table (the pairs are kept across spectra).
+The DP5 **speed** (1 fastest … 5 best resolution) is a combo box in the Acquire tab, written as
+soon as it is chosen; **Tools → Pulse processor** is only for setting raw DP5 parameters by
+hand.  The live panel's dead-time bar shows the good range (5–50 %) in green, above it red.
 
 **Sharing the DAQ:** every EDS job takes the HAL's *exclusive lease*: the live SEM image pauses
 (state `PAUSED`), the SEM is switched to external scan for the job, and imaging resumes by
@@ -198,8 +227,8 @@ USB-6363 + DP5 the overhead is ≈ 22 ms per pixel (64×48 at 50 ms dwell ≈ 3.
 
 **DP5 notes (FW 6.10.02):** a preset real time stops counting and sets "preset done" but leaves
 "MCA enabled" set (the HAL disables it before read-and-clear).  If the factory fast threshold
-(`THFA` 30) misses pulses (ICR < OCR), run *Auto thresholds* with the beam off; the live time is
-clamped to the real time meanwhile.
+(`THFA` 30) misses pulses (ICR < OCR), raise or lower `THFA` in the pulse-processor dialog; the
+live time is clamped to the real time meanwhile.
 
 ## Microscope (Hitachi S-3000, RS-232)
 
@@ -230,10 +259,9 @@ S-3000. On top of it:
   it decides about motor power).  Positions are still read – each read sends `#STAGE ON`, the query
   and `#STAGE OFF`.  `engage()` (`#STAGE ON`) gives easyEBL the stage for moves; `release()` stops
   any move and hands it back.
-* **Wiring.** Imaging and EDS use the column through `MicroscopeControl`.  The DAQ field follows the
-  magnification as `field = K / magnification`.  `K` is learnt from the current field calibration
-  the first time and re-learnt when the field is calibrated in *Advanced…*; it is stored in
-  `%APPDATA%\easyEBL\microscope.json`.  Zooming keeps the scan's share of the field.  EDS takes the
+* **Wiring.** Imaging and EDS use the column through `MicroscopeControl`.  `FieldScale`
+  (`microscope/coupling.py`) keeps the DAQ field at `K / magnification` (the global field calibration,
+  see the SEM window); zooming keeps the scan's share of the field.  EDS takes the
   SEM's kV as the nominal beam energy, and spectra and images carry the column and stage readbacks.
 * The window: HV, magnification, focus / WD, stigmator, condenser and SEM display on the left; on
   the right a big **STOP ALL** (also *Esc*), the **Enable / Disable** button (easyEBL or the SEM PC
@@ -357,5 +385,6 @@ EASYEBL_HW_DRY_RUN=1 pytest tests/hardware    # check the tests on the mock DP5 
   the device, and easyEBL warns when that happens.
 * Fit a hardware **blanker watchdog** (blank unless a heartbeat is present). Software cannot
   guarantee blanking if the host stalls mid‑stream.
-* The S‑3000N DBC input is scaled by the SEM magnification. Calibrate `FieldCalibration` for
-  each magnification you write at, and match the voltage range to the SEM's own X‑OUT/Y‑OUT signals.
+* The S‑3000N DBC input is scaled by the SEM magnification.  easyEBL assumes field = K / magnification
+  with one `K`; check the calibration at the magnifications you write at (the SEM's own magnification
+  steps may not be exactly proportional), and match the voltage range to the SEM's X‑OUT/Y‑OUT signals.

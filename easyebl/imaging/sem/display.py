@@ -4,11 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-__all__ = ["ContrastBrightness", "nice_scale_bar", "format_length", "display_magnification"]
-
-#: Polaroid / 4×5" convention: magnification refers to a 127 mm wide image.
-REFERENCE_WIDTH_UM = 127_000.0
-
+__all__ = ["ContrastBrightness", "nice_scale_bar", "format_length", "display_magnification", "image_magnification"]
 
 @dataclass
 class ContrastBrightness:
@@ -57,21 +53,29 @@ def nice_scale_bar(width_um: float, fraction: float = 0.2) -> float:
     return float(best or 10**exp)
 
 
-def format_length(um: float) -> str:
+def format_length(um: float, digits: int = 6) -> str:
+    """A length with its unit (nm / µm / mm), at most *digits* significant figures."""
     if um >= 1000:
-        return f"{um / 1000:g} mm"
+        return f"{um / 1000:.{digits}g} mm"
     if um >= 1:
-        return f"{um:g} µm"
-    return f"{um * 1000:g} nm"
+        return f"{um:.{digits}g} µm"
+    return f"{um * 1000:.{digits}g} nm"
 
 
-def display_magnification(width_um: float) -> str:
-    """Magnification of the scan field on the 127 mm reference width ("×1.5k")."""
-    if width_um <= 0:
+def image_magnification(column_mag: float | None, field_um: float | None, width_um: float) -> float | None:
+    """Magnification of the image: the column's magnification is that of the full field of view;
+    a narrower sweep zooms in from there (column × field / scan width)."""
+    if not column_mag or not field_um or width_um <= 0:
+        return None
+    return float(column_mag) * float(field_um) / float(width_um)
+
+
+def display_magnification(mag: float | None) -> str:
+    """"×1.5k"-style text of a magnification (None: unknown)."""
+    if not mag or mag <= 0:
         return "×—"
-    m = REFERENCE_WIDTH_UM / width_um
-    if m >= 1e5:
-        return f"×{m / 1e3:.0f}k"
-    if m >= 1e3:
-        return f"×{m / 1e3:.1f}k"
-    return f"×{m:.0f}"
+    if mag >= 1e5:
+        return f"×{mag / 1e3:.0f}k"
+    if mag >= 1e3:
+        return f"×{mag / 1e3:.3g}k"
+    return f"×{mag:.3g}"

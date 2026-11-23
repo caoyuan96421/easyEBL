@@ -91,7 +91,7 @@ class StreamProgram:
         if src is None:
             if len(self._cache) > 4:  # bounded: only recent layouts are kept
                 self._cache.clear()
-            src = FrameSource(RasterPlan(cfg, cal or self.cal))
+            src = FrameSource(RasterPlan(cfg, cal or self.cal, limit_v=self.engine.ao_limit_v))
             self._cache[key] = src
         return src
 

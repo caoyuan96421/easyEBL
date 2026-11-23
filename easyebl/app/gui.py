@@ -150,13 +150,6 @@ class HardwareDialog(QtWidgets.QDialog):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.daq_file, 1)
         row.addWidget(b)
-        self.daq_field = QtWidgets.QDoubleSpinBox()
-        self.daq_field.setRange(0.01, 1e6)
-        self.daq_field.setDecimals(2)
-        self.daq_field.setSuffix(" µm")
-        self.daq_field.setValue(d.field_um)
-        self.daq_field.setToolTip("field covered by the full deflection range (follows the magnification "
-                                  "when the microscope is connected)")
         self.daq_rate = QtWidgets.QDoubleSpinBox()
         self.daq_rate.setRange(0, 10000)
         self.daq_rate.setDecimals(0)
@@ -178,7 +171,6 @@ class HardwareDialog(QtWidgets.QDialog):
         f.addRow("NI device name", self.daq_device)
         f.addRow("Wiring", self.daq_preset)
         f.addRow("Config file", row)
-        f.addRow("Field at start", self.daq_field)
         f.addRow("Sample clock", self.daq_rate)
         f.addRow("Buffer latency", self.daq_latency)
         f.addRow("Video input", self.daq_ai)
@@ -293,7 +285,6 @@ class HardwareDialog(QtWidgets.QDialog):
         b = self._base
         daq = replace(b.daq, backend=self.daq_backend.currentData(), device=self.daq_device.text().strip() or "Dev1",
                       preset=self.daq_preset.currentData(), config_file=self.daq_file.text().strip(),
-                      field_um=float(self.daq_field.value()),
                       rate=(self.daq_rate.value() * 1e3) or None, latency_ms=float(self.daq_latency.value()),
                       ai_terminal=self.daq_ai.currentData(), invert_x=self.daq_inv_x.isChecked(),
                       invert_y=self.daq_inv_y.isChecked(), swap_xy=self.daq_swap.isChecked())

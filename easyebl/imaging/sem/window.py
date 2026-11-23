@@ -1,17 +1,18 @@
 """The SEM main window."""
 from __future__ import annotations
 
+import math
 import os
 import time
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..engine import SATURATION_WARN, EngineState, ImagingEngine
+from ..engine import SATURATION_WARN, EngineState, ImagingEngine, speed_by_name, speed_of
 from ..export import auto_levels, save_frame
 from .advanced import AdvancedDialog, SaveSettings
 from .display import ContrastBrightness, format_length
 from ...microscope.control import MicroscopeControl, StubMicroscope
-from .panels import BeamShiftPanel, CapturePanel, ColumnPanel, ImagePanel, ScanPanel
+from .panels import CapturePanel, ColumnPanel, FieldOfViewPanel, ImagePanel, ScanPanel
 from .view import SEMImageView, render_annotated
 
 __all__ = ["SEMWindow", "apply_dark_theme"]
@@ -82,13 +83,19 @@ class SEMWindow(QtWidgets.QMainWindow):
         # magnification ↔ field coupling; a bare MicroscopeControl only the column
         self.bundle = microscope_bundle
         self.mic = microscope or (microscope_bundle.sem if microscope_bundle is not None else StubMicroscope())
+        # the global field calibration (field = K / magnification): the bundle's, else one of our own
+        self.field_scale = getattr(microscope_bundle, "field_scale", None)
+        self._own_scale = self.field_scale is None
+        if self._own_scale:
+            from ...microscope.coupling import FieldScale
+
+            self.field_scale = FieldScale(self.mic, [engine])
         self.save_settings = SaveSettings(folder=os.path.join(os.getcwd(), "captures"))
         self.cb = ContrastBrightness(ai_range_v=self._ai_range())
         self._last_seq = 0
         self._capture_future = None
         self._acb_pending = True  # auto contrast on the first image
         self._adv: AdvancedDialog | None = None
-        self._relay = None
         self._disp_times: list = []
         self._sub = engine.subscribe(maxlen=200)
 
@@ -97,12 +104,12 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.scan = ScanPanel(engine, self.notify)
         self.capture = CapturePanel()
         self.image = ImagePanel(engine, self.cb, self.notify)
-        self.shift = BeamShiftPanel(engine, self.notify)
+        self.fov = FieldOfViewPanel(engine, self.notify)
         self.column = ColumnPanel(self.mic, self.notify)
         side = QtWidgets.QWidget()
         sl = QtWidgets.QVBoxLayout(side)
         sl.setContentsMargins(4, 4, 4, 4)
-        for w in (self.scan, self.capture, self.image, self.shift, self.column):
+        for w in (self.scan, self.capture, self.image, self.fov, self.column):
             sl.addWidget(w)
         self.b_adv = QtWidgets.QPushButton("Advanced…")
         self.b_adv.clicked.connect(self.open_advanced)
@@ -140,8 +147,9 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.capture.saveRequested.connect(self.save_dialog)
         self.view.centerRequested.connect(self._center_at)
         self.view.shiftDragged.connect(self._drag_shift)
-        self.view.wheelSteps.connect(lambda n: self.column._call(lambda: self.mic.step_magnification(n)))
+        self.view.zoomSteps.connect(self.fov.zoom)  # the swept range – never the column magnification
         self.view.pointerMoved.connect(self._pointer)
+        self.view.measureChanged.connect(self._measure_changed)
 
         self.timer = QtCore.QTimer(self)
         self.timer.setTimerType(QtCore.Qt.PreciseTimer)
@@ -160,20 +168,24 @@ class SEMWindow(QtWidgets.QMainWindow):
         tb = self.addToolBar("Main")
         tb.setObjectName("main")
         tb.setMovable(False)
-        self.cb_ext = QtWidgets.QCheckBox("External scan")
-        self.cb_ext.setToolTip("On: the SEM takes its scan from this program (HAL external control). "
-                               "Off: the SEM's own scan and controls work as usual.")
-        self.cb_ext.setVisible(self.engine.handle.has_external_control)
-        self.cb_ext.toggled.connect(self.set_external_scan)
-        tb.addWidget(self.cb_ext)
-        tb.addSeparator()
         a = tb.addAction("Crosshair")
         a.setCheckable(True)
         a.toggled.connect(lambda on: (setattr(self.view, "show_crosshair", on), self.view.update()))
+        self.a_measure = a = tb.addAction("Measure")
+        a.setCheckable(True)
+        a.setShortcut(QtGui.QKeySequence("M"))
+        a.setToolTip("drag on the image to measure a distance (M); the line can calibrate the field "
+                     "(Advanced… → Calibration)")
+        a.toggled.connect(self._measure_mode)
         a = tb.addAction("Scan line")
         a.setCheckable(True)
         a.setChecked(True)
         a.toggled.connect(lambda on: setattr(self.view, "show_scan_line", on))
+        a = tb.addAction("Field inset")
+        a.setCheckable(True)
+        a.setChecked(True)
+        a.setToolTip("lower-left corner: the scanned region within the full field of view")
+        a.toggled.connect(lambda on: (setattr(self.view, "show_fov_inset", on), self.view.update()))
         tb.addSeparator()
         tb.addAction("Advanced…", self.open_advanced)
         if self.bundle is not None and self.bundle.connected:
@@ -184,11 +196,19 @@ class SEMWindow(QtWidgets.QMainWindow):
     def _make_status(self):
         sb = self.statusBar()
         self.l_state = QtWidgets.QLabel()
+        self.l_ext = QtWidgets.QLabel()
+        self.l_ext.setToolTip("the SEM's scan source: switched to the DAQ while scanning, back when stopped")
         self.l_fps = QtWidgets.QLabel()
         self.l_buf = QtWidgets.QLabel()
         self.l_pix = QtWidgets.QLabel()
+        self.l_timing = QtWidgets.QLabel()
+        self.l_timing.setStyleSheet("color:#9aa")
+        self.l_timing.setToolTip("set by the scan speed preset")
         self.l_ptr = QtWidgets.QLabel()
-        for w in (self.l_state, self.l_fps, self.l_buf, self.l_pix):
+        self.l_meas = QtWidgets.QLabel()
+        self.l_meas.setStyleSheet("color:#fd0")
+        sb.addWidget(self.l_meas)
+        for w in (self.l_state, self.l_ext, self.l_fps, self.l_buf, self.l_pix, self.l_timing):
             sb.addPermanentWidget(w)
             w.setContentsMargins(6, 0, 10, 0)
         sb.addPermanentWidget(self.l_ptr, 1)
@@ -209,7 +229,11 @@ class SEMWindow(QtWidgets.QMainWindow):
         sc("Ctrl+A", self.auto_contrast)
         sc("Esc", lambda: self.engine.stop())
         for key, dx, dy in (("Shift+Left", -1, 0), ("Shift+Right", 1, 0), ("Shift+Up", 0, 1), ("Shift+Down", 0, -1)):
-            sc(key, lambda dx=dx, dy=dy: self.shift.step(dx, dy))
+            sc(key, lambda dx=dx, dy=dy: self.fov.step(dx, dy))
+        sc("Ctrl++", lambda: self.fov.zoom(+1))
+        sc("Ctrl+=", lambda: self.fov.zoom(+1))
+        sc("Ctrl+-", lambda: self.fov.zoom(-1))
+        sc("Ctrl+0", lambda: self.fov._do(self.engine.full_field))
 
     # ---------------------------------------------------------------- helpers
     def _ai_range(self) -> float:
@@ -241,7 +265,8 @@ class SEMWindow(QtWidgets.QMainWindow):
                 self.scan.sync_state(EngineState(ev.data.get("state", "idle")))
             elif ev.kind == "settings":  # also changes made by the console / scripts
                 self.scan.sync()
-                self.shift.sync()
+                self.fov.sync()
+                self._sync_view_info()
                 if ev.data.get("changes", {}).get("averaging") is not None:
                     self.image.avg.blockSignals(True)
                     self.image.avg.setValue(self.engine.options.averaging)
@@ -289,18 +314,23 @@ class SEMWindow(QtWidgets.QMainWindow):
             stall += " <b style='color:#f55'>DAQ DISCONNECTED – reconnecting…</b>"
         if s.saturation > SATURATION_WARN:
             stall += f" <b style='color:#f55'>VIDEO SATURATED {s.saturation:.0%}</b>"
-        if self._relay is not None or self.cb_ext.isChecked():
+        if self.engine.handle.has_external_control:
             ext = self.engine.handle.manager.external_control
-            if bool(ext) != self.cb_ext.isChecked() and ext is not None:
-                self.cb_ext.blockSignals(True)
-                self.cb_ext.setChecked(bool(ext))
-                self.cb_ext.blockSignals(False)
+            self.l_ext.setText("<b style='color:#4c4'>EXT SCAN</b>" if ext else
+                               ("<span style='color:#999'>SEM scan</span>" if ext is False else "scan ?"))
         self.l_buf.setText(f"{s.rate / 1e6:g} MS/s · buffer {s.latency_s * 1e3:.0f} ms{health}{warn}{stall}")
         c = self.engine.config
-        self.l_pix.setText(f"{c.nx}×{c.ny} · field {format_length(c.width_um)} · "
+        self.l_pix.setText(f"{c.nx}×{c.ny} · size {format_length(c.width_um)} · "
                            f"pixel {format_length(c.pixel_size_um[0])}")
+        sp = speed_of(c)
+        self.l_timing.setText(f"{sp.name if sp else 'custom'}: dwell {c.actual_dwell_s * 1e6:g} µs "
+                              f"({c.samples_per_pixel} samples) · pre-line {c.preline_s * 1e6:g} µs · "
+                              f"flyback {c.flyback_s * 1e6:g} µs · frame settle {c.frame_settle_s * 1e6:g} µs · "
+                              f"pixel settle {c.settle_samples}")
         self.column.sync()
+        self.fov.sync()
         self._sync_microscope_info()
+        self._sync_view_info()
 
     def _sync_microscope_info(self):
         """Data bar: accelerating voltage and working distance from the microscope (when known)."""
@@ -312,6 +342,46 @@ class SEMWindow(QtWidgets.QMainWindow):
             info["kv"], info["wd"] = new_kv, new_wd
             self.view.update()
 
+    def _sync_view_info(self):
+        """Image magnification (column × full field / scan width) and the field inset."""
+        c, cal = self.engine.config, self.engine.calibration
+        info = self.view.info
+        new = {"column_mag": self.field_scale.magnification, "field_um": cal.field_size_um,
+               "scan": ((float(c.center_um[0]), float(c.center_um[1])), c.width_um, c.height, c.rotation_rad)}
+        if any(info.get(k) != v for k, v in new.items()):
+            info.update(new)
+            self.view.update()
+
+    def _measure_mode(self, on: bool):
+        self.view.measure_mode = on
+        self.notify("Measure: drag on the image to draw a line" if on else "Measure off")
+
+    def _measure_changed(self, line):
+        if line is None:
+            self.l_meas.setText("")
+            return
+        (x0, y0), (x1, y1) = line
+        dx, dy = x1 - x0, y1 - y0
+        self.l_meas.setText(f"line {format_length(math.hypot(dx, dy))}  (Δx {format_length(abs(dx))}, "
+                            f"Δy {format_length(abs(dy))}, {math.degrees(math.atan2(dy, dx)):+.1f}°)")
+
+    def measured_line_um(self) -> float | None:
+        """Length (µm) of the measuring line, for calibrating the field; None without one.  Raises
+        ValueError when the displayed image was not taken with the present field."""
+        length = self.view.measure_length_um()
+        if length is None:
+            return None
+        f = self.view.frame()
+        now = self.engine.calibration.field_size_um
+        if f is not None and abs(f.calibration.field_size_um - now) > 1e-6 * now:
+            raise ValueError("the image was taken at another field (magnification or calibration changed); "
+                             "take a new image and redraw the line")
+        return length
+
+    def _calibrated(self, r: float):
+        self.view.scale_measure(r)  # every field µm scaled by r: the line stays on its feature
+        self.fov.sync()
+
     def _pointer(self, xy):
         self.l_ptr.setText("" if xy is None else f"x {xy[0]:+.3f} µm, y {xy[1]:+.3f} µm")
 
@@ -319,14 +389,14 @@ class SEMWindow(QtWidgets.QMainWindow):
     def _center_at(self, x, y):
         try:
             self.engine.set_beam_shift(x, y)
-            self.shift.sync()
+            self.fov.sync()
         except Exception as e:  # noqa: BLE001
             self.notify(f"error: {e}")
 
     def _drag_shift(self, dx, dy):
         try:
             self.engine.shift_beam(dx, dy)
-            self.shift.sync()
+            self.fov.sync()
         except Exception as e:  # noqa: BLE001
             self.notify(f"error: {e}")
 
@@ -338,7 +408,8 @@ class SEMWindow(QtWidgets.QMainWindow):
             frames = req.pop("frames", 1)
             self._capture_future = self.engine.capture(frames=frames, **req)
             self._capture_t0 = time.perf_counter()
-            cfg = self.engine.config.with_(nx=req["nx"], ny=req["ny"], height_um=None, dwell_s=req["dwell_s"])
+            cfg = self.engine.config.with_(nx=req["nx"], ny=req["ny"], height_um=None,
+                                           **speed_by_name(req["speed"]).fields())
             self._capture_eta = self.engine.frame_time_s(cfg) * frames
             self.capture.progress.setVisible(True)
             self.capture.b_capture.setEnabled(False)
@@ -394,57 +465,31 @@ class SEMWindow(QtWidgets.QMainWindow):
 
     def open_advanced(self):
         if self._adv is None:
-            self._adv = AdvancedDialog(self.engine, self.save_settings, self)
+            self._adv = AdvancedDialog(self.engine, self.save_settings, self, field_scale=self.field_scale,
+                                       measured=self.measured_line_um)
             self._adv.applied.connect(self._after_advanced)
+            self._adv.calibrated.connect(self._calibrated)
         self._adv.load()
         self._adv.show()
         self._adv.raise_()
 
     def _after_advanced(self):
-        f = self.bundle.follower if self.bundle is not None else None
-        if f is not None:
-            f.adopt()  # a new full-scale field at this magnification re-calibrates field × magnification
         self.cb.ai_range_v = self._ai_range()
         self.scan.sync()
-        self.shift.sync()
+        self.fov.sync()
         self.image.sync()
-
-    # ------------------------------------------------------- external scan relay
-    def set_external_scan(self, on: bool):
-        """Switch the SEM between its internal scan and this program (HAL external control)."""
-        mgr = self.engine.handle.manager
-        was = self.engine.is_scanning
-        try:
-            if was:  # the switch is refused while a stream runs
-                self.engine.stop()
-                self.engine.wait_idle(5.0)
-            if self._relay is None:
-                self._relay = mgr.get_handle("external_scan")
-            self._relay.set_external_control(on)
-            if not on:
-                self._relay.release()
-            self.notify("external scan ON (SEM scans from the DAQ)" if on else "external scan OFF (SEM internal scan)")
-            if was and on:
-                self.engine.run()
-        except Exception as e:  # noqa: BLE001
-            self.notify(f"scan control error: {e}")
-        self.cb_ext.blockSignals(True)
-        self.cb_ext.setChecked(bool(mgr.external_control))
-        self.cb_ext.blockSignals(False)
 
     # ------------------------------------------------------------------ close
     def closeEvent(self, ev):  # noqa: N802
+        if self._own_scale:
+            self.field_scale.close()
         self.timer.stop()
         self._status_timer.stop()
         try:
-            self.engine.stop()
+            self.engine.stop()  # the engine gives the scan back to the SEM when it stops
             self.engine.wait_idle(5.0)
-            if self._relay is not None and self._relay.external_control:
-                self.set_external_scan(False)
         finally:
             self._sub.close()
             if self.owns_engine:
                 self.engine.close()
-            if self._relay is not None:
-                self._relay.close()
         super().closeEvent(ev)

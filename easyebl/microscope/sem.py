@@ -301,9 +301,38 @@ class SEMControl(MicroscopeControl):
             raise NotAvailable(f"{key.replace('_', ' ')} (not read yet)")
         return cur
 
+    #: writes of the same stigmator value after a wrong readback (see :meth:`set_stigmator`)
+    STIG_RETRIES = 2
+
     def set_stigmator(self, axis: str, n: int) -> concurrent.futures.Future:
-        key = "stig_x" if axis.upper() == "X" else "stig_y"
-        return self._set_int(key, n, lambda v: C.stigmator(axis, v), f"STG {axis}")
+        """Stigmator X / Y, 0–4095 (raw; the SEM moves in steps of 16).
+
+        The S-3000 misapplies a single write that changes the value by one step (±16): within
+        ~0.3 s it moves to ±240 instead – the step lands on the coarse part (×256) and the fine
+        part moves the other way – and stays there.  The same value written twice holds (seen
+        stable for 3 s), so every value is written twice, read back, and written again if the SEM
+        reports something else (values off the 16-step grid are rounded by the SEM: a readback
+        within one step is accepted)."""
+        axis = axis.upper()
+        key = "stig_x" if axis == "X" else "stig_y"
+        item = f"STG {axis}"
+        lo, hi = _LIMITS[key]
+        v = int(round(n))
+        if not lo <= v <= hi:
+            raise ValueError(f"{item} must be {lo}…{hi}")
+        text = C.stigmator(axis, v)
+
+        def send(session, t):
+            want = int(t.rsplit(" ", 1)[1])
+            for _ in range(1 + self.STIG_RETRIES):
+                session.sem.command(t)
+                session.sem.command(t)  # a single one-step write drifts by ±240 (see above)
+                got = _parse(item, session.sem.read(item)).get(key)
+                if got is None or abs(got - want) < 16:  # the SEM's stigmator step
+                    break
+            self._update({key: got if got is not None else want})
+
+        return self._set_latest(key, text, send, text)
 
     def stigmate(self, dx: float, dy: float) -> concurrent.futures.Future:
         fut = None

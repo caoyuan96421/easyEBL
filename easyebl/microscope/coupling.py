@@ -1,94 +1,146 @@
-"""Keep the DAQ field calibration of imaging and EDS in step with the SEM magnification.
+"""The global field calibration: one constant for every column magnification.
 
-The SEM scales its external-scan input with the magnification, so the field
-the DAQ covers at full-scale volts is ``K / magnification`` with one constant
-``K`` (µm, stored in :class:`~easyebl.microscope.settings.MicroscopeSettings`).
+The SEM scales its external-scan input with the magnification, so the field the
+DAQ sweeps with the full deflection range (±full-scale volts) is
 
-* If ``K`` is unknown, it is taken from the current field calibration the first
-  time the magnification is known (the calibration is assumed to be valid at
-  that magnification) – recalibrate the field once to make it exact.
-* Whenever the magnification changes (on the SEM panel, from the SEM window's
-  wheel, from the microscope window), every target gets
-  ``field_size_um = K / magnification``.
-* :meth:`FieldFollower.adopt` re-derives ``K`` after the user calibrated the
-  field by hand (SEM window → Advanced → Calibration).
+    field (µm) = K / magnification
 
-Targets are objects with ``calibration`` and ``set_calibration(cal)`` – the
-imaging engine and the EDS controller.  With the simulator backend the
-simulated SEM's field is scaled too, so the simulated image zooms like the
-real one.
+with one constant ``K``: the field at a hypothetical ×1 (equivalently
+``K / (2 × full scale)`` µm per volt at ×1).  :class:`FieldScale` owns ``K``
+and keeps the field calibration of its targets (the imaging engine, the EDS
+controller) at ``K / magnification``:
+
+* the magnification comes from the microscope; when it reports none (not
+  connected) the *manual* magnification is used – entered by the user;
+* ``K`` is calibrated by a line of known length measured on the image
+  (:meth:`calibrate`) or set directly (:meth:`set_k`);
+* with settings (:class:`~easyebl.microscope.settings.MicroscopeSettings`) ``K``
+  and the manual magnification are stored on disk; without, they live in memory
+  (the simulators – they must not overwrite the instrument's calibration).
+
+Targets are objects with ``calibration`` and ``set_calibration(cal)``.  With the
+simulator backend the simulated SEM's field is scaled too, so the simulated
+image zooms like the real one.
 """
 from __future__ import annotations
 
 from dataclasses import replace
 import threading
 
-from .control import MicroscopeControl
+from .control import MicroscopeControl, StubMicroscope
 
-__all__ = ["FieldFollower"]
+__all__ = ["FieldScale", "DEFAULT_FIELD_AT_1X_UM", "DEFAULT_MANUAL_MAG"]
+
+DEFAULT_FIELD_AT_1X_UM = 100_000.0  # 100 µm at ×1000 – until calibrated
+DEFAULT_MANUAL_MAG = 1000.0
 
 
-class FieldFollower:
-    def __init__(self, microscope: MicroscopeControl, targets, settings=None, sim_backend=None, notify=None):
-        self.mic = microscope
+class FieldScale:
+    def __init__(self, microscope: MicroscopeControl | None, targets, settings=None, k_um: float | None = None,
+                 sim_backend=None, notify=None):
+        self.mic = microscope if microscope is not None else StubMicroscope()
         self.targets = [t for t in targets if t is not None]
         self.settings = settings
         self.sim_backend = sim_backend
-        link = getattr(microscope, "link", None)
+        link = getattr(self.mic, "link", None)
         self.notify = notify or (lambda msg: link.events.emit("info", msg) if link is not None else None)
-        self._lock = threading.Lock()
-        self._mag = None
-        self.enabled = bool(getattr(settings, "follow_magnification", True))
-        microscope.add_listener(self._changed)
-        m = microscope.magnification()
-        if m:
-            self._apply(m)
+        self._lock = threading.RLock()
+        if settings is not None:
+            self._k = float(settings.field_at_1x_um)
+            self._manual = float(settings.manual_magnification)
+        else:
+            self._manual = DEFAULT_MANUAL_MAG
+            if k_um is None and self.targets:  # in memory: keep the targets' present field
+                k_um = self.targets[0].calibration.field_size_um * self.magnification
+            self._k = float(k_um or DEFAULT_FIELD_AT_1X_UM)
+        self.mic.add_listener(self._changed)
+        self.apply()
+
+    # ------------------------------------------------------------------ readout
+    @property
+    def k_um(self) -> float:
+        """Field (µm, full deflection range) at ×1."""
+        return self._k
 
     @property
-    def k_um(self) -> float | None:
-        return getattr(self.settings, "field_mag_product_um", None) if self.settings is not None else self._k
+    def from_microscope(self) -> bool:
+        """The magnification is reported by the microscope (else the manual one is used)."""
+        return bool(self.mic.magnification())
 
-    _k = None
+    @property
+    def manual_magnification(self) -> float:
+        return self._manual
 
-    def _set_k(self, k: float) -> None:
-        if self.settings is not None:
-            self.settings.field_mag_product_um = float(k)
-            try:
-                self.settings.save()
-            except OSError:
-                pass
-        else:
-            self._k = float(k)
+    @property
+    def magnification(self) -> float:
+        return float(self.mic.magnification() or self._manual)
 
-    def field_for(self, mag: float) -> float | None:
-        k = self.k_um
-        return None if not k or not mag else k / float(mag)
+    @property
+    def field_um(self) -> float:
+        """Field at the current magnification."""
+        return self._k / self.magnification
+
+    @property
+    def v_full_scale(self) -> float:
+        return self.targets[0].calibration.v_full_scale if self.targets else 10.0
+
+    def um_per_volt(self, magnification: float | None = None) -> float:
+        """µm of beam travel per deflection volt at *magnification* (default: the current one)."""
+        return self._k / float(magnification or self.magnification) / (2.0 * self.v_full_scale)
+
+    # ------------------------------------------------------------------ changes
+    def set_k(self, k_um: float) -> None:
+        if not k_um or k_um <= 0:
+            raise ValueError("the field at ×1 must be positive")
+        with self._lock:
+            self._k = float(k_um)
+            self._save()
+            self.apply()
+        self.notify(f"field calibration: {self._k:.6g} µm at ×1 → {self.field_um:.4g} µm at ×{self.magnification:g}")
+
+    def set_manual_magnification(self, mag: float) -> None:
+        """The magnification used while the microscope does not report one."""
+        if not mag or mag <= 0:
+            raise ValueError("the magnification must be positive")
+        with self._lock:
+            self._manual = float(mag)
+            self._save()
+            self.apply()
+
+    def calibrate(self, measured_um: float, true_um: float) -> float:
+        """A line measured *measured_um* long (with the present calibration) is really *true_um*:
+        scale ``K`` by true / measured.  Returns that ratio."""
+        if not measured_um or measured_um <= 0 or not true_um or true_um <= 0:
+            raise ValueError("both lengths must be positive")
+        r = float(true_um) / float(measured_um)
+        self.set_k(self._k * r)
+        return r
+
+    def _save(self) -> None:
+        s = self.settings
+        if s is None:
+            return
+        s.field_at_1x_um, s.manual_magnification = self._k, self._manual
+        try:
+            s.save()
+        except OSError:
+            pass
 
     def _changed(self, changes: dict) -> None:
-        if "mag" in changes and changes["mag"]:
-            self._apply(changes["mag"])
+        if changes.get("mag"):
+            self.apply()
 
-    def _apply(self, mag: float) -> None:
+    def apply(self) -> None:
+        """Every target to ``K / magnification``."""
         with self._lock:
-            self._mag = float(mag)
-            if not self.targets:
-                return
-            if not self.k_um:
-                f0 = self.targets[0].calibration.field_size_um
-                self._set_k(f0 * self._mag)
-                self.notify(f"field calibration tied to the magnification: {f0:g} µm at ×{self._mag:g} "
-                            f"(K = {self.k_um:.4g} µm); recalibrate the field once to make it exact")
-                self._sim(f0)
-                return
-            if not self.enabled:
-                return
-            field = self.k_um / self._mag
+            field = self.field_um
             for t in self.targets:
                 cal = t.calibration
                 if abs(cal.field_size_um - field) > 1e-9 * field:
                     self._set(t, replace(cal, field_size_um=field))
-            self._sim(field)
-        self.notify(f"×{mag:g}: field {field:g} µm")
+            be = self.sim_backend  # the simulated SEM scales its scan with the magnification too
+            if be is not None and hasattr(be, "params"):
+                be.params.field_size_um = float(field)
 
     @staticmethod
     def _set(target, cal) -> None:
@@ -97,27 +149,6 @@ class FieldFollower:
             target.set_calibration(cal, scale_scan=True)
         except TypeError:  # targets without a scan (EDS controller)
             target.set_calibration(cal)
-
-    def _sim(self, field: float) -> None:
-        """Simulator: the simulated SEM scales its scan with the magnification too."""
-        be = self.sim_backend
-        if be is not None and hasattr(be, "params"):
-            be.params.field_size_um = float(field)
-
-    def adopt(self) -> None:
-        """The field was calibrated by hand at the current magnification: derive K from it."""
-        with self._lock:
-            if self._mag and self.targets:
-                f = self.targets[0].calibration.field_size_um
-                expected = self.field_for(self._mag)
-                if expected is not None and abs(f - expected) <= 1e-6 * expected:
-                    return  # unchanged
-                self._set_k(f * self._mag)
-                for t in self.targets[1:]:
-                    if abs(t.calibration.field_size_um - f) > 1e-9 * f:
-                        t.set_calibration(replace(t.calibration, field_size_um=f))
-                self._sim(f)
-                self.notify(f"field calibration: {f:g} µm at ×{self._mag:g} (K = {self.k_um:.4g} µm)")
 
     def close(self) -> None:
         self.mic.remove_listener(self._changed)

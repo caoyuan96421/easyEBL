@@ -93,7 +93,16 @@ def _explicit_geometry(changes: dict) -> bool:
     return "width_um" in changes or "center_um" in changes or changes.get("height_um") is not None
 
 
+def _speed(speed) -> ScanSpeed:
+    if isinstance(speed, ScanSpeed):
+        return speed
+    if isinstance(speed, str):
+        return speed_by_name(speed)
+    raise TypeError(f"a scan speed preset (name or ScanSpeed), not {speed!r}")
+
+
 def default_scan_config(calibration: FieldCalibration, rate: float, channels=("video",)) -> RasterConfig:
+    sp = speed_by_name("Fast 1")
     """640×480 over the whole field (±full-scale volts), Fast 1.  The engine narrows it to the widest
     scan that fits (the line start / flyback overshoot the edges).  Zoom in for room to beam-shift."""
     return RasterConfig(
@@ -101,10 +110,7 @@ def default_scan_config(calibration: FieldCalibration, rate: float, channels=("v
         ny=480,
         width_um=calibration.field_size_um,
         rate=rate,
-        dwell_s=1e-6,
-        preline_s=20e-6,
-        flyback_s=40e-6,
-        frame_settle_s=200e-6,
+        **sp.fields(),
         ai_channels=tuple(channels),
     )
 
@@ -187,7 +193,8 @@ class ImagingEngine:
         # accept a DAQManager or a DAQHandle
         self.handle = manager.get_handle(owner) if hasattr(manager, "get_handle") else manager
         self.daq_config = self.handle.config
-        self._cal = calibration or FieldCalibration(100.0, self.daq_config.ao_limit_v)
+        self._cal = calibration or FieldCalibration(100.0, self.daq_config.full_scale_v)
+        self._external_on: bool | None = False  # the external-scan switch, as this engine set it
         opts = options or EngineOptions()
         opts.validate()
         self._opts = opts
@@ -252,10 +259,30 @@ class ImagingEngine:
             raise ValueError(
                 f"{len(cfg.ai_channels)} AI channels at {cfg.rate:g} S/s exceed the device limit; lower the rate"
             )
-        # geometry fits the field and timing is consistent – checked on the exact samples
+        # the scan is at most the full field of view (±full scale); the waveform – pre-line,
+        # flyback, rotation – may reach the AO limit beyond it.  Checked on the exact samples
         # the stream will emit, with no tolerance (DAQmx rejects anything beyond its range)
-        FrameSource(RasterPlan(cfg, cal)).check(min(cal.v_full_scale, self.daq_config.ao_limit_v))
+        self._check_size(cfg, cal)
+        lim = self.ao_limit_v
+        FrameSource(RasterPlan(cfg, cal, limit_v=lim)).check(lim)
         return cfg
+
+    @property
+    def ao_limit_v(self) -> float:
+        """Hard limit of every deflection sample (the scan field itself is ±calibration full scale)."""
+        return float(self.daq_config.ao_limit_v)
+
+    @staticmethod
+    def _check_size(cfg: RasterConfig, cal: FieldCalibration) -> None:
+        if max(cfg.width_um, cfg.height) > cal.field_size_um * (1 + 1e-9):
+            raise OutOfFieldError(f"scan {cfg.width_um:.4g} × {cfg.height:.4g} µm is larger than the full field of "
+                                  f"view ({cal.field_size_um:.4g} µm)")
+
+    def max_width_um(self, cfg: RasterConfig | None = None) -> float:
+        """Widest scan of this shape: the full field of view (its longer side)."""
+        cfg = cfg or self.config
+        aspect = (cfg.height / cfg.width_um) if cfg.height_um is not None else cfg.ny / cfg.nx
+        return self.calibration.field_size_um / max(1.0, aspect)
 
     def _check_open(self) -> None:
         if self._closing:
@@ -321,7 +348,7 @@ class ImagingEngine:
 
     def frame_time_s(self, cfg: RasterConfig | None = None) -> float:
         cfg = cfg or self.config
-        return RasterPlan(cfg, self.calibration).frame_time_s
+        return RasterPlan(cfg, self.calibration, limit_v=self.ao_limit_v).frame_time_s
 
     def status(self) -> EngineStatus:
         with self._lock:
@@ -465,11 +492,9 @@ class ImagingEngine:
         return new
 
     def set_speed(self, speed) -> RasterConfig:
-        """Scan speed: a preset name ("TV", "Slow 2" …), a :class:`ScanSpeed` or a dwell in s."""
-        if isinstance(speed, str):
-            speed = speed_by_name(speed)
-        dwell = speed.dwell_s if isinstance(speed, ScanSpeed) else float(speed)
-        return self.update(dwell_s=dwell)
+        """Scan speed preset: a name ("TV", "Slow 2" …) or a :class:`ScanSpeed` – sets the dwell
+        and the line / frame timing that goes with it."""
+        return self.update(**_speed(speed).fields())
 
     def set_resolution(self, nx: int, ny: int) -> RasterConfig:
         return self.update(nx=int(nx), ny=int(ny), height_um=None)
@@ -480,7 +505,7 @@ class ImagingEngine:
 
     def _fit_width(self, cfg: RasterConfig, width_um: float) -> float:
         """*width_um*, or the largest width below it at which *cfg* fits the field."""
-        lo, hi = 1e-6 * self.calibration.field_size_um, float(width_um)
+        lo, hi = 1e-6 * self.calibration.field_size_um, min(float(width_um), self.max_width_um(cfg))
         if self._fits(cfg.with_(width_um=hi)):
             return hi
         for _ in range(40):
@@ -494,9 +519,9 @@ class ImagingEngine:
     def _fits(self, cfg: RasterConfig) -> bool:
         try:
             cal = self.calibration
-            src = FrameSource(RasterPlan(cfg.with_(frames=1), cal))
-            # keep a hair of margin when clamping to the edge of the field
-            src.check(min(cal.v_full_scale, self.daq_config.ao_limit_v) * (1 - 1e-9))
+            self._check_size(cfg, cal)
+            lim = self.ao_limit_v * (1 - 1e-9)  # keep a hair of margin when clamping to the edge
+            FrameSource(RasterPlan(cfg.with_(frames=1), cal, limit_v=lim)).check(lim)
             return True
         except (ValueError, OutOfFieldError):
             return False
@@ -529,8 +554,56 @@ class ImagingEngine:
     def reset_beam_shift(self) -> RasterConfig:
         return self.set_beam_shift(0.0, 0.0)
 
+    # ---------------------------------------------------------------- zoom (scan range)
+    def zoom(self, factor: float) -> RasterConfig:
+        """Zoom in (*factor* > 1) or out by changing the swept range – the column is not
+        touched.  Zooming out stops at the full field of view; the scan position moves
+        towards the centre where the larger scan would not fit."""
+        cfg = self.config
+        w = min(cfg.width_um / float(factor), self.max_width_um(cfg))
+        return self.set_field_of_view(w)
+
+    def set_field_of_view(self, width_um: float, center_um=None) -> RasterConfig:
+        """Scan size (width, µm) at *center_um* (default: the current scan position), clamped:
+        the size to the full field of view, the position so that the scan fits."""
+        cfg = self.config
+        w = min(max(float(width_um), 1e-6 * self.calibration.field_size_um), self.max_width_um(cfg))
+        c = np.asarray(cfg.center_um if center_um is None else center_um, float)
+        trial = cfg.with_(width_um=w, height_um=None if cfg.height_um is None else cfg.height_um * w / cfg.width_um)
+        if not self._fits(trial.with_(center_um=tuple(c))):
+            lo, hi = 0.0, 1.0  # pull the position towards the centre until it fits
+            if self._fits(trial.with_(center_um=(0.0, 0.0))):
+                for _ in range(30):
+                    mid = 0.5 * (lo + hi)
+                    if self._fits(trial.with_(center_um=tuple(c * mid))):
+                        lo = mid
+                    else:
+                        hi = mid
+                c = c * lo
+            else:
+                c = np.zeros(2)
+                w = self._fit_width(trial.with_(center_um=(0.0, 0.0)), w)
+        changes = {"width_um": w, "center_um": (float(c[0]), float(c[1]))}
+        if cfg.height_um is not None:
+            changes["height_um"] = cfg.height_um * w / cfg.width_um
+        return self.update(**changes)
+
+    def full_field(self) -> RasterConfig:
+        """The whole field of view: largest scan, centred."""
+        return self.set_field_of_view(self.max_width_um(), (0.0, 0.0))
+
+    @property
+    def zoom_factor(self) -> float:
+        """Full field of view / scan width (1 = the column's own field)."""
+        return self.calibration.field_size_um / self.config.width_um
+
     def set_rotation_deg(self, deg: float) -> RasterConfig:
-        return self.update(rotation_rad=math.radians(deg))
+        """Scan rotation; where the rotated scan would leave the AO range the scan size shrinks."""
+        cfg = self.config.with_(rotation_rad=math.radians(float(deg)))
+        if self._fits(cfg):
+            return self.update(rotation_rad=cfg.rotation_rad)
+        w = self._fit_width(cfg, cfg.width_um)
+        return self.update(rotation_rad=cfg.rotation_rad, width_um=w)
 
     def set_calibration(self, calibration: FieldCalibration, scale_scan: bool = False) -> None:
         """New µm ↔ V calibration.
@@ -621,8 +694,7 @@ class ImagingEngine:
         only; the live settings are kept.
         """
         if speed is not None:
-            sp = speed_by_name(speed) if isinstance(speed, str) else speed
-            changes["dwell_s"] = sp.dwell_s if isinstance(sp, ScanSpeed) else float(sp)
+            changes.update(_speed(speed).fields())
         if "nx" in changes or "ny" in changes:
             changes.setdefault("height_um", None)
         changes.pop("rate", None)
@@ -710,6 +782,10 @@ class ImagingEngine:
         failures = 0
         while True:
             with self._cv:
+                idle = self._mode == "idle"
+            if idle or self._closing:
+                self._external_scan(False)  # stopped: the SEM gets its own scan back
+            with self._cv:
                 while not self._closing and self._mode == "idle":
                     self._cv.wait(0.5)
                 if self._closing:
@@ -718,6 +794,7 @@ class ImagingEngine:
                 self._wait_for_lease()
                 continue
             try:
+                self._external_scan(True)  # scanning: the SEM takes X / Y from the DAQ
                 good = self._stream_once()
                 failures = 0 if good else failures
             except DeviceLostError as e:
@@ -747,7 +824,27 @@ class ImagingEngine:
             except Exception as e:  # noqa: BLE001 - never let the scan thread die
                 failures += 1
                 self._fail(e, tb=traceback.format_exc())
+        self._external_scan(False)
         self._finish_captures("engine closed")
+
+    def _external_scan(self, on: bool) -> None:
+        """Claim the SEM's external-scan switch while scanning, release it when stopped
+        (option ``auto_external_control``).  Never fatal: a failure is reported."""
+        if not (self._opts.auto_external_control and self.handle.has_external_control):
+            return
+        try:
+            if on and self._external_on is not True:
+                self.handle.set_external_control(True)
+                self._external_on = True
+                self.events.emit("info", "external scan ON (the SEM scans from the DAQ)")
+            elif not on and self._external_on:
+                self.handle.release("external_control")
+                self._external_on = False
+                self.events.emit("info", "external scan OFF (SEM internal scan)")
+        except DeviceLostError:
+            self._external_on = None if on else False
+        except Exception as e:  # noqa: BLE001
+            self.events.emit("warning", f"external scan {'on' if on else 'off'} failed: {e}")
 
     # ------------------------------------------------------------ DAQ lease
     def _on_preempt(self, lease) -> None:

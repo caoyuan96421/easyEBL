@@ -11,7 +11,8 @@ Modules:
 """
 from .core import SATURATION_WARN, EngineStatus, ImagingEngine, default_scan_config
 from .frames import EngineEvent, EngineState, Frame, FrameSlot
-from .settings import AI_RANGES_V, RESOLUTIONS, SCAN_SPEEDS, EngineOptions, ScanSpeed, speed_by_name, valid_rates
+from .settings import (AI_RANGES_V, RESOLUTIONS, SCAN_SPEEDS, EngineOptions, ScanSpeed, speed_by_name, speed_of,
+                       valid_rates)
 from .source import FrameSource
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "RESOLUTIONS",
     "AI_RANGES_V",
     "speed_by_name",
+    "speed_of",
     "valid_rates",
     "default_scan_config",
     "SATURATION_WARN",

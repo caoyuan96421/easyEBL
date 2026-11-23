@@ -42,7 +42,8 @@ def eds(qtbot, tmp_path):
 
 
 def _wait_idle(qtbot, w, timeout=60000):
-    qtbot.waitUntil(lambda: not w.ctrl.busy and w._job is None and w._analysis is None, timeout=timeout)
+    qtbot.waitUntil(lambda: not w.ctrl.busy and w._job is None and w._analysis is None and w._maps_fut is None,
+                    timeout=timeout)
 
 
 def test_eds_window_workflow(qtbot, eds, tmp_path):
@@ -156,9 +157,29 @@ def test_processor_dialog(qtbot, eds):
     d = ProcessorDialog(dpp, w)
     qtbot.addWidget(d)
     assert d.table.rowCount() > 5
-    d.cb_speed.setCurrentIndex(0)
-    d._apply_speed()
-    assert dpp.current_speed() == 1
+    assert not hasattr(d, "cb_speed") and not hasattr(d, "b_thr")  # speed: Acquire tab; no auto threshold
+    d.close()
+
+    # the speed preset is a combo box in the Acquire tab, written as soon as it is chosen
+    i1 = w.sp_speed.findData(1)
+    w.sp_speed.setCurrentIndex(i1)
+    w.sp_speed.activated.emit(i1)
+    assert dpp.current_speed() == 1 and w.sp_speed.currentData() == 1
+    i5 = w.sp_speed.findData(5)
+    w.sp_speed.setCurrentIndex(i5)
+    w.sp_speed.activated.emit(i5)
+    assert dpp.current_speed() == 5 and w.sp_speed.currentData() == 5
+    # chosen during an acquisition: written when it is done
+    w.sp_time.setValue(1.0)
+    w.sp_autoid.setChecked(False)
+    w.site_list.setCurrentRow(-1)
+    w.b_acquire.click()
+    qtbot.waitUntil(lambda: w.ctrl.busy, timeout=5000)
+    w.sp_speed.setCurrentIndex(i1)
+    w.sp_speed.activated.emit(i1)
+    assert w._speed_pending == 1 and dpp.current_speed() == 5
+    _wait_idle(qtbot, w)
+    assert dpp.current_speed() == 1 and w._speed_pending is None
 
 
 def test_live_panel_composition_and_beam_sync(qtbot, eds):
@@ -269,3 +290,38 @@ def test_min_energy_control(qtbot, eds):
     qtbot.waitUntil(lambda: abs(float(dpp.get_settings(["THSL"])["THSL"]) - w.ctrl.thsl_for(0.5)) < 0.01,
                     timeout=3000)
     assert w.settings.min_energy_kev == 0.5
+
+
+def test_live_maps_during_the_scan_and_dead_time_zones(qtbot, eds):
+    w, mgr, dpp = eds
+    # dead-time bar: grey below 5 %, green 5–50 %, red above
+    for pct, col in ((2, "200,200,200"), (20, "80,200,90"), (70, "240,70,60")):
+        w._style_dead(pct)
+        assert f"chunk{{background:rgba({col}" in w.l_dead.styleSheet()
+
+    # element maps appear while the map is still scanning; unscanned pixels are blank (NaN)
+    w._site_requested("map", (0.0, 0.0, 60.0, 60.0))
+    w.m_nx.setValue(16)
+    w.m_ny.setValue(12)
+    w.m_dwell.setValue(25)  # ≈ 5 s
+    w.m_kind.setCurrentIndex(0)
+    w.m_bin.setValue(1)
+    w.set_elements(["Mn", "Fe"])
+    w.start_map()
+    qtbot.waitUntil(lambda: bool(w._job is not None and getattr(w, "_tiles", None)
+                                 and any(t.label.startswith("Fe") for t in w._tiles)
+                                 and np.isnan(w._tiles[-1].data).any()), timeout=20000)
+    assert w._map_running is not None
+    # changing the composition mid-scan: the live maps follow
+    w.set_elements(["Mn", "Fe", "Cu"])
+    qtbot.waitUntil(lambda: bool(any(t.label.startswith("Cu") for t in w._tiles)), timeout=10000)
+    assert w._job is not None, "the scan should still be running"
+    _wait_idle(qtbot, w, 120000)
+    labels = [t.label for t in w._tiles]
+    assert labels[0] == "SE" and {"Mn", "Fe", "Cu"} <= {lb.split()[0] for lb in labels[1:]}
+    assert w.map is not None and w.map.done.all()
+    assert all(np.isfinite(t.data).all() for t in w._tiles[1:])  # the final maps are complete
+    # after the scan: changing the map kind recomputes by itself
+    w.m_kind.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: bool(w._maps_fut is None and w._maps_done_gen == w._maps_gen), timeout=20000)
+    assert any(t.unit == "counts" for t in w._tiles)

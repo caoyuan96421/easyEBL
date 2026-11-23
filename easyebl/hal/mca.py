@@ -372,13 +372,6 @@ class DP5PulseProcessor(PulseProcessor):
         except Exception as e:  # noqa: BLE001
             raise MCAError(f"DP5 speed preset failed: {e}") from e
 
-    def auto_threshold(self) -> dict:
-        """Fast threshold from the noise – beam OFF (blanked), no X-rays.  The slow threshold
-        is not touched (it follows the EDS minimum energy)."""
-        self._require()
-        self._stop_polling()
-        return self._dev.auto_threshold()
-
     def _write_preset(self, seconds):
         self._require()
         self._stop_polling()
