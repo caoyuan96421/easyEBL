@@ -4,9 +4,11 @@
 on top of a :class:`~easyebl.microscope.link.MicroscopeLink`:
 
 * **readbacks** are cached (``state``) and returned at once; they are refreshed
-  when the module starts, after every setting, and by a slow status poll
-  (``MAG``/``HV``/``WD``, default every 10 s) so changes made on the SEM's own
-  panel are picked up;
+  when the module starts, after every setting, and continuously in the
+  background: every item is a task of the link's
+  :class:`~easyebl.microscope.poll.Poller` at a priority level (:data:`POLL_LEVELS`:
+  MAG / HV most often, none less often than every 15 s), so changes made on the
+  SEM's own panel are picked up;
 * **settings** are queued at the highest priority (``SEM_SET``) and return a
   Future.  Repeated settings of the same quantity *coalesce*: ten mouse-wheel
   steps while one ``MAG`` transaction is on the wire become one more
@@ -24,16 +26,22 @@ import time
 from typing import Callable
 
 from .control import MicroscopeControl, NotAvailable
-from .link import POLL, READ, SEM_SET, MicroscopeLink
+from .link import READ, SEM_SET, MicroscopeLink
 from .s3000 import commands as C
 
-__all__ = ["SEMControl", "STATUS_ITEMS", "ALL_ITEMS", "MAGNIFICATIONS", "SCAN_MODES", "PRESET_KEYS"]
+__all__ = ["SEMControl", "STATUS_ITEMS", "ALL_ITEMS", "POLL_LEVELS", "MAGNIFICATIONS", "SCAN_MODES", "PRESET_KEYS"]
 
 #: read on start and by "Refresh"
 ALL_ITEMS = ("HV", "MAG", "WD", "EMI", "BEAM C", "BEAM F", "FOCUS C", "FOCUS F", "STG X", "STG Y",
              "CONT", "BRT", "RUN", "INPUTS AF")
-#: polled in the background (changes on the SEM console that matter to imaging / EDS)
+#: the readbacks that matter most to imaging / EDS
 STATUS_ITEMS = ("MAG", "HV", "WD")
+#: background-read priority levels (easyebl.microscope.poll; each level is read half as often as the
+#: one above): 1 what imaging / EDS depend on, 2 the column settings, 4 (default) the rest
+POLL_LEVELS = {"MAG": 1, "HV": 1,
+               "FOCUS C": 2, "FOCUS F": 2, "STG X": 2, "STG Y": 2, "BEAM C": 2, "BEAM F": 2, "WD": 2}
+POLL_LEVEL_DEFAULT = 4
+
 MAGNIFICATIONS: tuple[int, ...] = C.ALLOWED_MAGNIFICATIONS
 SCAN_MODES = C.SCAN_MODES  # {"F": "TV scan 1", …}
 
@@ -74,7 +82,7 @@ def _parse(item: str, data: str) -> dict:
 class SEMControl(MicroscopeControl):
     """The S-3000 column through the shared link (see module docstring)."""
 
-    def __init__(self, link: MicroscopeLink, status_poll_s: float = 10.0, focus_step: int = 8,
+    def __init__(self, link: MicroscopeLink, polling: bool = True, focus_step: int = 8,
                  coarse_focus_step: int = 64, stig_step: int = 16, refresh_on_start: bool = True):
         self.link = link
         link.sem = self
@@ -86,10 +94,11 @@ class SEMControl(MicroscopeControl):
         self._targets: dict = {}
         self._jobs: dict = {}
         self._listeners: list[Callable[[dict], None]] = []
-        self._poll_s = float(status_poll_s)
-        self._stop = threading.Event()
-        self._poller = threading.Thread(target=self._poll_loop, name="easyebl-microscope-sem-poll", daemon=True)
-        self._poller.start()
+        self._polling = bool(polling)
+        for item in ALL_ITEMS:
+            link.poller.add(f"SEM {item}", lambda s, i=item: self._read_items(s, (i,)), owner=self,
+                            key=("sem-read", (item,)), what=f"SEM read {item}", enabled=lambda: self._polling,
+                            level=POLL_LEVELS.get(item, POLL_LEVEL_DEFAULT), cost_s=0.3)
         if refresh_on_start:
             self.refresh()
 
@@ -152,31 +161,17 @@ class SEMControl(MicroscopeControl):
         return self.link.submit(lambda s: self._read_items(s, items), priority, "SEM read " + ", ".join(items),
                                 key=("sem-read", items))
 
-    # ------------------------------------------------------------------ status poll
+    # ------------------------------------------------------------------ background read
     @property
-    def status_poll_s(self) -> float:
-        return self._poll_s
+    def polling(self) -> bool:
+        return self._polling
 
-    def set_status_poll(self, seconds: float) -> None:
-        """Background read of MAG / HV / WD every *seconds* (0: off)."""
-        self._poll_s = max(0.0, float(seconds))
-
-    def _poll_loop(self) -> None:
-        t_next = time.monotonic() + max(self._poll_s, 1.0)
-        while not self._stop.wait(0.25):
-            if self._poll_s <= 0:
-                t_next = time.monotonic() + 1.0
-                continue
-            if time.monotonic() >= t_next:
-                t_next = time.monotonic() + self._poll_s
-                if self.link.connected:
-                    try:
-                        self.refresh(STATUS_ITEMS, priority=POLL)
-                    except RuntimeError:  # link closed
-                        return
+    def set_polling(self, on: bool) -> None:
+        """Background read of the SEM settings (see :mod:`~easyebl.microscope.poll`) on / off."""
+        self._polling = bool(on)
 
     def close(self) -> None:
-        self._stop.set()
+        self.link.poller.remove(self)
 
     # ------------------------------------------------------------------ coalesced settings
     def _set_latest(self, name: str, value, send: Callable, what: str) -> concurrent.futures.Future:

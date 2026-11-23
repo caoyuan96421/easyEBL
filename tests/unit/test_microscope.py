@@ -15,7 +15,7 @@ from easyebl.microscope.s3000 import MotionError
 @pytest.fixture
 def mic():
     link = MicroscopeLink.simulated(command_delay_s=0.01)
-    sem = SEMControl(link, status_poll_s=0)
+    sem = SEMControl(link, polling=False)
     stage = StageControl(link, polling=False, hand_control=False)
     sem.refresh().result(10)
     stage.refresh().result(10)
@@ -85,29 +85,91 @@ def test_repeated_settings_coalesce(mic):
     assert sem.magnification() == MAGNIFICATIONS[MAGNIFICATIONS.index(1000) + 6]
 
 
-def test_stage_poll_is_never_faster_than_20_s(mic):
-    link, sem, stage = mic
-    assert stage.set_poll_interval(5) == 20.0 and stage.poll_interval_s == 20.0
-    assert stage.set_poll_interval(45) == 45.0
-    s2 = StageControl(link, poll_s=1, polling=False)
-    assert s2.poll_interval_s == StageControl.MIN_POLL_S == 20.0
-    s2.close()
+def test_poller_reads_each_level_half_as_often_and_none_beyond_the_floor():
+    """Order: the largest age / 2 ** (level - 1) first, whatever the read time; overdue before all."""
+    from easyebl.microscope.poll import PollTask
+
+    l1, l3 = PollTask("l1", None, level=1, cost=5.0), PollTask("l3", None, level=3, cost=0.01)
+    l1.last = l3.last = 100.0
+    assert l1.score(101.0) == pytest.approx(1.0) and l3.score(101.0) == pytest.approx(0.25)
+    assert l1.score(101.0) > l3.score(101.0)  # same age: the important one, although it is slow
+    assert l3.score(104.1) > l1.score(101.0)  # level 3 goes when 4x older
+    assert PollTask("new", None).score(0.0) == float("inf")
+    late = PollTask("late", None, level=9)
+    late.last = 84.0
+    assert late.score(100.0, 2.0, 15.0) > l1.score(100.0 + 1e3, 2.0, 15.0 * 1e9)  # overdue beats any
 
 
-def test_stage_polls_in_the_background(monkeypatch):
-    monkeypatch.setattr(StageControl, "MIN_POLL_S", 0.3)  # fast for the test only
+def test_poller_schedule_on_the_simulator(monkeypatch):
+    """Every SEM item and stage controller is a task; costs are measured; nothing waits past the floor."""
     link = MicroscopeLink.simulated(command_delay_s=0.01)
     try:
-        stage = StageControl(link, poll_s=0.3)
+        sem = SEMControl(link, refresh_on_start=False)
+        stage = StageControl(link)
+        poller = link.poller
+        names = {t.name for t in poller.tasks()}
+        assert {f"SEM {i}" for i in ("MAG", "HV", "WD", "STG X")} <= names
+        assert {"stage X/Y", "stage Z/T", "stage R"} <= names
+        lv = {x.name: x.level for x in poller.tasks()}
+        assert lv["SEM MAG"] == lv["SEM HV"] == 1 and lv["SEM FOCUS F"] == lv["SEM STG X"] == lv["SEM WD"] == 2
+        assert lv["stage X/Y"] == lv["stage Z/T"] == 3 and lv["stage R"] == lv["SEM CONT"] == 4
         t0 = time.monotonic()
-        while sum(1 for _, w in link.executed if w.startswith("stage read")) < 6 and time.monotonic() - t0 < 5:
+        while (any(t.reads < 2 for t in poller.tasks()) and time.monotonic() - t0 < 60):
+            time.sleep(0.1)
+        assert all(t.reads >= 2 for t in poller.tasks())
+        assert all(t.cost > 0 and t.period for t in poller.tasks())  # measured, not the guesses
+        reads = [(p, w) for p, w in link.executed if w.startswith(("SEM read", "stage read"))]
+        assert reads and all(p == POLL for p, _ in reads)
+        assert sem.magnification() is not None and stage.positions["X"] == pytest.approx(0x17077D / 25.6)
+        assert stage.poll_period_s() is not None
+        # a setting waits for one read at most
+        last = link.executed[-1]  # the log keeps the last 200: find the place by identity
+        sem.set_magnification(2000).result(10)
+        log = list(link.executed)
+        k = next(i for i in range(len(log) - 1, -1, -1) if log[i] is last)
+        assert [p for p, _ in log[k + 1:]].index(SEM_SET) <= 1
+        # switched off: no more reads of that module
+        sem.set_polling(False)
+        stage.set_polling(False)
+        time.sleep(1.5)  # the read in progress finishes
+        n = poller.reads
+        time.sleep(1.0)
+        assert poller.reads == n
+        stage.set_polling(True)
+        t0 = time.monotonic()
+        while poller.reads < n + 2 and time.monotonic() - t0 < 10:
             time.sleep(0.05)
-        reads = [(p, w) for p, w in link.executed if w.startswith("stage read")]
-        assert len(reads) >= 6 and all(p == POLL for p, _ in reads)
-        assert stage.positions["X"] == pytest.approx(0x17077D / 25.6)
-        assert stage.positions["Z"] == pytest.approx(0x051BEB / 22.32)  # ≈ 15 mm = WD
+        assert poller.reads >= n + 2 and all(w.startswith("stage read") for _, w in link.executed[-2:])
     finally:
         link.close()
+
+
+def test_poller_never_lets_a_low_level_wait_past_the_floor(monkeypatch):
+    """A task of a very low level is still read every MAX_PERIOD_S."""
+    from easyebl.microscope.poll import Poller
+
+    monkeypatch.setattr(Poller, "MAX_PERIOD_S", 1.0)
+    link = MicroscopeLink.simulated(command_delay_s=0.0)
+    try:
+        poller = link.poller
+        poller.add("top", lambda s: time.sleep(0.01), level=1)
+        slow = poller.add("low", lambda s: time.sleep(0.05), level=30)  # by level alone: ~never
+        time.sleep(4.0)
+        assert slow.reads >= 3 and slow.period == pytest.approx(1.0, abs=0.3)
+        assert poller.task("top").reads > 20 * slow.reads
+    finally:
+        link.close()
+
+
+def test_old_settings_keep_the_sem_read_switch(tmp_path):
+    import json
+    from easyebl.microscope.settings import MicroscopeSettings
+    f = tmp_path / "m.json"
+    f.write_text(json.dumps({"port": "COM9", "stage_poll_s": 30.0, "sem_status_poll_s": 10.0}))
+    s = MicroscopeSettings.load(str(f))
+    assert s.port == "COM9" and s.sem_polling is True and s.stage_polling is True
+    f.write_text(json.dumps({"sem_status_poll_s": 0}))
+    assert MicroscopeSettings.load(str(f)).sem_polling is False
 
 
 def test_stage_moves_relative_and_absolute(mic):

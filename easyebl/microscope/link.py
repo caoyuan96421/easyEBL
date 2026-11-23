@@ -11,7 +11,7 @@ priority        value  used for
 ``SEM_SET``     0      SEM settings and actions (always first)
 ``STAGE_CMD``   1      stage moves and the refresh after a move
 ``READ``        2      explicit SEM / stage reads
-``POLL``        3      background polling (stage position, SEM status)
+``POLL``        3      background polling (:mod:`~easyebl.microscope.poll`)
 ==============  =====  ==============================================
 
 A request is one or a few transactions, so a SEM setting waits at most for the
@@ -78,6 +78,16 @@ class MicroscopeLink:
         self._worker.start()
         self.sem = None  # SEMControl (set by its constructor)
         self.stage = None  # StageControl
+        self._poller = None
+
+    @property
+    def poller(self):
+        """The background poller every module registers its readbacks with (created on first use)."""
+        if self._poller is None:
+            from .poll import Poller
+
+            self._poller = Poller(self)
+        return self._poller
 
     # ------------------------------------------------------------------ construction
     @classmethod
@@ -217,6 +227,8 @@ class MicroscopeLink:
                     mod.close()
                 except Exception:  # noqa: BLE001
                     pass
+        if self._poller is not None:
+            self._poller.close()
         self._closed.set()
         self._q.put(_Request(-99, -1, None, "stop", None))
         self._worker.join(5.0)

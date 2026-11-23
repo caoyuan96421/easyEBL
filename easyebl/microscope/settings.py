@@ -26,8 +26,8 @@ def default_settings_path() -> str:
 @dataclass
 class MicroscopeSettings:
     port: str = "COM4"
-    stage_poll_s: float = 30.0  # never below StageControl.MIN_POLL_S (20 s)
-    sem_status_poll_s: float = 10.0  # MAG / HV / WD background read (0: off)
+    sem_polling: bool = True  # background read of the SEM settings (easyebl.microscope.poll)
+    stage_polling: bool = True  # background read of the stage positions
     #: the global field calibration: the field (µm) the full deflection range sweeps at ×1;
     #: the field at magnification M is this / M (easyebl.microscope.coupling.FieldScale)
     field_at_1x_um: float = 100_000.0
@@ -50,6 +50,8 @@ class MicroscopeSettings:
             known = {f.name for f in fields(cls)} - {"path"}
             if "field_at_1x_um" not in d and d.get("field_mag_product_um"):  # the same constant, renamed
                 d["field_at_1x_um"] = d["field_mag_product_um"]
+            if "sem_polling" not in d and "sem_status_poll_s" in d:  # the old periodic poll (0: off)
+                d["sem_polling"] = bool(d["sem_status_poll_s"])
             for k, v in d.items():
                 if k in known:
                     setattr(s, k, v)

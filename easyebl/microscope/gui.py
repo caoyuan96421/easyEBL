@@ -99,8 +99,8 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(self.TICK_MS)
-        self.notify(f"{sem.name}: SEM settings go first; stage positions are read every "
-                    f"{stage.poll_interval_s:g} s (stage queries share the slow port)")
+        self.notify(f"{sem.name}: SEM settings go first; readbacks are polled in the background by "
+                    f"priority, MAG / HV most often (none less often than every {link.poller.MAX_PERIOD_S:g} s)")
         self._sync_all()
 
     @staticmethod
@@ -291,11 +291,12 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
         g = QtWidgets.QGroupBox("Background read")
         f = QtWidgets.QFormLayout(g)
-        self.sem_poll = _dspin(0, 600, 0, sem.status_poll_s, 5, " s")
-        self.sem_poll.setToolTip("MAG / HV / WD are read this often so changes on the SEM panel reach "
-                                 "imaging and EDS (0: off)")
-        self.sem_poll.valueChanged.connect(self._sem_poll_changed)
-        f.addRow("SEM status every", self.sem_poll)
+        self.sem_poll = QtWidgets.QCheckBox("Read SEM settings in the background")
+        self.sem_poll.setChecked(sem.polling)
+        self.sem_poll.setToolTip("Reads the SEM settings one after another without pause (MAG / HV most "
+                                 "often), so changes on the SEM panel reach imaging and EDS")
+        self.sem_poll.toggled.connect(self._sem_poll_changed)
+        f.addRow(self.sem_poll)
         lay.addWidget(g)
         lay.addStretch(1)
         return w
@@ -351,15 +352,12 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         b = QtWidgets.QPushButton("Read now")
         b.clicked.connect(self.refresh_stage)
         r.addWidget(b)
-        self.cb_poll = QtWidgets.QCheckBox("Auto-read every")
+        self.cb_poll = QtWidgets.QCheckBox("Auto-read")
         self.cb_poll.setChecked(st.polling)
-        self.cb_poll.toggled.connect(st.set_polling)
+        self.cb_poll.setToolTip("Read the stage positions in the background, with the SEM readbacks "
+                                "(X/Y and Z/T after MAG / HV and the column settings, R least often)")
+        self.cb_poll.toggled.connect(self._stage_poll_changed)
         r.addWidget(self.cb_poll)
-        self.poll_s = _dspin(st.MIN_POLL_S, 3600, 0, st.poll_interval_s, 5, " s")
-        self.poll_s.setToolTip(f"stage queries are slow (≈1 s each): not more often than every {st.MIN_POLL_S:g} s")
-        self.poll_s.valueChanged.connect(lambda s_: self.settings.__setattr__("stage_poll_s",
-                                                                              st.set_poll_interval(s_)))
-        r.addWidget(self.poll_s)
         r.addStretch(1)
         self.l_read = QtWidgets.QLabel("")
         self.l_read.setStyleSheet(_NOTE)
@@ -450,9 +448,13 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         v = round(self.hv_set.value(), 2 if self.hv_set.value() < 10 else 1)
         self._call(self.sem.set_hv, f"{v:.2f}" if v < 10 else f"{v:.1f}", what="HV setpoint")
 
+    def _stage_poll_changed(self, v):
+        self.stage.set_polling(v)
+        self.settings.stage_polling = bool(v)
+
     def _sem_poll_changed(self, v):
-        self.sem.set_status_poll(v)
-        self.settings.sem_status_poll_s = float(v)
+        self.sem.set_polling(v)
+        self.settings.sem_polling = bool(v)
 
     def refresh_sem(self):
         self._call(self.sem.refresh, what="SEM read")
@@ -599,9 +601,19 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         busy = self.link.busy_with
         self.l_bus.setText(f"port: {busy}" + (f" (+{self.link.pending} queued)" if self.link.pending else "")
                            if busy else "port idle")
-        n = st.next_poll_in_s
-        self.l_poll.setText("stage auto-read off" if n is None else
-                            ("stage moving" if st.moving else f"next stage read in {n:.0f} s"))
+        self.l_poll.setText(self._poll_text())
+
+    def _poll_text(self) -> str:
+        st = self.stage
+        if st.moving:
+            return "stage moving"
+        p = st.poll_period_s() if st.polling else None
+        tasks = self.link.poller.tasks()
+        self.l_poll.setToolTip("background reads – level: measured read time / period:\n" + "\n".join(
+            f"{t.name}  {t.level}: {t.cost:.2f} s / " + (f"{t.period:.1f} s" if t.period else "–")
+            for t in sorted(tasks, key=lambda t: t.level)))
+        return ("stage auto-read off" if not st.polling else
+                f"stage X/Y read every {p:.0f} s" if p else "stage auto-read on")
 
     # ================================================================ lifecycle
     def closeEvent(self, ev):  # noqa: N802

@@ -145,7 +145,7 @@ def microscope():
         link = MicroscopeLink.simulated(command_delay_s=0.05) if DRY_RUN else MicroscopeLink.open(MICROSCOPE_PORT)
     except Exception as e:  # noqa: BLE001 - no such port, or in use
         pytest.skip(f"microscope port {MICROSCOPE_PORT} not available: {type(e).__name__}: {e}")
-    sem = SEMControl(link, status_poll_s=0, refresh_on_start=False)
+    sem = SEMControl(link, polling=False, refresh_on_start=False)
     try:
         sem.refresh(("MAG",)).result(10)
     except Exception as e:  # noqa: BLE001 - port open, SEM silent

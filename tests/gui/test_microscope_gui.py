@@ -21,7 +21,7 @@ from easyebl.microscope.gui import MoveDialog  # noqa: E402
 @pytest.fixture
 def bundle(tmp_path):
     link = MicroscopeLink.simulated(command_delay_s=0.01)
-    sem = SEMControl(link, status_poll_s=0)
+    sem = SEMControl(link, polling=False)
     stage = StageControl(link, polling=False)
     sem.refresh().result(10)
     stage.refresh().result(10)
@@ -91,9 +91,18 @@ def test_microscope_window(qtbot, bundle):
     w.b_enable.click()
     qtbot.waitUntil(lambda: sim.sem["STAGE"] == "OFF" and not bundle.stage.moving, timeout=8000)
     assert bundle.stage.hand_control and not w.g_jog.isEnabled() and "SEM PC" in w.b_enable.text()
-    # the poll interval cannot go below 20 s
-    w.poll_s.setValue(5)
-    assert w.poll_s.value() == 20 and bundle.stage.poll_interval_s == 20
+    # stage auto-read on / off (stored)
+    w.cb_poll.setChecked(True)
+    assert bundle.stage.polling and bundle.settings.stage_polling is True
+    w.cb_poll.setChecked(False)
+    assert not bundle.stage.polling and bundle.settings.stage_polling is False
+    assert "off" in w._poll_text()
+    # the continuous SEM read can be switched off and on
+    assert not w.sem_poll.isChecked()  # the fixture's SEM module does not poll
+    w.sem_poll.setChecked(True)
+    assert bundle.sem.polling and bundle.settings.sem_polling is True
+    w.sem_poll.setChecked(False)
+    assert not bundle.sem.polling and bundle.settings.sem_polling is False
     # raw port log
     w._raw_tabs.setCurrentIndex(1)
     assert "TX" in w.raw.toPlainText() and "MAG" in w.raw.toPlainText()

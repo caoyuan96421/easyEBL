@@ -7,7 +7,7 @@ share the link:
 
 * :class:`SEMControl` – magnification, HV, beam, focus, stigmation, contrast …
   (implements :class:`MicroscopeControl`, the interface imaging and EDS use);
-* :class:`StageControl` – stage positions (polled at most every 20 s), moves, stop.
+* :class:`StageControl` – stage positions (polled with the SEM readbacks, by priority level), moves, stop.
 
 Quick start (simulator)::
 
@@ -24,20 +24,21 @@ hitachi_s3000_control_lib.
 from .control import MicroscopeControl, NotAvailable, StubMicroscope
 from .link import POLL, READ, SEM_SET, STAGE_CMD, MicroscopeLink
 from .sem import MAGNIFICATIONS, PRESET_KEYS, SEMControl
-from .stage import AXES, MIN_POLL_S, StageControl
+from .poll import Poller
+from .stage import AXES, StageControl
 
 __all__ = ["MicroscopeControl", "NotAvailable", "StubMicroscope", "MicroscopeLink", "SEMControl", "StageControl",
-           "AXES", "MIN_POLL_S", "MAGNIFICATIONS", "PRESET_KEYS", "SEM_SET", "STAGE_CMD", "READ", "POLL",
+           "AXES", "Poller", "MAGNIFICATIONS", "PRESET_KEYS", "SEM_SET", "STAGE_CMD", "READ", "POLL",
            "open_microscope"]
 
 
-def open_microscope(port: str, command_delay_s: float = 0.25, stage_poll_s: float = 30.0,
-                    sem_status_poll_s: float = 10.0, **session_kw):
+def open_microscope(port: str, command_delay_s: float = 0.25, sem_polling: bool = True,
+                    stage_polling: bool = True, **session_kw):
     """(link, SEMControl, StageControl) on *port* (e.g. ``"COM4"``) or ``"sim"`` (simulator)."""
     if str(port).lower() in ("sim", "simulator"):
         link = MicroscopeLink.simulated(command_delay_s=command_delay_s)
     else:
         link = MicroscopeLink.open(port, **session_kw)
-    sem = SEMControl(link, status_poll_s=sem_status_poll_s)
-    stage = StageControl(link, poll_s=stage_poll_s)
+    sem = SEMControl(link, polling=sem_polling)
+    stage = StageControl(link, polling=stage_polling)
     return link, sem, stage

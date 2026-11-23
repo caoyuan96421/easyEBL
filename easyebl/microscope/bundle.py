@@ -95,8 +95,8 @@ def open_bundle(port: str | None, baudrate: int = 9600, settings: MicroscopeSett
     if not port or str(port).lower() in ("none", "off"):
         return MicroscopeBundle(settings=settings)
     kw = {} if str(port).lower() in ("sim", "simulator") else {"baudrate": int(baudrate)}
-    link, sem, stage = open_microscope(port, command_delay_s=command_delay_s, stage_poll_s=settings.stage_poll_s,
-                                       sem_status_poll_s=settings.sem_status_poll_s, **kw)
+    link, sem, stage = open_microscope(port, command_delay_s=command_delay_s, sem_polling=settings.sem_polling,
+                                       stage_polling=settings.stage_polling, **kw)
     if not link.simulated:
         settings.port = port
     return MicroscopeBundle(link, sem, stage, settings)

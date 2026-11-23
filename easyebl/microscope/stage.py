@@ -5,11 +5,12 @@ for R (rotation) and T (tilt) – and converts to motor pulses with the
 calibrated scales of the driver (X/Y 25.6 /µm, Z 22.32 /µm, R 1849 /°,
 T 3528 /°).
 
-* **Polling** – positions are read in the background at most every
-  :attr:`MIN_POLL_S` (20 s; stage queries take ~1 s each and share the port with
-  the SEM).  One query per controller (``R3`` reads both motors of X/Y and of
-  Z/T), at the lowest priority, so SEM settings always go first.  No polling
-  while the stage moves; the moved axes are read once when the motion ends.
+* **Polling** – each controller (``R3`` reads both motors of X/Y and of Z/T; R
+  alone) is a task of the link's :class:`~easyebl.microscope.poll.Poller`, next to
+  the SEM readbacks: X/Y and Z/T at level 3, R at level 4 (:data:`POLL_LEVELS`;
+  at least every 15 s).  Lowest priority, so SEM
+  settings always go first.  No polling while the stage moves; the moved axes are
+  read once when the motion ends.
 * **Moves** – absolute or relative targets for any axes.  ``C0`` starts both
   motors of a controller, so the partner axis is re-targeted at its own
   position (``hold_partners``).  A move returns a Future that resolves when
@@ -34,14 +35,16 @@ import math
 import threading
 import time
 
-from .link import POLL, READ, STAGE_CMD, MicroscopeLink
+from .link import READ, STAGE_CMD, MicroscopeLink
 from .s3000 import Axis, MotionError, MotionState, StageRejectedBySem, axis_unit, from_pulses, to_pulses
 from .s3000.stage import AxisEvent
 
-__all__ = ["StageControl", "AXES", "MIN_POLL_S"]
+__all__ = ["StageControl", "AXES", "POLL_LEVELS"]
+
+#: background-read priority levels per controller (easyebl.microscope.poll); T comes with Z
+POLL_LEVELS = {"stage X/Y": 3, "stage Z/T": 3, "stage R": 4}
 
 AXES = ("X", "Y", "Z", "R", "T")
-MIN_POLL_S = 20.0
 _CONTROLLER = {"X": 0, "Y": 0, "R": 1, "Z": 2, "T": 2}
 
 
@@ -76,9 +79,8 @@ def _gather(futures) -> concurrent.futures.Future:
 class StageControl:
     """The five-axis stage through the shared link (see module docstring)."""
 
-    MIN_POLL_S = MIN_POLL_S
 
-    def __init__(self, link: MicroscopeLink, poll_s: float = 30.0, polling: bool = True, move_timeout_s: float = 600.0,
+    def __init__(self, link: MicroscopeLink, polling: bool = True, move_timeout_s: float = 600.0,
                  hand_control: bool = True):
         self.link = link
         link.stage = self
@@ -94,14 +96,12 @@ class StageControl:
         # one halt sequence at a time: S0 lines interleaved on the port (a second STOP, or the re-halt
         # of a move whose start was on the wire) make the SEM drop an acknowledgement
         self._halt_lock = threading.Lock()
-        self._poll_s = max(self.MIN_POLL_S, float(poll_s))
         self._polling = bool(polling)
-        self._t_next_poll = time.monotonic()  # first read right away
-        self.t_last_poll: float | None = None
-        self._stop = threading.Event()
         link.session.stage.add_listener(self._on_stage_message)
-        self._poller = threading.Thread(target=self._poll_loop, name="easyebl-microscope-stage-poll", daemon=True)
-        self._poller.start()
+        for u, name in ((0, "stage X/Y"), (2, "stage Z/T"), (1, "stage R")):
+            link.poller.add(name, lambda s, u=u: self._read_controller(s, u), level=POLL_LEVELS[name], owner=self,
+                            key=("stage-read", u), what=f"stage read (controller {u})",
+                            enabled=lambda: self._polling and not self.moving, cost_s=1.1)
 
     # ------------------------------------------------------------------ state
     @staticmethod
@@ -121,42 +121,19 @@ class StageControl:
 
     # ------------------------------------------------------------------ polling
     @property
-    def poll_interval_s(self) -> float:
-        return self._poll_s
-
-    def set_poll_interval(self, seconds: float) -> float:
-        """Background read interval; never shorter than :attr:`MIN_POLL_S`.  Returns the value used."""
-        self._poll_s = max(self.MIN_POLL_S, float(seconds))
-        self._t_next_poll = min(self._t_next_poll, time.monotonic() + self._poll_s)
-        return self._poll_s
-
-    @property
     def polling(self) -> bool:
         return self._polling
 
     def set_polling(self, on: bool) -> None:
         self._polling = bool(on)
 
-    @property
-    def next_poll_in_s(self) -> float | None:
-        return max(0.0, self._t_next_poll - time.monotonic()) if self._polling else None
-
-    def _poll_loop(self) -> None:
-        while not self._stop.wait(0.2):
-            if not self._polling or time.monotonic() < self._t_next_poll:
-                continue
-            if self.moving or not self.link.connected:
-                self._t_next_poll = time.monotonic() + 1.0
-                continue
-            self._t_next_poll = time.monotonic() + self._poll_s
-            try:
-                self.refresh(priority=POLL)
-                self.t_last_poll = time.time()
-            except RuntimeError:  # link closed
-                return
+    def poll_period_s(self, name: str = "stage X/Y") -> float | None:
+        """Measured time between background reads of one controller (None: not known yet)."""
+        task = self.link.poller.task(name)
+        return task.period if task is not None else None
 
     def close(self) -> None:
-        self._stop.set()
+        self.link.poller.remove(self)
 
     # ------------------------------------------------------------------ reads
     def _ensure_on(self, session) -> None:
