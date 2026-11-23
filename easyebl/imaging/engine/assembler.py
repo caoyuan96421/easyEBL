@@ -217,7 +217,8 @@ class ImageAccumulator:
     def __init__(self, channels: tuple):
         self.channels = tuple(channels)
         self.images: dict[str, np.ndarray] = {}
-        self.row_n = np.zeros(0, int)
+        self.row_n = np.zeros(0, int)  # times each row was scanned
+        self.row_avg = np.zeros(0, int)  # frames in each row's current average
         self._key = None
         self._geo = None
 
@@ -230,15 +231,18 @@ class ImageAccumulator:
             self.channels = tuple(cfg.ai_channels)
             self.images = {c: np.full((cfg.ny, cfg.nx), np.nan, dtype=np.float32) for c in self.channels}
             self.row_n = np.zeros(cfg.ny, int)
+            self.row_avg = np.zeros(cfg.ny, int)
             return True
         if geo != self._geo:
             self._geo = geo
             self.row_n[:] = 0
+            self.row_avg[:] = 0
             return True
         return False
 
     def reset(self) -> None:
         self.row_n[:] = 0
+        self.row_avg[:] = 0
 
     def add_row(self, row: int, vals: np.ndarray, n_avg: int) -> None:
         n = self.row_n[row]
@@ -251,12 +255,13 @@ class ImageAccumulator:
                 img = self.images[c][row]
                 img += (vals[ci] - img) * w
         self.row_n[row] = n + 1
+        self.row_avg[row] = 1 if n == 0 or n_avg <= 1 else min(n + 1, n_avg)
 
     def snapshot(self) -> dict:
         return {c: a.copy() for c, a in self.images.items()}
 
     def frames_averaged(self) -> int:
-        return int(self.row_n.min()) if self.row_n.size else 0
+        return int(self.row_avg.min()) if self.row_avg.size else 0
 
 
 @dataclass

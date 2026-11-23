@@ -119,7 +119,7 @@ def test_eds_window_workflow(qtbot, eds, tmp_path):
     assert w._current.spectrum is not None and w._current.spectrum.total > 0
 
     # a small map + window maps
-    w._site_requested("map", (0.0, 0.0, 50.0, 50.0))
+    w._site_requested("map", (0.0, 0.0, 0.5, 0.5))  # field fractions
     w.m_nx.setValue(8)
     w.m_ny.setValue(6)
     w.m_dwell.setValue(5)
@@ -138,7 +138,7 @@ def test_eds_window_workflow(qtbot, eds, tmp_path):
     assert w._current.spectrum.total > 0
 
     # line scan
-    w._site_requested("line", (-40.0, 0.0, 40.0, 0.0))
+    w._site_requested("line", (-0.4, 0.0, 0.4, 0.0))
     w.l_n.setValue(6)
     w.l_dwell.setValue(5)
     w.start_linescan()
@@ -148,6 +148,48 @@ def test_eds_window_workflow(qtbot, eds, tmp_path):
     # files
     w._current.spectrum.save(tmp_path / "x.msa")
     assert (tmp_path / "x.msa").exists()
+
+
+
+def test_sites_follow_the_field_of_view_and_clear_all(qtbot, eds):
+    """Sites are fractions of the field: a magnification change keeps them in place on the
+    screen and in range; the map region cannot leave the image; Clear all resets everything."""
+    from easyebl.eds.spectrum import ElectronImage
+
+    w, mgr, dpp = eds
+    calls = {}
+    w.ctrl.acquire_map = lambda nx, ny, dwell, region: calls.update(map=region)
+    w.ctrl.acquire_spectrum = lambda t, **kw: calls.update(spectrum=kw)
+    # an SEM-like 4:3 image of the middle of a 100 µm field
+    w._show_image(ElectronImage(np.zeros((30, 40)), (0.0, 0.0, 40.0, 30.0), 1e-6, metadata={"field_um": 100.0}))
+    assert w._image_region() == pytest.approx((0.0, 0.0, 0.4, 0.3))
+    # drawn beyond the image: limited to it
+    w._site_requested("map", (0.1, 0.0, 0.4, 0.5))
+    assert w.map_region == pytest.approx((0.05, 0.0, 0.3, 0.3))  # x -0.1..0.2, y -0.15..0.15
+    w._site_requested("point", (0.45, 0.0))  # outside the image: ignored
+    assert w._sites == []
+    w._site_requested("point", (0.1, 0.1))
+    assert "(10.00, 10.00) µm" in w.site_list.item(0).text()
+    # ×10 magnification: same places in the field of view, 10× smaller in µm
+    w.ctrl.set_calibration(FieldCalibration(10.0, w.ctrl.calibration.v_full_scale))
+    w._tick()
+    assert w._sites[0].params == pytest.approx((0.1, 0.1))
+    assert "(1.00, 1.00) µm" in w.site_list.item(0).text()
+    w.start_map()
+    assert calls["map"] == pytest.approx((0.5, 0.0, 3.0, 3.0))
+    w.acquire_site(w._sites[0])
+    assert calls["spectrum"]["at_um"] == pytest.approx((1.0, 1.0))
+    # the old image keeps its place in the field of view
+    assert w._image_region() == pytest.approx((0.0, 0.0, 0.4, 0.3))
+    # Clear all: no sites, no line, map region = the whole image
+    w._site_requested("line", (-0.1, 0.0, 0.1, 0.0))
+    assert w.b_clear.text() == "Clear all" and w.b_clear.font().bold()
+    w.b_clear.click()
+    assert w._sites == [] and w.site_list.count() == 0 and w.line is None and w.map_region is None
+    assert w.m_region.text() == "whole image"
+    calls.clear()
+    w.start_map()
+    assert calls["map"] == pytest.approx((0.0, 0.0, 4.0, 3.0))  # the image at ×10
 
 
 def test_processor_dialog(qtbot, eds):
@@ -300,7 +342,7 @@ def test_live_maps_during_the_scan_and_dead_time_zones(qtbot, eds):
         assert f"chunk{{background:rgba({col}" in w.l_dead.styleSheet()
 
     # element maps appear while the map is still scanning; unscanned pixels are blank (NaN)
-    w._site_requested("map", (0.0, 0.0, 60.0, 60.0))
+    w._site_requested("map", (0.0, 0.0, 0.6, 0.6))
     w.m_nx.setValue(16)
     w.m_ny.setValue(12)
     w.m_dwell.setValue(25)  # ≈ 5 s

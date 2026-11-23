@@ -177,11 +177,13 @@ class SpectrumView(pg.PlotWidget):
 
 
 class ElectronImageView(pg.GraphicsLayoutWidget):
-    """Electron image (µm coordinates) with acquisition sites and drawing tools.
+    """Electron image with acquisition sites and drawing tools.
 
+    The coordinates are whatever the owner uses (the EDS window: fractions of the
+    deflection field, so sites do not depend on the magnification).
     Tools: ``point``, ``rect``, ``ellipse``, ``line`` (click/drag on the image);
-    ``siteRequested(kind, params)`` is emitted with µm parameters:
-    point (x, y) · rect/ellipse (cx, cy, w, h) · line (x0, y0, x1, y1).
+    ``siteRequested(kind, params)`` is emitted with point (x, y) · rect/ellipse
+    (cx, cy, w, h) · line (x0, y0, x1, y1).
     """
 
     siteRequested = QtCore.Signal(str, tuple)

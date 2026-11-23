@@ -40,20 +40,24 @@ class _Site:
     def __init__(self, sid: int, kind: str, params: tuple):
         self.id, self.kind, self.params = sid, kind, tuple(float(p) for p in params)
         self.spectrum: Spectrum | None = None
+        self.text = ""  # fixed description (map pixel, file …)
         self.color = SITE_COLORS[(sid - 1) % len(SITE_COLORS)]
 
     @property
     def name(self) -> str:
         return f"Spectrum {self.id}"
 
-    def describe(self) -> str:
-        p = self.params
+    def describe(self, field_um: float = 1.0) -> str:
+        """*params* are fractions of the deflection field; shown in µm at *field_um*."""
+        if self.text:
+            return f"{self.name} – {self.text}"
+        p = [v * field_um for v in self.params]
         if self.kind == "point":
             return f"{self.name} – point ({p[0]:.2f}, {p[1]:.2f}) µm"
         if self.kind in ("rect", "ellipse"):
             return f"{self.name} – {self.kind} {p[2]:.2f}×{p[3]:.2f} µm"
         if self.kind == "field":
-            return f"{self.name} – whole field"
+            return f"{self.name} – whole image"
         return f"{self.name} – SEM spot"
 
 
@@ -110,7 +114,8 @@ class EDSWindow(QtWidgets.QMainWindow):
         # ------------------------------------------------ central area
         self.imgview = ElectronImageView()
         self.imgview.siteRequested.connect(self._site_requested)
-        self.imgview.pointerMoved.connect(lambda x, y: self.l_ptr.setText(f"x {x:.2f} µm  y {y:.2f} µm"))
+        self.imgview.pointerMoved.connect(
+            lambda x, y: self.l_ptr.setText(f"x {x * self._field():.2f} µm  y {y * self._field():.2f} µm"))
         self.specview = SpectrumView()
         self.specview.cursorMoved.connect(self._cursor)
         self.site_list = QtWidgets.QListWidget()
@@ -134,14 +139,20 @@ class EDSWindow(QtWidgets.QMainWindow):
             if key == "point":
                 a.setChecked(True)
         self._tool_group.triggered.connect(lambda a: setattr(self.imgview, "tool", a.data()))
-        tools.addSeparator()
-        tools.addAction("Clear sites", self.clear_sites)
+        self.b_clear = QtWidgets.QPushButton("Clear all")
+        f_ = self.b_clear.font()
+        f_.setBold(True)
+        f_.setPointSizeF(f_.pointSizeF() * 1.4)
+        self.b_clear.setFont(f_)
+        self.b_clear.setToolTip("remove all sites and the line; the map region goes back to the whole image")
+        self.b_clear.clicked.connect(self.clear_all)
 
         left = QtWidgets.QWidget()
         ll = QtWidgets.QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.addWidget(QtWidgets.QLabel("<b>Electron image</b>"))
         ll.addWidget(tools)
+        ll.addWidget(self.b_clear)
         ll.addWidget(self._image_controls())
         ll.addWidget(self.imgview, 1)
         ll.addWidget(self.site_list)
@@ -730,8 +741,73 @@ class EDSWindow(QtWidgets.QMainWindow):
     def notify(self, msg: str):
         self.log.appendPlainText(time.strftime("%H:%M:%S  ") + msg)
 
+    # Sites, the line and the map region are kept in fractions of the deflection field
+    # (centre 0, full field ±0.5), so they stay where they were drawn relative to the
+    # field of view when the magnification changes; µm = fraction × the present field.
+    def _field(self) -> float:
+        return float(self.ctrl.calibration.field_size_um)
+
+    def _um(self, params) -> tuple:
+        f = self._field()
+        return tuple(float(p) * f for p in params)
+
+    def _frac(self, region_um, field_um=None) -> tuple:
+        f = float(field_um or self._field())
+        return tuple(float(p) / f for p in region_um)
+
+    def _frac_of(self, obj) -> tuple:
+        """Region of an ElectronImage / SpectrumMap in field fractions (field at its acquisition)."""
+        return self._frac(obj.region_um, (obj.metadata or {}).get("field_um"))
+
     def _image_region(self) -> tuple:
-        return self.image.region_um if self.image is not None else self.ctrl.full_field_um()
+        """The SEM / EDS image in field fractions (the whole field without an image)."""
+        if self.image is None:
+            return (0.0, 0.0, 1.0, 1.0)
+        return self._frac_of(self.image)
+
+    def _show_image(self, im: ElectronImage) -> None:
+        self.image = im
+        self.imgview.set_image(im.data, self._image_region())
+
+    def _clip(self, kind: str, params: tuple):
+        """*params* limited to the image; None if nothing of it is inside."""
+        cx, cy, w, h = self._image_region()
+        x0, x1, y0, y1 = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+        cl = lambda v, a, b: min(max(v, a), b)  # noqa: E731
+        if kind == "point":
+            x, y = params
+            return params if (x0 <= x <= x1 and y0 <= y <= y1) else None
+        if kind == "line":
+            a, b, c, d = params
+            out = (cl(a, x0, x1), cl(b, y0, y1), cl(c, x0, x1), cl(d, y0, y1))
+            return out if out[:2] != out[2:] else None
+        pcx, pcy, pw, ph = params
+        l, r = max(pcx - pw / 2, x0), min(pcx + pw / 2, x1)
+        b_, t = max(pcy - ph / 2, y0), min(pcy + ph / 2, y1)
+        if r - l <= 0 or t - b_ <= 0:
+            return None
+        return ((l + r) / 2, (b_ + t) / 2, r - l, t - b_)
+
+    def _line_text(self) -> str:
+        if self.line is None:
+            return "draw a line on the image"
+        x0, y0, x1, y1 = self._um(self.line)
+        return f"({x0:.1f}, {y0:.1f}) → ({x1:.1f}, {y1:.1f}) µm, {np.hypot(x1 - x0, y1 - y0):.2f} µm"
+
+    def _region_text(self) -> str:
+        if self.map_region is None:
+            return "whole image"
+        cx, cy, w, h = self._um(self.map_region)
+        return f"{w:.2f} × {h:.2f} µm at ({cx:.1f}, {cy:.1f})"
+
+    def _field_changed(self) -> None:
+        """New magnification: same places in the field of view, new µm values."""
+        for i, s in enumerate(self._sites):
+            it = self.site_list.item(i)
+            if it is not None:
+                it.setText(s.describe(self._field()))
+        self.l_line.setText(self._line_text())
+        self.m_region.setText(self._region_text())
 
     def _cursor(self, e, c):
         near = xray.lines_near(e, tol=0.04, beam_kv=self._kv(), min_weight=0.3)[:3]
@@ -778,28 +854,50 @@ class EDSWindow(QtWidgets.QMainWindow):
         if abs(getattr(cfg, "rotation_rad", 0.0)) > 1e-6:
             self.notify("note: the SEM image is rotated – EDS sites use unrotated field coordinates")
         region = (cfg.center_um[0], cfg.center_um[1], cfg.width_um, cfg.height)
-        self.image = ElectronImage(np.asarray(f.image, float), region, cfg.dwell_s, metadata={"source": "SEM"})
-        self.imgview.set_image(self.image)
+        cal = getattr(f, "calibration", None)
+        field = float(cal.field_size_um) if cal is not None else self._field()
+        self._show_image(ElectronImage(np.asarray(f.image, float), region, cfg.dwell_s,
+                                       metadata={"source": "SEM", "field_um": field}))
+        self._limit_map_region()
         self.notify(f"electron image from the SEM: {cfg.nx}×{cfg.ny}, {cfg.width_um:g} µm field")
 
     def _site_requested(self, kind: str, params: tuple):
+        """A site drawn on the image (field fractions), limited to the image."""
+        clipped = self._clip(kind, tuple(float(p) for p in params))
+        if clipped is None:
+            self.notify(f"{kind}: outside the image – ignored")
+            return
+        params = clipped
         if kind == "line":
             self.line = params
-            self.l_line.setText(f"({params[0]:.1f}, {params[1]:.1f}) → ({params[2]:.1f}, {params[3]:.1f}) µm, "
-                                f"{np.hypot(params[2] - params[0], params[3] - params[1]):.2f} µm")
+            self.l_line.setText(self._line_text())
             self.imgview.add_site("line", "line", params, "#ffffff", "line")
             return
         if kind == "map":
             self.map_region = params
-            self.m_region.setText(f"{params[2]:.2f} × {params[3]:.2f} µm at ({params[0]:.1f}, {params[1]:.1f})")
+            self.m_region.setText(self._region_text())
             self.imgview.add_site("mapregion", "map", params, "#ffffff", "map")
             return
         self._new_site(kind, params)
 
+    def _limit_map_region(self) -> None:
+        """Keep the map region inside the (new) image."""
+        if self.map_region is None:
+            return
+        r = self._clip("map", self.map_region)
+        if r != self.map_region:
+            self.map_region = r
+            if r is None:
+                self.imgview.remove_site("mapregion")
+                self.notify("the map region was outside the new image: maps cover the whole image")
+            else:
+                self.imgview.add_site("mapregion", "map", r, "#ffffff", "map")
+            self.m_region.setText(self._region_text())
+
     def _new_site(self, kind: str, params: tuple):
         site = _Site(next(self._site_ids), kind, params)
         self._sites.append(site)
-        self.site_list.addItem(site.describe())
+        self.site_list.addItem(site.describe(self._field()))
         self.site_list.item(self.site_list.count() - 1).setForeground(QtGui.QColor(site.color))
         if kind in ("point", "rect", "ellipse"):
             self.imgview.add_site(site.id, kind, params, site.color, str(site.id))
@@ -821,17 +919,18 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.settings.spectrum_time_s, self.settings.live_time_mode = t, live
         kw = {"live_time": live, "title": site.name}
         if site.kind == "point":
-            kw["at_um"] = site.params
+            kw["at_um"] = self._um(site.params)
         elif site.kind in ("rect", "ellipse"):
-            kw["region_um"], kw["shape"] = site.params, site.kind
+            kw["region_um"], kw["shape"] = self._um(site.params), site.kind
         elif site.kind == "field":
-            kw["region_um"], kw["shape"] = site.params, "rect"
+            kw["region_um"], kw["shape"] = self._um(site.params), "rect"
         job = self._start(self.ctrl.acquire_spectrum, t, **kw)
         if job is not None:
             job._site = site
 
     def start_map(self):
-        region = self.map_region or self._image_region()
+        self._limit_map_region()
+        region = self._um(self.map_region or self._image_region())
         s = self.settings
         s.map_nx, s.map_ny, s.map_dwell_ms = self.m_nx.value(), self.m_ny.value(), self.m_dwell.value()
         job = self._start(self.ctrl.acquire_map, s.map_nx, s.map_ny, s.map_dwell_ms / 1e3, region)
@@ -843,7 +942,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         if self.line is None:
             self.notify("draw a line on the electron image first (Line tool)")
             return
-        x0, y0, x1, y1 = self.line
+        x0, y0, x1, y1 = self._um(self.line)
         self._start(self.ctrl.acquire_linescan, (x0, y0), (x1, y1), self.l_n.value(), self.l_dwell.value() / 1e3)
 
     def stop(self):
@@ -856,6 +955,15 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.imgview.clear_sites()
         self._current = None
         self.specview.clear_spectra()
+
+    def clear_all(self):
+        """Clear all: sites, the line, and the map region (back to the whole image)."""
+        self.clear_sites()  # also removes the line and map outlines from the image
+        self.line = None
+        self.l_line.setText(self._line_text())
+        self.map_region = None
+        self.m_region.setText(self._region_text())
+        self.imgview.set_overlay(None)
 
     def _select_site(self, row: int):
         self._current = self._sites[row] if 0 <= row < len(self._sites) else None
@@ -1192,7 +1300,7 @@ class EDSWindow(QtWidgets.QMainWindow):
             return
         m = self._maps[i - 1]
         col = MAP_COLORS[(i - 1) % len(MAP_COLORS)]
-        region = self.map.region_um
+        region = self._frac_of(self.map)
         if m.data.shape != self.map.shape:
             pass  # binned: same region, coarser
         self.imgview.set_overlay(m.data, region, col)
@@ -1208,7 +1316,9 @@ class EDSWindow(QtWidgets.QMainWindow):
         sp = sm.sum_spectrum(mask).with_calibration(self.ctrl.energy_calibration)
         sp.title = f"map pixel ({col}, {row})"
         sp.metadata = dict(sp.metadata or {}, beam_kv_source=sm.metadata.get("beam_kv_source", "nominal"))
-        site = _Site(next(self._site_ids), "point", sm.pixel_to_um(c0 + (b - 1) / 2, r0 + (b - 1) / 2))
+        site = _Site(next(self._site_ids), "point",
+                     self._frac(sm.pixel_to_um(c0 + (b - 1) / 2, r0 + (b - 1) / 2), sm.metadata.get("field_um")))
+        site.text = sp.title
         site.spectrum = sp
         self._sites.append(site)
         self.site_list.addItem(f"{site.name} – {sp.title}")
@@ -1219,7 +1329,8 @@ class EDSWindow(QtWidgets.QMainWindow):
             return
         sp = self.map.sum_spectrum().with_calibration(self.ctrl.energy_calibration)
         sp.metadata = dict(sp.metadata or {}, beam_kv_source=self.map.metadata.get("beam_kv_source", "nominal"))
-        site = _Site(next(self._site_ids), "field", self.map.region_um)
+        site = _Site(next(self._site_ids), "field", self._frac_of(self.map))
+        site.text = f"map sum ({int(self.map.done.sum())} px)"
         site.spectrum = sp
         self._sites.append(site)
         self.site_list.addItem(f"{site.name} – map sum ({int(self.map.done.sum())} px)")
@@ -1258,11 +1369,11 @@ class EDSWindow(QtWidgets.QMainWindow):
             site = self._current
             kw = {"live_time": True, "title": "calibration"}
             if site is not None and site.kind == "point":
-                kw["at_um"] = site.params
+                kw["at_um"] = self._um(site.params)
             elif site is not None and site.kind in ("rect", "ellipse", "field"):
-                kw["region_um"], kw["shape"] = site.params, ("ellipse" if site.kind == "ellipse" else "rect")
+                kw["region_um"], kw["shape"] = self._um(site.params), ("ellipse" if site.kind == "ellipse" else "rect")
             elif self.image is not None:
-                kw["region_um"] = self.image.region_um
+                kw["region_um"] = self._um(self._image_region())
             return self.ctrl.acquire_spectrum(seconds, **kw)
 
         d = CalibrationDialog(sp, self.ctrl.energy_calibration, acquire=acquire, parent=self,
@@ -1366,6 +1477,7 @@ class EDSWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Open", str(e))
             return
         site = _Site(next(self._site_ids), "spot", ())
+        site.text = os.path.basename(path)
         site.spectrum = sp
         sp.title = sp.title or os.path.basename(path)
         sp.metadata = dict(sp.metadata or {}, beam_kv_source="file")
@@ -1475,6 +1587,10 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     def _tick(self):
         self._follow_microscope_kv()
+        f = self._field()
+        if f != getattr(self, "_field_shown", None):
+            self._field_changed()
+        self._field_shown = f
         for ev in self._sub.drain():
             self._event(ev)
         job = self._job
@@ -1528,8 +1644,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         elif ev.kind == "image":
             im = d.get("image")
             if im is not None:
-                self.image = im
-                self.imgview.set_image(im)
+                self._show_image(im)
         elif ev.kind == "pixel":
             sm = d.get("map")
             if sm is not None:
@@ -1544,7 +1659,8 @@ class EDSWindow(QtWidgets.QMainWindow):
                     self._map_live_t = time.monotonic()
                     se = np.where(sm.done, sm.se, np.nan)
                     if np.isfinite(se).any() and sm.shape[0] > 1:
-                        self.imgview.set_overlay(np.nan_to_num(se - np.nanmin(se)), sm.region_um, (120, 200, 255))
+                        self.imgview.set_overlay(np.nan_to_num(se - np.nanmin(se)), self._frac_of(sm),
+                                                (120, 200, 255))
         if "progress" in d:
             self.p_job.setValue(int(1000 * float(d["progress"])))
 
@@ -1568,8 +1684,8 @@ class EDSWindow(QtWidgets.QMainWindow):
                 if self.sp_autoid.isChecked() and site is self._current and res.total > 200 and not job.cancelled:
                     self.analyse(autoid=True)
         elif job.kind == "image" and isinstance(res, ElectronImage):
-            self.image = res
-            self.imgview.set_image(res)
+            self._show_image(res)
+            self._limit_map_region()
         elif job.kind == "map" and isinstance(res, SpectrumMap):
             self._map_running = None
             self._map_beam_kv(res)
@@ -1596,7 +1712,7 @@ class EDSWindow(QtWidgets.QMainWindow):
     def _map_done(self, sm: SpectrumMap):
         self.imgview.set_overlay(None)
         self.m_progress.setValue(int(100 * sm.done.mean()))
-        self.imgview.add_site("mapregion", "map", sm.region_um, "#ffffff", "map")
+        self.imgview.add_site("mapregion", "map", self._frac_of(sm), "#ffffff", "map")
         oh = sm.metadata.get("overhead_s")
         self.notify(f"map {sm.shape[1]}×{sm.shape[0]}: {int(sm.done.sum())} px, "
                     f"{sm.sum_spectrum().total:,} counts" + (f", overhead {oh * 1e3:.0f} ms/px" if oh else ""))

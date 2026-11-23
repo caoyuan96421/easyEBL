@@ -143,6 +143,15 @@ def test_image_accumulator_running_average_and_reset():
     # exponential average over ≈4 frames, starting with a plain mean
     assert 5.0 < acc.images["video"][0, 0] < 9.0
     assert np.isnan(acc.images["video"][1]).all()
+    acc.add_row(1, np.zeros((1, 4)), n_avg=4)
+    assert acc.frames_averaged() == 1  # row 1 has one frame so far
+    for _ in range(5):
+        acc.add_row(1, np.zeros((1, 4)), n_avg=4)
+    assert acc.frames_averaged() == 4  # capped at the averaging depth
+    acc.add_row(0, np.zeros((1, 4)), n_avg=1)
+    acc.add_row(1, np.zeros((1, 4)), n_avg=1)
+    assert acc.frames_averaged() == 1  # a single scan replaces the rows: no average
+    assert acc.row_n.min() == 7
     assert not acc.ensure(cfg.with_(dwell_s=7e-6))  # speed change keeps the average
     assert acc.ensure(cfg.with_(center_um=(1.0, 0.0)))  # beam shift restarts it…
     assert acc.row_n.sum() == 0 and not np.isnan(acc.images["video"][0, 0])  # …but keeps pixels visible

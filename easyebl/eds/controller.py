@@ -681,9 +681,9 @@ class EDSController:
         pts = grid_points(region[:2], region[2], region[3], nx, ny)
         volts = self._to_volts(pts).reshape(ny, nx, 2)
         return self._start("image", f"electron image {nx}×{ny}", self._job_image, nx, ny, float(dwell_s), region,
-                           volts)
+                           volts, float(self._cal.field_size_um))
 
-    def _job_image(self, job, nx, ny, dwell, region, volts):
+    def _job_image(self, job, nx, ny, dwell, region, volts, field_um=None):
         o = self.options
         rate = self.rate
         spp = max(1, int(round(dwell * rate)))
@@ -741,14 +741,15 @@ class EDSController:
                     self.handle.abort()
                 if time.monotonic() - last > o.update_s:
                     last = time.monotonic()
-                    part = ElectronImage(img.copy(), region, dwell, metadata={"rows": state["rows"]})
+                    part = ElectronImage(img.copy(), region, dwell,
+                                         metadata={"rows": state["rows"], "field_um": field_um})
                     job.partial = part
                     self._progress(job, state["rows"] / ny, f"electron image row {state['rows']}/{ny}",
                                    kind="image", image=part)
             th.join(5)
             if "e" in res:
                 raise res["e"]
-        im = ElectronImage(img, region, dwell, metadata={"rate": rate, "samples_per_pixel": spp})
+        im = ElectronImage(img, region, dwell, metadata={"rate": rate, "samples_per_pixel": spp, "field_um": field_um})
         job.partial = im
         if job.cancelled:
             raise JobCancelled()
@@ -765,7 +766,7 @@ class EDSController:
         volts = self._to_volts(pts)
         desc = title or f"map {nx}×{ny} @ {dwell_s * 1e3:g} ms"
         return self._start("map", desc, self._job_points, volts, (ny, nx), float(dwell_s), region, desc,
-                           {"type": "map"})
+                           {"type": "map", "field_um": float(self._cal.field_size_um)})
 
     def acquire_linescan(self, p0_um, p1_um, n: int, dwell_s: float, title: str = "") -> EDSJob:
         """Spectra at *n* points from *p0_um* to *p1_um* (a 1×n map whose metadata holds the path)."""
@@ -777,7 +778,8 @@ class EDSController:
         region = (float((p0[0] + p1[0]) / 2), float((p0[1] + p1[1]) / 2), L, 0.0)
         desc = title or f"line scan {n} pts @ {dwell_s * 1e3:g} ms"
         return self._start("linescan", desc, self._job_points, volts, (1, n), float(dwell_s), region, desc,
-                           {"type": "linescan", "p0_um": p0.tolist(), "p1_um": p1.tolist(),
+                           {"type": "linescan", "field_um": float(self._cal.field_size_um),
+                            "p0_um": p0.tolist(), "p1_um": p1.tolist(),
                             "points_um": pts.tolist()})
 
     def _job_points(self, job, volts, shape, dwell, region, title, meta):
