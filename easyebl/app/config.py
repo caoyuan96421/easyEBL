@@ -3,6 +3,10 @@
 Stored per user in ``%APPDATA%\\easyEBL\\system.json`` (Windows) or
 ``~/.config/easyebl/system.json``; ``EASYEBL_SYSTEM_CONFIG`` overrides the path.
 Edited in the menu window (*Hardware → Configure…*).
+
+The ``wiring`` section (:class:`~easyebl.hal.wiring.Wiring`, the *Wiring* tab)
+maps every DAQ signal to its physical channel.  A file without it (written
+before the tab existed) keeps the wiring of the DAQ preset / config file.
 """
 from __future__ import annotations
 
@@ -10,10 +14,14 @@ from dataclasses import asdict, dataclass, field, fields, replace
 import json
 import os
 
-__all__ = ["DAQSection", "EDSSection", "MicroscopeSection", "ScanMonitorSection", "SystemConfig", "default_config_path",
+from ..hal.wiring import Wiring
+
+__all__ = ["Wiring", "DAQSection", "AI_RANGES_V", "EDSSection", "MicroscopeSection", "ScanMonitorSection", "SystemConfig", "default_config_path",
            "AI_TERMINALS", "BAUD_RATES"]
 
 AI_TERMINALS = ("DIFF", "RSE", "NRSE", "PSEUDO_DIFF")
+#: USB-6363 AI input ranges (±V): the smallest that holds the signal uses the full 16-bit resolution
+AI_RANGES_V = (10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1)
 BAUD_RATES = (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200)
 
 
@@ -38,6 +46,7 @@ class DAQSection:
     rate: float | None = None  # sample clock (S/s); None: device maximum (500 kS/s on the simulator)
     latency_ms: float = 100.0  # output buffer depth (setting-change latency)
     ai_terminal: str | None = None  # video input mode; None: the preset's
+    ai_range_v: float | None = None  # video input range (±V); None: the preset's
     invert_x: bool = False  # reverse the X deflection output
     invert_y: bool = False  # reverse the Y deflection output
     swap_xy: bool = False  # image X drives the Y deflection (before the inversions)
@@ -79,6 +88,8 @@ class SystemConfig:
     eds: EDSSection = field(default_factory=EDSSection)
     microscope: MicroscopeSection = field(default_factory=MicroscopeSection)
     monitor: ScanMonitorSection = field(default_factory=ScanMonitorSection)
+    #: signal → channel map; None = the preset's / config file's wiring (files without a wiring section)
+    wiring: Wiring | None = None
     path: str = field(default="", repr=False, compare=False)
 
     _SECTIONS = {"daq": DAQSection, "eds": EDSSection, "microscope": MicroscopeSection,
@@ -102,6 +113,47 @@ class SystemConfig:
                        microscope=replace(self.microscope,
                                           port="none" if self.microscope.port == "none" else "sim"))
 
+    # ---------------------------------------------------------------- DAQ wiring
+    def base_daq_config(self, preset: str | None = None, config_file: str | None = None):
+        """The DAQConfig of the preset / config file, before the wiring section is applied."""
+        from ..hal.config import DAQConfig
+
+        c = self.daq
+        path = c.config_file if config_file is None else config_file
+        if path:
+            with open(path, encoding="utf-8") as fh:
+                cfg = DAQConfig.from_json(fh.read())
+        else:
+            cfg = DAQConfig.usb6363() if (preset or c.preset) == "usb6363" else DAQConfig()
+        if c.device:
+            cfg.device = c.device
+        if c.ai_terminal:
+            cfg.ai_terminal = c.ai_terminal
+        if c.ai_range_v:
+            cfg.ai_range_v = float(c.ai_range_v)
+        return cfg
+
+    def preset_wiring(self, preset: str | None = None, config_file: str | None = None) -> Wiring:
+        """The wiring used when there is no wiring section (today's defaults)."""
+        return Wiring.from_daq_config(self.base_daq_config(preset, config_file))
+
+    def effective_wiring(self) -> Wiring:
+        return self.wiring.copy() if self.wiring is not None else self.preset_wiring()
+
+    def daq_config(self):
+        """The DAQConfig the HAL is opened with: preset / file + device + input mode + wiring."""
+        cfg = self.base_daq_config()
+        if self.wiring is not None:
+            self.wiring.validate(cfg.ai_terminal)
+            self.wiring.apply_to(cfg)
+        cfg.validate()
+        return cfg
+
+    @property
+    def eds_video_channel(self) -> str | None:
+        """The video input EDS co-acquires as its SE signal."""
+        return self.effective_wiring().eds_video
+
     @property
     def simulated(self) -> bool:
         return self.daq.simulated and self.eds.mca != "dp5" and self.microscope.port.lower() in ("sim", "none")
@@ -119,6 +171,8 @@ class SystemConfig:
             known = {f.name for f in fields(sec_cls)}
             vals = {k: v for k, v in (d.get(name) or {}).items() if k in known}
             setattr(out, name, sec_cls(**vals))
+        w = d.get("wiring")
+        out.wiring = Wiring.from_dict(w) if isinstance(w, dict) else None
         return out
 
     @classmethod

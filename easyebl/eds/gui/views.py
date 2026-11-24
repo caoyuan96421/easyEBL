@@ -201,6 +201,7 @@ class ElectronImageView(pg.GraphicsLayoutWidget):
         self.vb.addItem(self.overlay)
         self.tool = "point"
         self._items: dict = {}
+        self.styles: dict = {}  # key → {"bold", "width", "kind", "label"} of each site drawn
         self._drag = None
         self._drag_item = None
         self.region_um = (0.0, 0.0, 100.0, 100.0)
@@ -240,13 +241,14 @@ class ElectronImageView(pg.GraphicsLayoutWidget):
         self.overlay.setRect(QtCore.QRectF(cx - w / 2, cy - h / 2, w, h))
 
     # ---------------------------------------------------------------- sites
-    def add_site(self, key, kind: str, params: tuple, color: str, label: str = "") -> None:
+    def add_site(self, key, kind: str, params: tuple, color: str, label: str = "", bold: bool = False) -> None:
+        """Draw (or redraw) a site.  ``bold``: the selected one – thicker outline, label in bold."""
         self.remove_site(key)
-        pen = pg.mkPen(color, width=2)
+        pen = pg.mkPen(color, width=4 if bold else 2)
         pen.setCosmetic(True)
         if kind == "point":
             x, y = params
-            it = pg.ScatterPlotItem([x], [y], symbol="+", size=16, pen=pen, brush=None)
+            it = pg.ScatterPlotItem([x], [y], symbol="+", size=24 if bold else 16, pen=pen, brush=None)
         elif kind in ("rect", "map"):
             cx, cy, w, h = params
             it = QtWidgets.QGraphicsRectItem(cx - w / 2, cy - h / 2, w, h)
@@ -266,14 +268,21 @@ class ElectronImageView(pg.GraphicsLayoutWidget):
         txt = None
         if label:
             txt = pg.TextItem(label, color=color, anchor=(0, 1))
+            f = QtGui.QFont(txt.textItem.font())
+            f.setBold(bold)
+            if bold:
+                f.setPointSizeF(f.pointSizeF() * 1.3)
+            txt.setFont(f)
             px, py = (params[0], params[1]) if kind != "line" else (params[2], params[3])
             if kind in ("rect", "ellipse", "map"):
                 px, py = params[0] - params[2] / 2, params[1] + params[3] / 2
             txt.setPos(px, py)
             self.vb.addItem(txt)
         self._items[key] = (it, txt)
+        self.styles[key] = {"bold": bool(bold), "width": pen.widthF(), "kind": kind, "label": label}
 
     def remove_site(self, key) -> None:
+        self.styles.pop(key, None)
         old = self._items.pop(key, None)
         if old:
             for it in old:
@@ -344,7 +353,8 @@ class ElectronImageView(pg.GraphicsLayoutWidget):
 class MapTile(QtWidgets.QFrame):
     """One element map with its label and a colour scale."""
 
-    clicked = QtCore.Signal(int, int)  # row, col
+    clicked = QtCore.Signal(int, int)  # row, col (left button)
+    menuRequested = QtCore.Signal(int, int, QtCore.QPoint)  # row, col, global position (right button)
 
     def __init__(self, label: str, data: np.ndarray, unit: str, color=(255, 255, 255), parent=None):
         super().__init__(parent)
@@ -383,13 +393,24 @@ class MapTile(QtWidgets.QFrame):
         if new_shape:
             self.vb.autoRange(padding=0)
 
-    def _click(self, ev):
-        p = self.vb.mapSceneToView(ev.scenePos())
+    def pixel_at(self, scene_pos):
+        """(row, col) of the map pixel under *scene_pos*, None outside the map."""
+        p = self.vb.mapSceneToView(scene_pos)
         ny, nx = self.data.shape
         col, row_flip = int(np.floor(p.x())), int(np.floor(p.y()))
         row = ny - 1 - row_flip
-        if 0 <= row < ny and 0 <= col < nx:
-            self.clicked.emit(row, col)
+        return (row, col) if 0 <= row < ny and 0 <= col < nx else None
+
+    def _click(self, ev):
+        rc = self.pixel_at(ev.scenePos())
+        if rc is None:
+            return
+        if ev.button() == QtCore.Qt.RightButton:
+            sp = ev.screenPos()
+            self.menuRequested.emit(rc[0], rc[1], QtCore.QPoint(int(sp.x()), int(sp.y())))
+            ev.accept()
+        elif ev.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit(*rc)
 
 
 class PeriodicTableWidget(QtWidgets.QWidget):

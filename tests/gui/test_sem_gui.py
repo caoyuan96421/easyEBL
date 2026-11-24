@@ -182,16 +182,14 @@ def test_saturation_shown_and_input_mode_fix(qtbot):
         w.scan.b_run.click()
         qtbot.waitUntil(lambda: "VIDEO SATURATED" in w.l_buf.text(), timeout=10000)
         assert "saturated" in w.log.toPlainText() and "AI−" in w.log.toPlainText()
+        assert "Hardware → Configure… → Wiring" in w.log.toPlainText()  # the input mode is hardware wiring
         w.open_advanced()
         d = w._adv
-        assert d.ai_mode.currentData() == "DIFF"
-        d.ai_mode.setCurrentIndex(d.ai_mode.findData("RSE"))
-        d.apply()
-        assert "Applied" in d.msg.text(), d.msg.text()
-        assert eng.handle.ai_terminal == "RSE"
+        assert not hasattr(d, "ai_mode") and not hasattr(d, "ai_range")  # no SEM-side copy of the setting
+        d.close()
+        eng.set_ai_terminal("RSE")  # what Apply & reconnect does with the Wiring tab's input mode
         qtbot.waitUntil(lambda: eng.state == EngineState.LIVE, timeout=10000)
         qtbot.waitUntil(lambda: "VIDEO SATURATED" not in w.l_buf.text(), timeout=10000)
-        d.close()
     finally:
         w.close()
         mgr.close()

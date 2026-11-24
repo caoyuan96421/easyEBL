@@ -149,6 +149,11 @@ class _InStream:
         return DEVICE.total - DEVICE.ai_read
 
 
+class _ExportSignals:
+    samp_clk_output_term = None
+    start_trig_output_term = None
+
+
 class Task:
     def __init__(self, name=""):
         self.name = name
@@ -161,6 +166,7 @@ class Task:
         self.timing = _Timing(self)
         self.out_stream = _OutStream(self)
         self.in_stream = _InStream(self)
+        self.export_signals = _ExportSignals()
         DEVICE.tasks.append(self)
 
     def kinds(self):

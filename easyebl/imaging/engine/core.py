@@ -1076,7 +1076,7 @@ class ImagingEngine:
             self.events.emit(
                 "warning",
                 f"video input saturated: {frac:.0%} of pixels at the ±{rng:g} V limit. {hint}"
-                "Check the video wiring, or change the input mode / range (Advanced… → Hardware).",
+                "Check the video wiring, or change the input mode / range (easyEBL menu: Hardware → Configure… → Wiring).",
                 saturation=frac,
             )
         elif frac < SATURATION_WARN / 4:

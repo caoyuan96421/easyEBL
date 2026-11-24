@@ -146,6 +146,77 @@ def test_hardware_dialog_roundtrip(qtbot):
     assert d.port() == "COM12"
 
 
+def _pick(combo, data):
+    i = combo.findData(data)
+    assert i >= 0, data
+    combo.setCurrentIndex(i)
+
+
+def test_hardware_dialog_wiring_tab(ui, qtbot):
+    """Wiring tab: USB-6363 dropdowns, conflicts block Apply, the wiring is saved and used by the (simulated) DAQ."""
+    from easyebl.app.gui import HardwareDialog
+
+    d = HardwareDialog(ui.config)
+    qtbot.addWidget(d)
+    w = d.wiring
+    assert [d.tabs.tabText(i) for i in range(d.tabs.count())] == ["Devices", "Wiring"]
+    assert d.config().wiring is None  # untouched: still the preset's wiring (no section written)
+    assert [w.ao_x.itemData(i) for i in range(w.ao_x.count())] == ["ao0", "ao1", "ao2", "ao3"]
+    assert w.blank.count() == 32 and w.blank.currentData() == "port0/line23"
+    assert [n for n, ch, _ in w.ext.items()] == [None, None] and [ch for _, ch, _ in w.ext.items()] == ["PFI6", "PFI7"]
+    ai = w.ai.rows[0]["combo"]
+    assert ai.count() == 32 and ai.currentData() == "ai0"
+    # DIFF: only the AI+ channels of the pairs are offered
+    _pick(w.ai_terminal, "DIFF")
+    assert ai.count() == 16 and ai.findData("ai8") < 0 and ai.findData("ai16") >= 0
+    _pick(w.ai_terminal, "RSE")
+    # the video input range lives here too (not in the SEM window)
+    assert w.ai_range.currentData() is None and "±10 V" in w.ai_range.itemText(0)
+    _pick(w.ai_range, 2.0)
+
+    # a conflict: two signals on one output
+    _pick(w.ao_y, "ao0")
+    assert not d._ok.isEnabled() and d.tabs.tabText(1).startswith("Wiring ⚠")
+    assert "share the analog output ao0" in w.issues_label.text() and "#f55" in w.ao_y.styleSheet()
+    _pick(w.ao_y, "ao1")
+    assert d._ok.isEnabled() and d.tabs.tabText(1) == "Wiring" and w.ao_y.styleSheet() == ""
+    # PFI6 is port1/line6: a static line there clashes with the relay line
+    r = w.static.add_row("relay", "PFI6")
+    assert not d._ok.isEnabled() and "#f55" in r["combo"].styleSheet()
+    _pick(r["combo"], "PFI9")
+    assert d._ok.isEnabled()
+
+    # a second SE input, used by EDS; clock export; X/Y on other outputs
+    _pick(w.ao_x, "ao2")
+    _pick(w.aux0, "ao0")
+    r = w.ai.add_row("bse", "ai4")
+    _pick(w.eds_video, "bse")
+    _pick(w.clock_out, "PFI12")
+    out = d.config()
+    assert out.wiring.ai_channels == {"video": "ai0", "bse": "ai4"} and out.wiring.eds_video == "bse"
+    assert (out.wiring.ao_x, out.wiring.aux0, out.wiring.sample_clock_out) == ("ao2", "ao0", "PFI12")
+    assert out.wiring.static_lines == {"relay": "PFI9"} and out.daq.ai_terminal == "RSE" and out.daq.ai_range_v == 2.0
+
+    # Apply & reconnect: saved with the system config and used by the HAL and its consumers
+    assert ui.restart_backend(out, ask=False)
+    back = SystemConfig.load(ui.config.path)
+    assert back.wiring == out.wiring
+    cfg = ui.backend.manager.config
+    assert (cfg.ao_x, cfg.aux_physical("aux0"), cfg.sample_clock_out) == ("ao2", "ao0", "PFI12")
+    assert cfg.ai_channels == {"video": "ai0", "bse": "ai4"} and cfg.static_lines == {"relay": "PFI9"}
+    assert ui.backend.eds.options.video_channel == "bse" and cfg.ai_range_v == 2.0
+    assert ui.backend.engine.options.ai_range_v is None  # the SEM uses the hardware range
+
+    # reopened, the dialog shows the saved wiring; Reset to preset brings back today's defaults
+    d2 = HardwareDialog(ui.config)
+    qtbot.addWidget(d2)
+    assert d2.wiring.wiring() == out.wiring and d2.config().wiring == out.wiring
+    d2.reset_wiring()
+    assert d2.wiring.wiring() == d2.preset_wiring() and d2.wiring.ao_x.currentData() == "ao0"
+    _pick(d2.daq_preset, "default")  # another preset loads its wiring
+    assert d2.wiring.blank.currentData() == "port0/line0"
+
+
 def test_single_instance(qtbot):
     """A second start (another process) hands its request to the running program."""
     import subprocess

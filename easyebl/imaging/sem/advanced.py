@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
-from ..engine import AI_RANGES_V, ImagingEngine, valid_rates
+from ..engine import ImagingEngine, valid_rates
 from .display import format_length
 
 __all__ = ["AdvancedDialog", "SaveSettings"]
@@ -88,22 +88,10 @@ class AdvancedDialog(QtWidgets.QDialog):
         self.latency.setToolTip("Output buffer depth. Settings reach the beam after about this time. "
                                 "Larger = more tolerant of PC stalls. Doubled automatically after an underflow.")
         f.addRow("Buffer / latency", self.latency)
-        self.ai_range = QtWidgets.QComboBox()
-        self.ai_range.addItem(f"configured (±{dc.ai_range_v:g} V)", None)
-        for v in AI_RANGES_V:
-            self.ai_range.addItem(f"±{v:g} V", v)
-        self.ai_range.setToolTip("Video input range: the smallest range that contains the signal uses the "
-                                 "full 16-bit resolution.")
-        f.addRow("Video input range", self.ai_range)
-        self.ai_mode = QtWidgets.QComboBox()
-        for mode, text in (("RSE", "RSE – single-ended, AI+ vs AI GND (default)"),
-                           ("DIFF", "DIFF – differential, AI+ and AI− both wired")):
-            self.ai_mode.addItem(text, mode)
-        if self.engine.handle.ai_terminal not in ("RSE", "DIFF"):  # set from config / console
-            self.ai_mode.addItem(self.engine.handle.ai_terminal, self.engine.handle.ai_terminal)
-        self.ai_mode.setToolTip("How the video input is wired. In DIFF mode an unconnected AI− floats and drives "
-                                "the reading into the ±range rail (saturated image). Applying restarts scanning.")
-        f.addRow("Video input mode", self.ai_mode)
+        # the video input mode and range are hardware wiring: easyEBL menu → Hardware → Configure… → Wiring
+        video = QtWidgets.QLabel(f"{dc.ai_terminal}, ±{dc.ai_range_v:g} V  (Hardware → Configure… → Wiring)")
+        video.setToolTip("The video input mode and range are set with the DAQ wiring in the easyEBL menu window.")
+        f.addRow("Video input", video)
         self.chunk = _dspin(0.5, 100, 1, " ms", 0.5)
         self.chunk.setToolTip("Lines are grouped into output blocks of about this length.")
         f.addRow("Output block", self.chunk)
@@ -286,8 +274,6 @@ class AdvancedDialog(QtWidgets.QDialog):
         i = 0 if o.rate is None else self.rate.findData(c.rate)
         self.rate.setCurrentIndex(max(0, i))
         self.latency.setValue(o.latency_s * 1e3)
-        self.ai_range.setCurrentIndex(max(0, self.ai_range.findData(o.ai_range_v)))
-        self.ai_mode.setCurrentIndex(max(0, self.ai_mode.findData(e.handle.ai_terminal)))
         self.chunk.setValue(o.chunk_s * 1e3)
         self.publish.setValue(o.publish_hz)
         self.restart.setChecked(o.restart_on_change)
@@ -319,15 +305,12 @@ class AdvancedDialog(QtWidgets.QDialog):
                     fs.set_manual_magnification(self.mag.value())
                 if abs(self.k_field.value() - fs.k_um) > 0.5:  # the box shows whole µm: not a change
                     fs.set_k(self.k_field.value())
-            if self.ai_mode.currentData() != e.handle.ai_terminal:
-                e.set_ai_terminal(self.ai_mode.currentData())
             rate = self.rate.currentData()
             if rate is not None and rate > e.daq_config.max_scan_rate(len(e.config.ai_channels)) * (1 + 1e-9):
                 rate = None
             e.set_options(
                 rate=rate,
                 latency_s=self.latency.value() / 1e3,
-                ai_range_v=self.ai_range.currentData(),
                 chunk_s=self.chunk.value() / 1e3,
                 publish_hz=self.publish.value(),
                 restart_on_change=self.restart.isChecked(),

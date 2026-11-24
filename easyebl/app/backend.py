@@ -66,20 +66,12 @@ class SystemBackend:
 
     def _open_daq(self) -> None:
         from ..core.calibration import FieldCalibration
-        from ..hal import DAQConfig, DAQManager, SimParams, SimulatedBackend, create_backend
+        from ..hal import DAQManager, SimParams, SimulatedBackend, create_backend
         from ..imaging.engine import EngineOptions, ImagingEngine
 
         c = self.config.daq
         try:
-            if c.config_file:
-                with open(c.config_file, encoding="utf-8") as fh:
-                    cfg = DAQConfig.from_json(fh.read())
-            else:
-                cfg = DAQConfig.usb6363() if c.preset == "usb6363" else DAQConfig()
-            if c.device:
-                cfg.device = c.device
-            if c.ai_terminal:
-                cfg.ai_terminal = c.ai_terminal
+            cfg = self.config.daq_config()  # preset / file with the Wiring tab's channels applied
             # the field itself is set by the global field calibration (FieldScale) once the microscope is open
             cal = FieldCalibration(100.0, cfg.full_scale_v, invert_x=bool(c.invert_x),
                                    invert_y=bool(c.invert_y), swap_xy=bool(c.swap_xy))
@@ -115,7 +107,8 @@ class SystemBackend:
             s = self.eds_settings
             self.eds = EDSController(self.manager, self.mca, self.engine.calibration, s.energy_calibration,
                                      s.beam_kv, s.takeoff_deg,
-                                     options=EDSOptions(external_control=self.config.eds.external_control),
+                                     options=EDSOptions(external_control=self.config.eds.external_control,
+                                                        video_channel=self._eds_video()),
                                      owner="eds")
         except Exception as e:  # noqa: BLE001
             self._fail("eds", e)
@@ -125,6 +118,11 @@ class SystemBackend:
                 except Exception:  # noqa: BLE001
                     pass
             self.mca = self.eds = None
+
+    def _eds_video(self) -> str | None:
+        """The SE input of EDS (Wiring tab), if the open DAQ has it."""
+        ch = self.config.eds_video_channel
+        return ch if ch in self.manager.config.ai_channels else None
 
     def _open_microscope(self) -> None:
         from ..microscope.bundle import MicroscopeBundle, open_bundle

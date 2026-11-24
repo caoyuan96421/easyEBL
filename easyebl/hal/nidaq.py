@@ -395,6 +395,11 @@ class NIDAQBackend(DAQBackend):
             ao.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
             ao.out_stream.output_buf_size = buf
             self._set_usb_xfer(ao.ao_channels, "ao_usb_xfer_req_size")
+            # optional exports for instruments that follow the scan (Hardware → Configure… → Wiring)
+            if cfg.sample_clock_out:
+                ao.export_signals.samp_clk_output_term = f"/{cfg.physical(cfg.sample_clock_out)}"
+            if cfg.start_trigger_out:
+                ao.export_signals.start_trig_output_term = f"/{cfg.physical(cfg.start_trigger_out)}"
             actual = float(ao.timing.samp_clk_rate)
             info["actual_rate"] = actual
             if abs(actual - rate) > 1e-6 * rate:

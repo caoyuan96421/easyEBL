@@ -35,6 +35,7 @@ def eds(qtbot, tmp_path):
     qtbot.addWidget(w)
     w.show()
     yield w, mgr, dpp
+    w._ask_unsaved = lambda items: "discard"  # unsaved test data: no dialog at the end
     w.close()
     link.close()
     dpp.close()
@@ -58,7 +59,7 @@ def test_eds_window_workflow(qtbot, eds, tmp_path):
     # calibration from a whole-field spectrum (the DP5 mock sees a 55Fe source: Mn Kα + Kβ)
     w.sp_time.setValue(1.5)
     w.sp_autoid.setChecked(False)
-    w.site_list.setCurrentRow(-1)
+    w.select(None)
     w.b_acquire.click()  # nothing selected: the whole image
     _wait_idle(qtbot, w)
     sp = w._current.spectrum
@@ -134,8 +135,9 @@ def test_eds_window_workflow(qtbot, eds, tmp_path):
     w.compute_phases()
     _wait_idle(qtbot, w)
     assert any(m.label == "Phases" for m in w._maps)
-    w._map_pixel(2, 3)
-    assert w._current.spectrum.total > 0
+    n_items = len(w.data)
+    w._map_pixel(2, 3)  # a click shows the pixel's spectrum without adding an item
+    assert w._spectrum_of_current().total > 0 and len(w.data) == n_items
 
     # line scan
     w._site_requested("line", (-0.4, 0.0, 0.4, 0.0))
@@ -158,7 +160,7 @@ def test_sites_follow_the_field_of_view_and_clear_all(qtbot, eds):
 
     w, mgr, dpp = eds
     calls = {}
-    w.ctrl.acquire_map = lambda nx, ny, dwell, region: calls.update(map=region)
+    w.ctrl.acquire_map = lambda nx, ny, dwell, region, **kw: calls.update(map=region)
     w.ctrl.acquire_spectrum = lambda t, **kw: calls.update(spectrum=kw)
     # an SEM-like 4:3 image of the middle of a 100 µm field
     w._show_image(ElectronImage(np.zeros((30, 40)), (0.0, 0.0, 40.0, 30.0), 1e-6, metadata={"field_um": 100.0}))
@@ -167,17 +169,18 @@ def test_sites_follow_the_field_of_view_and_clear_all(qtbot, eds):
     w._site_requested("map", (0.1, 0.0, 0.4, 0.5))
     assert w.map_region == pytest.approx((0.05, 0.0, 0.3, 0.3))  # x -0.1..0.2, y -0.15..0.15
     w._site_requested("point", (0.45, 0.0))  # outside the image: ignored
-    assert w._sites == []
+    assert len(w.data) == 0
     w._site_requested("point", (0.1, 0.1))
-    assert "(10.00, 10.00) µm" in w.site_list.item(0).text()
+    site = w.data.items[0]
+    assert "(10.00, 10.00) µm" in w._rows[site.number].text(3)
     # ×10 magnification: same places in the field of view, 10× smaller in µm
     w.ctrl.set_calibration(FieldCalibration(10.0, w.ctrl.calibration.v_full_scale))
     w._tick()
-    assert w._sites[0].params == pytest.approx((0.1, 0.1))
-    assert "(1.00, 1.00) µm" in w.site_list.item(0).text()
+    assert site.params == pytest.approx((0.1, 0.1))
+    assert "(1.00, 1.00) µm" in w._rows[site.number].text(3)
     w.start_map()
     assert calls["map"] == pytest.approx((0.5, 0.0, 3.0, 3.0))
-    w.acquire_site(w._sites[0])
+    w.acquire_site(site)
     assert calls["spectrum"]["at_um"] == pytest.approx((1.0, 1.0))
     # the old image keeps its place in the field of view
     assert w._image_region() == pytest.approx((0.0, 0.0, 0.4, 0.3))
@@ -185,7 +188,7 @@ def test_sites_follow_the_field_of_view_and_clear_all(qtbot, eds):
     w._site_requested("line", (-0.1, 0.0, 0.1, 0.0))
     assert w.b_clear.text() == "Clear all" and w.b_clear.font().bold()
     w.b_clear.click()
-    assert w._sites == [] and w.site_list.count() == 0 and w.line is None and w.map_region is None
+    assert len(w.data) == 0 and w.data_view.topLevelItemCount() == 0 and w.line is None and w.map_region is None
     assert w.m_region.text() == "whole image"
     calls.clear()
     w.start_map()
@@ -214,7 +217,7 @@ def test_processor_dialog(qtbot, eds):
     # chosen during an acquisition: written when it is done
     w.sp_time.setValue(1.0)
     w.sp_autoid.setChecked(False)
-    w.site_list.setCurrentRow(-1)
+    w.select(None)
     w.b_acquire.click()
     qtbot.waitUntil(lambda: w.ctrl.busy, timeout=5000)
     w.sp_speed.setCurrentIndex(i1)
@@ -247,7 +250,7 @@ def test_live_panel_composition_and_beam_sync(qtbot, eds):
     import re
     w.sp_autoid.setChecked(False)
     w.sp_time.setValue(2.0)
-    w.site_list.setCurrentRow(-1)
+    w.select(None)
     w.b_acquire.click()
     qtbot.waitUntil(lambda: w._job is not None and w._live_prev is not None
                     and w._live_prev.real_time > 1.0, timeout=10000)
@@ -276,7 +279,7 @@ def test_live_panel_composition_and_beam_sync(qtbot, eds):
     # AutoID only adds to the user's selection, and the selection survives new spectra
     w.set_elements(["Zr", "Mo"])
     w.sp_time.setValue(0.5)
-    w.site_list.setCurrentRow(-1)
+    w.select(None)
     w.b_acquire.click()
     qtbot.waitUntil(lambda: not w.ctrl.busy and w._job is None and w._analysis is None, timeout=30000)
     assert {"Zr", "Mo"} <= set(w.elements)
@@ -299,7 +302,7 @@ def test_markers_keep_their_screen_size_and_e0_shown(qtbot, eds):
     assert frac and np.allclose(frac, frac2, atol=1e-6)  # same height on screen
     # E0 of a spectrum without a measurable continuum end falls back to the nominal value
     w.sp_time.setValue(0.5)
-    w.site_list.setCurrentRow(-1)
+    w.select(None)
     w.b_acquire.click()
     qtbot.waitUntil(lambda: not w.ctrl.busy and w._job is None, timeout=30000)
     sp = w._current.spectrum
@@ -313,7 +316,7 @@ def test_markers_keep_their_screen_size_and_e0_shown(qtbot, eds):
 def test_close_stops_a_running_acquisition(qtbot, eds):
     w, mgr, dpp = eds
     w.sp_time.setValue(60.0)
-    w.site_list.setCurrentRow(-1)
+    w.select(None)
     w.b_acquire.click()
     qtbot.waitUntil(lambda: w.ctrl.busy and dpp.status().mca_enabled, timeout=10000)
     job = w.ctrl.job
@@ -367,3 +370,168 @@ def test_live_maps_during_the_scan_and_dead_time_zones(qtbot, eds):
     w.m_kind.setCurrentIndex(1)
     qtbot.waitUntil(lambda: bool(w._maps_fut is None and w._maps_done_gen == w._maps_gen), timeout=20000)
     assert any(t.unit == "counts" for t in w._tiles)
+
+
+def test_data_manager(qtbot, eds, tmp_path):
+    """Every acquisition is an item: maps and lines coexist, the selected item is highlighted on the
+    image, items are renamed / remeasured / saved / opened / deleted, unsaved data is guarded."""
+    from PySide6 import QtCore
+
+    w, mgr, dpp = eds
+    w.sp_autoid.setChecked(False)
+    w.sp_time.setValue(0.5)
+    # a point site, measured; Acquire again on it: a second item at the same place, the first kept
+    w._site_requested("point", (0.1, -0.1))
+    p1 = w._current
+    assert p1.number == 1 and p1.data is None and not w.isWindowModified()
+    w.b_acquire.click()
+    _wait_idle(qtbot, w)
+    assert p1.spectrum is not None and p1.dirty and w.isWindowModified() and w._rows[1].text(4) == "unsaved"
+    first = p1.spectrum
+    w.b_acquire.click()
+    _wait_idle(qtbot, w)
+    p2 = w._current
+    assert p2.number == 2 and p2.params == p1.params and p1.spectrum is first and p2.spectrum is not first
+    assert p1.conditions["request"] == {"time_s": 0.5, "live_time": False}
+    assert p1.conditions["field_um"] == pytest.approx(100.0) and p1.conditions["processor"]["name"]
+    # the selected item: thicker outline, number in bold; the others normal
+    st = w.imgview.styles
+    assert st["item2"]["bold"] and st["item2"]["width"] > st["item1"]["width"] and not st["item1"]["bold"]
+    assert w.imgview._items["item2"][1].textItem.font().bold()
+    w.select(p1)
+    assert st["item1"]["bold"] and not st["item2"]["bold"]
+
+    # two maps: the second does not replace the first
+    w._site_requested("map", (0.0, 0.0, 0.4, 0.4))
+    w.m_nx.setValue(3)
+    w.m_ny.setValue(2)
+    w.m_dwell.setValue(5)
+    w.set_elements(["Mn"])
+    m1 = w.start_map()
+    _wait_idle(qtbot, w, 60000)
+    w.m_nx.setValue(2)
+    m2 = w.start_map()
+    _wait_idle(qtbot, w, 60000)
+    assert m1.kind == m2.kind == "map" and m1.data is not None and m2.data is not None
+    assert m1.data.shape == (2, 3) and m2.data.shape == (2, 2) and w.map is m2.data
+    assert m1.conditions["request"] == {"nx": 3, "ny": 2, "dwell_s": 0.005}
+    assert st[f"item{m2.number}"]["bold"] and st[f"item{m2.number}"]["kind"] == "map"
+    w.select(m1)  # selecting a map shows it
+    assert w.map is m1.data and st[f"item{m1.number}"]["bold"] and not st[f"item{m2.number}"]["bold"]
+    _wait_idle(qtbot, w)
+    assert w._tiles and w._tiles[0].data.shape == (2, 3)
+    # a left click in a map tile only shows the pixel's spectrum (no new item) …
+    n = len(w.data)
+    tile = w._tiles[1]
+    seen = []
+    tile.clicked.connect(lambda r, c: seen.append((r, c)))
+    tile.menuRequested.connect(lambda r, c, pos: seen.append(("menu", r, c)))
+
+    class _Click:  # a pyqtgraph mouse click at the centre of pixel (row 1, col 2)
+        def __init__(self, button):
+            self._b = button
+
+        def button(self):
+            return self._b
+
+        def scenePos(self):
+            return tile.vb.mapViewToScene(QtCore.QPointF(2.5, 0.5))  # row 1 of 2 is y 0 (flipped)
+
+        def screenPos(self):
+            return QtCore.QPointF(10, 10)
+
+        def accept(self):
+            pass
+
+    w._map_menu = lambda r, c, pos: seen.append(("window menu", r, c))  # no modal menu in the test
+    tile.menuRequested.disconnect()
+    tile.menuRequested.connect(lambda r, c, pos: w._map_menu(r, c, pos))
+    tile._click(_Click(QtCore.Qt.LeftButton))
+    tile._click(_Click(QtCore.Qt.RightButton))
+    assert seen == [(1, 2), ("window menu", 1, 2)]
+    assert len(w.data) == n and w._preview is not None and w._current is m1
+    assert w._spectrum_of_current() is w._preview["sp"] and "preview" in st
+    assert "preview" in w.specview._curves and w._spectrum_of_current().title.startswith(f"Map {m1.number} pixel")
+    # … "Add to Data Manager" (right-click menu) keeps it as an item
+    px = w._map_pixel(1, 2, add=True)
+    assert len(w.data) == n + 1 and w._preview is None and "preview" not in st and w._current is px
+    assert px.kind == "spectrum" and px.source.startswith(f"Map {m1.number} pixel") and not px.can_remeasure
+    # a line scan
+    w._site_requested("line", (-0.2, 0.0, 0.2, 0.0))
+    w.l_n.setValue(4)
+    w.l_dwell.setValue(5)
+    ln = w.start_linescan()
+    _wait_idle(qtbot, w)
+    assert ln.kind == "line" and ln.data is not None and ln.data.shape == (1, 4) and w.linescan is ln.data
+    # the same on the line profile: a click shows the point's spectrum, "Add" keeps it
+    n = len(w.data)
+    sp = w._line_point(2)
+    assert len(w.data) == n and w._preview["sp"] is sp and w._current is ln and w._profile_cursor.isVisible()
+    assert sp.real_time > 0 and "point 3/4" in sp.title
+    pt = w._line_point(2, add=True)
+    assert len(w.data) == n + 1 and pt.shape == "point" and pt.source == f"Line {ln.number} point 3/4"
+    assert pt.params == pytest.approx((0.0 + (2.5 / 4 - 0.5) * 0.4, 0.0), abs=1e-6)
+    w.select(ln)
+
+    # rename, properties
+    w._ask_text = lambda title, label, text: "Grain A"
+    w.rename_item(p1)
+    assert p1.title == "Grain A" and w._rows[1].text(1) == "Grain A" and p1.spectrum.title == "Grain A"
+    d = w.show_properties(m1)
+    assert d.value("Conditions › request › nx") == "3" and d.value("Map › pixels") == "3 × 2"
+    assert d.value("Conditions › processor › min_energy_kev") is not None and d.value("Map › timestamp")
+    d.close()
+
+    # remeasure: a new item with the same geometry and conditions (not the panel's present values)
+    w.sp_time.setValue(2.0)
+    r = w.remeasure(p1)
+    _wait_idle(qtbot, w)
+    assert r.remeasure_of == 1 and r.params == p1.params and r.spectrum is not None
+    assert r.conditions["request"] == p1.conditions["request"] and r.spectrum.real_time < 1.5
+    assert r.title == "Grain A (re)"
+    rm = w.remeasure(m1)
+    _wait_idle(qtbot, w, 60000)
+    assert rm.data.shape == (2, 3) and rm.params == m1.params
+
+    # save everything, open it again
+    assert w.save_unsaved(str(tmp_path))
+    assert not w.data.dirty and not w.isWindowModified() and w._rows[1].text(4) == "saved"
+    n = len(w.data)
+    opened = w.open_data([p1.path, m1.path, ln.path])
+    assert [o.kind for o in opened] == ["spectrum", "map", "line"] and len(w.data) == n + 3
+    assert opened[0].title == "Grain A" and opened[0].params == pytest.approx(p1.params)
+    assert opened[1].params == pytest.approx(m1.params) and np.array_equal(opened[1].data.cube, m1.data.cube)
+    assert not w.data.dirty and w._current is opened[2]
+
+    # delete: an unsaved item asks first
+    w.data.rename(m2, "to delete")
+    asked = []
+    w._confirm = lambda title, text: asked.append(text) or False
+    w.delete_items([m2])
+    assert asked and m2 in w.data
+    w._confirm = lambda title, text: True
+    w.delete_items([m2])
+    assert m2 not in w.data and f"item{m2.number}" not in st and m2.number not in w._rows
+
+    # closing with unsaved data: cancel keeps the window, save writes the files and closes
+    from easyebl.eds.datamanager import open_file
+
+    w.data.rename(p2, "last")  # saved before: goes back to its file
+    w._site_requested("point", (0.0, 0.1))
+    w.b_acquire.click()  # never saved: goes into the folder chosen at closing
+    _wait_idle(qtbot, w)
+    new = w._current
+    assert new.dirty and new.path is None
+    w._ask_unsaved = lambda items: "cancel"
+    w.close()
+    assert w.isVisible() and w.timer.isActive()
+    w._ask_unsaved = lambda items: "save"
+    w._ask_folder = lambda: None  # the folder dialog cancelled: the window stays open
+    w.close()
+    assert w.isVisible() and w.data.dirty
+    w._ask_folder = lambda: str(tmp_path / "at_close")
+    (tmp_path / "at_close").mkdir()
+    w.close()
+    assert not w.isVisible() and not w.data.dirty
+    assert open_file(p2.path).name == "last"
+    assert (tmp_path / "at_close" / f"{new.number:03d}_Spectrum {new.number}.msa").exists()

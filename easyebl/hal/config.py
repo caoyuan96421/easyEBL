@@ -46,6 +46,11 @@ class DAQConfig:
     * ``aux_outputs``: the auxiliary analog outputs ``aux0`` / ``aux1`` → physical
       AO channel, or ``None`` for a dummy output (boards with only two AO
       channels).  Applications use the logical names only.
+    * ``sample_clock_out`` / ``start_trigger_out``: optional PFI terminals on
+      which every stream exports its sample clock / start trigger (for external
+      instruments that follow the scan), or ``None``.
+    * The whole wiring is edited in *Hardware → Configure… → Wiring*
+      (:class:`easyebl.hal.wiring.Wiring`).
     * ``ao_rate_limits``: maximum AO update rate by number of AO channels in a
       stream (X-series share one DAC timing engine); None = ``max_ao_rate``.
     """
@@ -69,6 +74,8 @@ class DAQConfig:
     ai_terminal: str = "RSE"  # RSE | DIFF | NRSE | PSEUDO_DIFF
     aux_outputs: dict = field(default_factory=lambda: {"aux0": None, "aux1": None})
     ao_rate_limits: dict | None = None
+    sample_clock_out: str | None = None  # PFI terminal that exports the scan sample clock (None: not exported)
+    start_trigger_out: str | None = None  # PFI terminal that exports the stream start trigger (None: not exported)
     park_x_v: float = 0.0
     park_y_v: float = 0.0
     max_ao_rate: float = 840e3  # USB-6341, two channels
@@ -115,6 +122,10 @@ class DAQConfig:
                     f"static line '{name}' ({line}) is on the hardware-timed port {port}; "
                     "the stream drives that whole port – move it to another port"
                 )
+        exports = [v for v in (self.sample_clock_out, self.start_trigger_out) if v]
+        used = [str(x).lower() for x in list(self.external_control_lines) + list(self.static_lines.values())]
+        if len(exports) != len(set(exports)) or {e.lower() for e in exports} & set(used):
+            raise ValueError("sample-clock / start-trigger exports need their own PFI terminals")
         aux = {k: None for k in AUX_OUTPUTS}
         aux.update(self.aux_outputs or {})
         unknown = set(aux) - set(AUX_OUTPUTS)

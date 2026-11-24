@@ -18,7 +18,7 @@ from typing import Callable
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .backend import COMPONENTS, ComponentStatus, SystemBackend
-from .config import AI_TERMINALS, BAUD_RATES, SystemConfig
+from .config import BAUD_RATES, SystemConfig
 
 __all__ = ["EasyEBLApp", "MenuWindow", "HardwareDialog", "SUBSYSTEMS", "make_icon"]
 
@@ -116,7 +116,8 @@ class ToolWindow(QtWidgets.QMainWindow):
 
 # ==================================================================== hardware dialog
 class HardwareDialog(QtWidgets.QDialog):
-    """Edit a :class:`SystemConfig`: scan DAQ, EDS pulse processor, microscope port."""
+    """Edit a :class:`SystemConfig`: scan DAQ, EDS pulse processor, microscope port (*Devices* tab)
+    and the DAQ signal → channel map (*Wiring* tab, :class:`~easyebl.app.wiring_gui.WiringEditor`)."""
 
     def __init__(self, config: SystemConfig, parent=None, persistent: bool = True):
         super().__init__(parent)
@@ -127,6 +128,11 @@ class HardwareDialog(QtWidgets.QDialog):
             note = QtWidgets.QLabel("Started with --sim: changes apply to this session and are not saved.")
             note.setStyleSheet("color:#fb4")
             lay.addWidget(note)
+        self.tabs = QtWidgets.QTabWidget()
+        lay.addWidget(self.tabs, 1)
+        devices = QtWidgets.QWidget()
+        dlay = QtWidgets.QVBoxLayout(devices)
+        self.tabs.addTab(devices, "Devices")
 
         # --- scan DAQ
         d = config.daq
@@ -162,18 +168,12 @@ class HardwareDialog(QtWidgets.QDialog):
         self.daq_latency.setSuffix(" ms")
         self.daq_latency.setValue(d.latency_ms)
         self.daq_latency.setToolTip("output buffer depth = how long a setting change takes to reach the beam")
-        self.daq_ai = QtWidgets.QComboBox()
-        self.daq_ai.addItem("preset default", None)
-        for t in AI_TERMINALS:
-            self.daq_ai.addItem(t, t)
-        self.daq_ai.setCurrentIndex(max(0, self.daq_ai.findData(d.ai_terminal)))
         f.addRow("Device", self.daq_backend)
         f.addRow("NI device name", self.daq_device)
         f.addRow("Wiring", self.daq_preset)
         f.addRow("Config file", row)
         f.addRow("Sample clock", self.daq_rate)
         f.addRow("Buffer latency", self.daq_latency)
-        f.addRow("Video input", self.daq_ai)
         self.daq_inv_x = QtWidgets.QCheckBox("Invert X")
         self.daq_inv_y = QtWidgets.QCheckBox("Invert Y")
         self.daq_swap = QtWidgets.QCheckBox("Swap X / Y")
@@ -187,7 +187,7 @@ class HardwareDialog(QtWidgets.QDialog):
             row2.addWidget(cb)
         row2.addStretch(1)
         f.addRow("Scan orientation", row2)
-        lay.addWidget(g)
+        dlay.addWidget(g)
         self._daq_hw = (self.daq_device,)
 
         # --- EDS
@@ -202,7 +202,7 @@ class HardwareDialog(QtWidgets.QDialog):
         self.eds_external.setChecked(config.eds.external_control)
         f.addRow("Device", self.eds_mca)
         f.addRow("", self.eds_external)
-        lay.addWidget(g)
+        dlay.addWidget(g)
 
         # --- microscope
         m = config.microscope
@@ -225,8 +225,28 @@ class HardwareDialog(QtWidgets.QDialog):
         self.mic_baud.setToolTip("the S-3000 uses 9600 baud, 8N1")
         f.addRow("Port", row)
         f.addRow("Baud rate", self.mic_baud)
-        lay.addWidget(g)
+        dlay.addWidget(g)
+        dlay.addStretch(1)
         self._fill_ports(m.port)
+
+        # --- wiring (the one place the DAQ channels are edited)
+        from .wiring_gui import WiringEditor
+
+        page = QtWidgets.QWidget()
+        wl = QtWidgets.QVBoxLayout(page)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel("NI USB-6363: which signal is on which channel."))
+        top.addStretch(1)
+        b = QtWidgets.QPushButton("Reset to preset")
+        b.setToolTip("the wiring of the selected preset (or DAQ config file)")
+        b.clicked.connect(self.reset_wiring)
+        top.addWidget(b)
+        wl.addLayout(top)
+        self.wiring = WiringEditor(config.effective_wiring() if self._safe_base() else self._fallback_wiring(),
+                                   d.ai_terminal, self._preset_terminal(), ai_range_v=d.ai_range_v,
+                                   preset_range_v=self._preset_range())
+        wl.addWidget(self.wiring, 1)
+        self.tabs.addTab(page, "Wiring")
 
         # --- buttons
         row = QtWidgets.QHBoxLayout()
@@ -236,13 +256,20 @@ class HardwareDialog(QtWidgets.QDialog):
         row.addWidget(b)
         row.addStretch(1)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Apply && reconnect")
+        self._ok = bb.button(QtWidgets.QDialogButtonBox.Ok)
+        self._ok.setText("Apply && reconnect")
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         row.addWidget(bb)
         lay.addLayout(row)
         self.daq_backend.currentIndexChanged.connect(self._sync)
+        self.daq_preset.currentIndexChanged.connect(self.reset_wiring)
+        self.daq_file.editingFinished.connect(self._file_changed)
+        self._file_seen = self.daq_file.text().strip()
+        self.wiring.changed.connect(self._sync_wiring)
         self._sync()
+        self._sync_wiring()
+        self.resize(620, 720)
 
     # ---------------------------------------------------------------- helpers
     def _browse(self):
@@ -280,22 +307,95 @@ class HardwareDialog(QtWidgets.QDialog):
         for w in self._daq_hw:
             w.setEnabled(hw)
 
+    # ---------------------------------------------------------------- wiring
+    def _with_daq(self, **kw) -> SystemConfig:
+        out = replace(self._base, daq=replace(self._base.daq, **kw))
+        out.path = self._base.path
+        return out
+
+    def _selected_base(self) -> SystemConfig:
+        return self._with_daq(preset=self.daq_preset.currentData(), config_file=self.daq_file.text().strip(),
+                              ai_terminal=None)
+
+    def _safe_base(self) -> bool:
+        try:
+            self._base.base_daq_config()
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _fallback_wiring(self):
+        from ..hal.wiring import Wiring
+
+        return self._base.wiring.copy() if self._base.wiring is not None else Wiring()
+
+    def _preset_terminal(self) -> str:
+        try:
+            return (self._selected_base() if hasattr(self, "daq_preset") else
+                    self._with_daq(ai_terminal=None)).base_daq_config().ai_terminal
+        except (OSError, ValueError, TypeError):
+            return "RSE"
+
+    def _preset_range(self) -> float:
+        try:
+            return self._with_daq(preset=self.daq_preset.currentData(), config_file=self.daq_file.text().strip(),
+                                  ai_range_v=None).base_daq_config().ai_range_v
+        except (OSError, ValueError, TypeError):
+            return 10.0
+
+    def preset_wiring(self):
+        """The wiring of the selected preset / config file (None if the file cannot be read)."""
+        try:
+            return self._selected_base().preset_wiring()
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def reset_wiring(self):
+        w = self.preset_wiring()
+        self.wiring.set_preset_terminal(self._preset_terminal())
+        self.wiring.set_preset_range(self._preset_range())
+        if w is not None:
+            self.wiring.set_wiring(w, keep_terminal=True)
+
+    def _file_changed(self):
+        if self.daq_file.text().strip() != self._file_seen:
+            self._file_seen = self.daq_file.text().strip()
+            self.reset_wiring()
+
+    def _sync_wiring(self):
+        n = len(self.wiring.issues())
+        i = self.tabs.indexOf(self.wiring.parentWidget())
+        self.tabs.setTabText(i, f"Wiring ⚠ {n}" if n else "Wiring")
+        self._ok.setEnabled(n == 0)
+        self._ok.setToolTip("fix the wiring conflicts first" if n else "")
+
+    def wiring_value(self):
+        """The wiring to save: None while it equals the preset's and the file had no wiring section."""
+        w = self.wiring.wiring()
+        if self._base.wiring is None and w == self.preset_wiring():
+            return None
+        return w
+
     # ---------------------------------------------------------------- value
     def config(self) -> SystemConfig:
         b = self._base
         daq = replace(b.daq, backend=self.daq_backend.currentData(), device=self.daq_device.text().strip() or "Dev1",
                       preset=self.daq_preset.currentData(), config_file=self.daq_file.text().strip(),
                       rate=(self.daq_rate.value() * 1e3) or None, latency_ms=float(self.daq_latency.value()),
-                      ai_terminal=self.daq_ai.currentData(), invert_x=self.daq_inv_x.isChecked(),
+                      ai_terminal=self.wiring.selected_terminal(), ai_range_v=self.wiring.selected_range(),
+                      invert_x=self.daq_inv_x.isChecked(),
                       invert_y=self.daq_inv_y.isChecked(), swap_xy=self.daq_swap.isChecked())
         eds = replace(b.eds, mca=self.eds_mca.currentData(), external_control=self.eds_external.isChecked())
         mic = replace(b.microscope, port=self.port(), baudrate=int(self.mic_baud.currentData()))
-        out = SystemConfig(daq, eds, mic, b.monitor)
+        out = SystemConfig(daq, eds, mic, b.monitor, self.wiring_value())
         out.path = b.path
         return out
 
     def set_config(self, c: SystemConfig):
         self.daq_backend.setCurrentIndex(max(0, self.daq_backend.findData(c.daq.backend)))
+        if c.wiring is not None:
+            self.wiring.set_wiring(c.wiring, c.daq.ai_terminal)
+        self.wiring._set_range(c.daq.ai_range_v)
         self.eds_mca.setCurrentIndex(max(0, self.eds_mca.findData(c.eds.mca)))
         self._fill_ports(c.microscope.port)
 

@@ -5,10 +5,14 @@ controller's job threads, analysis (AutoID, fitting, quantification, maps) in
 a worker thread; results are picked up by timers.  Nothing here touches the
 DAQ or the pulse processor directly.
 
-Layout: electron image with acquisition sites (left) · spectrum with element
-markers and fit (centre) · maps / line profile (bottom) ·
+Layout: electron image with acquisition sites and the Data Manager (left) ·
+spectrum with element markers and fit (centre) · maps / line profile (bottom) ·
 control tabs Acquire / Map / Composition (right) with the live MCA panel
 (delta-mode spectrum, ICR, OCR, dead time) always visible below them.
+
+Every acquisition (spectra, line scans, maps) is an item of the Data Manager
+(:mod:`easyebl.eds.datamanager`): kept in memory, numbered, drawn on the image,
+saved / remeasured / renamed from its context menu; closing with unsaved items asks first.
 """
 from __future__ import annotations
 
@@ -24,8 +28,9 @@ import pyqtgraph as pg
 from ... import xray
 from .. import analysis as A
 from ..controller import EDSController
+from ..datamanager import LINE, MAP, SPECTRUM, DataItem, DataManager, default_filename, flatten
 from ..settings import EDSSettings
-from ..spectrum import ElectronImage, Spectrum, SpectrumMap, load_map, load_spectrum
+from ..spectrum import ElectronImage, Spectrum, SpectrumMap
 from .calibration import CalibrationDialog
 from .processor import ProcessorDialog
 from .views import SITE_COLORS, ElectronImageView, MapTile, PeriodicTable, SpectrumView
@@ -36,29 +41,41 @@ MAP_COLORS = [(255, 90, 90), (90, 200, 255), (110, 230, 110), (255, 210, 80), (2
               (80, 255, 220), (255, 120, 200), (200, 200, 200)]
 
 
-class _Site:
-    def __init__(self, sid: int, kind: str, params: tuple):
-        self.id, self.kind, self.params = sid, kind, tuple(float(p) for p in params)
-        self.spectrum: Spectrum | None = None
-        self.text = ""  # fixed description (map pixel, file …)
-        self.color = SITE_COLORS[(sid - 1) % len(SITE_COLORS)]
+def _color(item) -> str:
+    return SITE_COLORS[(item.number - 1) % len(SITE_COLORS)]
 
-    @property
-    def name(self) -> str:
-        return f"Spectrum {self.id}"
 
-    def describe(self, field_um: float = 1.0) -> str:
-        """*params* are fractions of the deflection field; shown in µm at *field_um*."""
-        if self.text:
-            return f"{self.name} – {self.text}"
-        p = [v * field_um for v in self.params]
-        if self.kind == "point":
-            return f"{self.name} – point ({p[0]:.2f}, {p[1]:.2f}) µm"
-        if self.kind in ("rect", "ellipse"):
-            return f"{self.name} – {self.kind} {p[2]:.2f}×{p[3]:.2f} µm"
-        if self.kind == "field":
-            return f"{self.name} – whole image"
-        return f"{self.name} – SEM spot"
+#: how an item's geometry is drawn on the electron image (None: not drawn unless selected)
+_DRAW = {"point": "point", "rect": "rect", "ellipse": "ellipse", "line": "line", "map": "map", "field": None,
+         "spot": None}
+
+
+class PropertiesDialog(QtWidgets.QDialog):
+    """The conditions an item was taken under (read-only key / value table)."""
+
+    def __init__(self, item: DataItem, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Properties – {item.title}")
+        self.resize(560, 620)
+        self.rows = flatten(item.properties())
+        self.table = QtWidgets.QTreeWidget()
+        self.table.setColumnCount(2)
+        self.table.setHeaderLabels(["Property", "Value"])
+        self.table.setRootIsDecorated(False)
+        self.table.setAlternatingRowColors(True)
+        for k, v in self.rows:
+            it = QtWidgets.QTreeWidgetItem([k, v])
+            it.setToolTip(1, v)
+            self.table.addTopLevelItem(it)
+        self.table.resizeColumnToContents(0)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(self.table)
+        lay.addWidget(bb)
+
+    def value(self, key: str) -> str | None:
+        return next((v for k, v in self.rows if k == key), None)
 
 
 class EDSWindow(QtWidgets.QMainWindow):
@@ -83,12 +100,18 @@ class EDSWindow(QtWidgets.QMainWindow):
         self._pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="easyebl-eds-analysis")
         self._analysis = None  # (future, callback)
         self._job = None
-        self._sites: list[_Site] = []
-        self._site_ids = iter(range(1, 10 ** 9))
-        self._current: _Site | None = None
+        # every acquisition: spectra, line scans, maps (in memory until saved)
+        self.data = DataManager()
+        self.data.listeners.append(self._data_event)
+        self._current: DataItem | None = None  # the item selected in the Data Manager
+        self._rows: dict = {}  # item number → QTreeWidgetItem
+        self._closed = False
         self.elements: list = []
         self.image: ElectronImage | None = None
-        self.map: SpectrumMap | None = None
+        self.map: SpectrumMap | None = None  # the map shown (of the selected map item)
+        self.linescan: SpectrumMap | None = None  # the line scan shown
+        self._preview = None  # a spectrum clicked in a map / on the line profile (shown, not an item)
+        self._profile_cursor = None
         self.map_region = None
         self.line = None
         self._fit = None
@@ -118,9 +141,8 @@ class EDSWindow(QtWidgets.QMainWindow):
             lambda x, y: self.l_ptr.setText(f"x {x * self._field():.2f} µm  y {y * self._field():.2f} µm"))
         self.specview = SpectrumView()
         self.specview.cursorMoved.connect(self._cursor)
-        self.site_list = QtWidgets.QListWidget()
-        self.site_list.currentRowChanged.connect(self._select_site)
-        self.site_list.setMaximumHeight(130)
+        self.data_tabs = QtWidgets.QTabWidget()
+        self.data_tabs.addTab(self._data_tab(), "Data Manager")
 
         tools = QtWidgets.QToolBar()
         tools.setIconSize(QtCore.QSize(16, 16))
@@ -144,7 +166,8 @@ class EDSWindow(QtWidgets.QMainWindow):
         f_.setBold(True)
         f_.setPointSizeF(f_.pointSizeF() * 1.4)
         self.b_clear.setFont(f_)
-        self.b_clear.setToolTip("remove all sites and the line; the map region goes back to the whole image")
+        self.b_clear.setToolTip("remove the sites not acquired yet and the line; the map region goes back to the "
+                                "whole image.  Acquired data stays in the Data Manager (delete it there).")
         self.b_clear.clicked.connect(self.clear_all)
 
         left = QtWidgets.QWidget()
@@ -154,8 +177,13 @@ class EDSWindow(QtWidgets.QMainWindow):
         ll.addWidget(tools)
         ll.addWidget(self.b_clear)
         ll.addWidget(self._image_controls())
-        ll.addWidget(self.imgview, 1)
-        ll.addWidget(self.site_list)
+        lsplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        lsplit.addWidget(self.imgview)
+        lsplit.addWidget(self.data_tabs)
+        lsplit.setStretchFactor(0, 3)
+        lsplit.setStretchFactor(1, 1)
+        lsplit.setSizes([560, 220])
+        ll.addWidget(lsplit, 1)
 
         # bottom tabs: maps / line profile (the quantification is in the Composition tab)
         self.maps_area = QtWidgets.QScrollArea()
@@ -167,6 +195,9 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.profile.setLabel("bottom", "Distance", units="µm")
         self.profile.setLabel("left", "Counts")
         self.profile.addLegend()
+        self.profile.getPlotItem().setMenuEnabled(False)  # right-click: our menu (Add to Data Manager)
+        self.profile.getPlotItem().vb.setMenuEnabled(False)
+        self.profile.scene().sigMouseClicked.connect(self._profile_clicked)
         self.bottom = QtWidgets.QTabWidget()
         self.bottom.addTab(self.maps_area, "Maps")
         self.bottom.addTab(self.profile, "Line profile")
@@ -211,7 +242,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.start(self.TICK_MS)
         cap = controller.handle.capabilities()
-        self.setWindowTitle(f"easyEBL EDS – {controller.mca.name} + {cap.name}")
+        self.setWindowTitle(f"easyEBL EDS – {controller.mca.name} + {cap.name}[*]")
         self.notify(f"Pulse processor: {controller.mca.name} ({controller.mca.channels} channels); "
                     f"DAQ: {cap.name}; beam {controller.beam_kv:g} kV")
         self._emin_pending = True
@@ -398,7 +429,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.d_log = QtWidgets.QCheckBox("log scale")
         self.d_log.toggled.connect(self.specview.set_log)
         f.addRow(self.d_log)
-        self.d_overlay = QtWidgets.QCheckBox("overlay all site spectra")
+        self.d_overlay = QtWidgets.QCheckBox("overlay all spectra")
         self.d_overlay.toggled.connect(lambda *_: self._show_current())
         f.addRow(self.d_overlay)
         self.d_norm = QtWidgets.QCheckBox("normalise overlays (counts/s)")
@@ -706,14 +737,57 @@ class EDSWindow(QtWidgets.QMainWindow):
         lay.addWidget(g, 1)
         return w
 
+    def _data_tab(self):
+        """The Data Manager: every spectrum, line scan and map of the session."""
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(2, 2, 2, 2)
+        v.setSpacing(2)
+        t = self.data_view = QtWidgets.QTreeWidget()
+        t.setColumnCount(5)
+        t.setHeaderLabels(["#", "Name", "Type", "Where", "Status"])
+        t.setRootIsDecorated(False)
+        t.setUniformRowHeights(True)
+        t.setAlternatingRowColors(True)
+        t.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        t.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        t.customContextMenuRequested.connect(self._data_menu)
+        t.currentItemChanged.connect(lambda cur, _prev: self._select_item(self._item_of(cur)))
+        t.itemDoubleClicked.connect(lambda row, col: self.rename_item(self._item_of(row)) if col == 1 else None)
+        hh = t.header()
+        hh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        hh.setStretchLastSection(False)
+        for seq, fn in ((QtGui.QKeySequence.Delete, lambda: self.delete_items(self.selected_items())),
+                        (QtGui.QKeySequence("F2"), lambda: self.rename_item(self._current))):
+            sc = QtGui.QShortcut(seq, t)
+            sc.setContext(QtCore.Qt.WidgetShortcut)
+            sc.activated.connect(fn)
+        v.addWidget(t, 1)
+        r = QtWidgets.QHBoxLayout()
+        b = QtWidgets.QPushButton("Open…")
+        b.setToolTip("open spectrum (.msa, .npz), line scan or map (.npz) files into the Data Manager")
+        b.clicked.connect(lambda: self.open_data())
+        r.addWidget(b)
+        self.b_save_all = QtWidgets.QPushButton("Save unsaved…")
+        self.b_save_all.setToolTip("save every unsaved item into a folder (items opened from a file go back "
+                                   "to their file)")
+        self.b_save_all.clicked.connect(lambda: self.save_unsaved())
+        r.addWidget(self.b_save_all)
+        r.addStretch(1)
+        self.l_data = QtWidgets.QLabel()
+        self.l_data.setStyleSheet("color:#9aa")
+        r.addWidget(self.l_data)
+        v.addLayout(r)
+        return w
+
     def _make_menus(self):
         mb = self.menuBar()
         m = mb.addMenu("&File")
-        m.addAction("Open spectrum…", self.open_spectrum)
-        m.addAction("Save spectrum…", self.save_spectrum, QtGui.QKeySequence.Save)
+        m.addAction("Open data…", self.open_data, QtGui.QKeySequence.Open)
+        m.addAction("Save selected…", lambda: self.save_items(self.selected_items()), QtGui.QKeySequence.Save)
+        m.addAction("Save all unsaved…", lambda: self.save_unsaved())
         m.addSeparator()
-        m.addAction("Open map…", self.open_map)
-        m.addAction("Save map…", self.save_map)
         m.addAction("Export maps (PNG)…", self.export_maps)
         m.addSeparator()
         m.addAction("Export quantification (CSV)…", self.export_quant)
@@ -804,10 +878,10 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     def _field_changed(self) -> None:
         """New magnification: same places in the field of view, new µm values."""
-        for i, s in enumerate(self._sites):
-            it = self.site_list.item(i)
-            if it is not None:
-                it.setText(s.describe(self._field()))
+        for item in self.data:
+            row = self._rows.get(item.number)
+            if row is not None:
+                row.setText(3, item.describe(self._field()))
         self.l_line.setText(self._line_text())
         self.m_region.setText(self._region_text())
 
@@ -837,6 +911,339 @@ class EDSWindow(QtWidgets.QMainWindow):
         n = self.m_nx.value() * self.m_ny.value()
         per = self.m_dwell.value() / 1e3 + 0.02
         self.m_eta.setText(f"≈ {n * per / 60:.1f} min ({n} px)")
+
+    # ================================================================ data manager
+    def _item_of(self, row) -> DataItem | None:
+        return None if row is None else self.data.get(row.data(0, QtCore.Qt.UserRole))
+
+    def selected_items(self) -> list:
+        """The items selected in the Data Manager (the current one if nothing is selected)."""
+        items = [self._item_of(r) for r in self.data_view.selectedItems()]
+        items = [i for i in items if i is not None]
+        if not items and self._current is not None:
+            items = [self._current]
+        return sorted(items, key=lambda i: i.number)
+
+    def select(self, item: DataItem | None) -> None:
+        """Make *item* the current one (None: nothing selected)."""
+        if item is None:
+            self.data_view.clearSelection()
+            self.data_view.setCurrentIndex(QtCore.QModelIndex())
+            if self._current is not None:
+                self._select_item(None)
+            return
+        row = self._rows.get(item.number)
+        if row is not None:
+            self.data_view.setCurrentItem(row)
+
+    def _data_event(self, event: str, item: DataItem) -> None:
+        """The model changed: list row, outline on the image, window-modified mark."""
+        if event == "removed":
+            row = self._rows.pop(item.number, None)
+            if item is self._current:
+                self._select_item(None)
+            if row is not None:
+                self.data_view.blockSignals(True)
+                self.data_view.takeTopLevelItem(self.data_view.indexOfTopLevelItem(row))
+                self.data_view.blockSignals(False)
+                self._select_item(self._item_of(self.data_view.currentItem()))
+            self.imgview.remove_site(f"item{item.number}")
+        else:
+            row = self._rows.get(item.number)
+            if row is None:
+                row = QtWidgets.QTreeWidgetItem()
+                row.setData(0, QtCore.Qt.UserRole, item.number)
+                self._rows[item.number] = row
+                self.data_view.addTopLevelItem(row)
+            self._fill_row(row, item)
+            self._draw_item(item)
+        self._update_data_status()
+
+    def _fill_row(self, row, item: DataItem) -> None:
+        kind = {SPECTRUM: "Spectrum", LINE: "Line scan", MAP: "Map"}[item.kind]
+        if item.kind == SPECTRUM and item.shape != "spot":
+            kind += f" ({item.shape})"
+        vals = [str(item.number), item.title, kind, item.describe(self._field()), item.status()]
+        for c, txt in enumerate(vals):
+            row.setText(c, txt)
+        row.setForeground(0, QtGui.QColor(_color(item)))
+        f = row.font(0)
+        f.setBold(True)
+        row.setFont(0, f)
+        st = {"unsaved": "#fb4", "acquiring": "#4fc3f7", "saved": "#7c7"}.get(item.status())
+        row.setForeground(4, QtGui.QColor(st) if st else QtGui.QBrush())
+        for c in range(5):
+            row.setToolTip(c, item.path or "")
+
+    def _update_data_status(self) -> None:
+        n, dirty = len(self.data), len(self.data.dirty_items())
+        self.l_data.setText(f"{n} item{'s' if n != 1 else ''}" + (f", {dirty} unsaved" if dirty else ""))
+        self.b_save_all.setEnabled(dirty > 0)
+        self.setWindowModified(dirty > 0)
+
+    def _draw_item(self, item: DataItem) -> None:
+        """The item's outline and number on the image; the selected one thicker, number in bold."""
+        key = f"item{item.number}"
+        sel = item is self._current
+        kind = _DRAW.get(item.shape)
+        if kind is None and sel and item.shape == "field" and len(item.params) == 4:
+            kind = "rect"  # the whole image: outlined only while selected
+        if kind is None or not item.params:
+            self.imgview.remove_site(key)
+            return
+        self.imgview.add_site(key, kind, item.params, _color(item), str(item.number), bold=sel)
+
+    def _select_item(self, item: DataItem | None) -> None:
+        prev, self._current = self._current, item
+        self._clear_preview()
+        for it in (prev, item):
+            if it is not None and it in self.data:
+                self._draw_item(it)
+        if item is not None and item.kind == MAP and item.data is not None and item.data is not self.map:
+            self.map = item.data
+            self._maps_changed()
+            self._update_maps(force=True)
+            self.bottom.setCurrentWidget(self.maps_area)
+        elif item is not None and item.kind == LINE and item.data is not None and not item.acquiring:
+            self.linescan = item.data
+            self._show_linescan(item.data)
+        self._show_current()
+
+    def _data_menu(self, pos) -> None:
+        item = self._item_of(self.data_view.itemAt(pos))
+        items = self.selected_items() if item is not None else []
+        if item is not None and item not in items:
+            items = [item]
+        m = QtWidgets.QMenu(self)
+        if items:
+            one = items[0] if len(items) == 1 else None
+            m.addAction("Delete" + (f" {len(items)} items" if one is None else ""), lambda: self.delete_items(items))
+            a = m.addAction("Save…" if one is not None else f"Save {len(items)} items…",
+                            lambda: self.save_items(items))
+            a.setEnabled(any(i.data is not None for i in items))
+            a = m.addAction("Remeasure", lambda: self.remeasure(one))
+            a.setEnabled(one is not None and one.can_remeasure and not self.ctrl.busy)
+            a = m.addAction("Rename…", lambda: self.rename_item(one))
+            a.setEnabled(one is not None)
+            a = m.addAction("Properties…", lambda: self.show_properties(one))
+            a.setEnabled(one is not None)
+            m.addSeparator()
+        m.addAction("Open…", lambda: self.open_data())
+        a = m.addAction("Save all unsaved…", lambda: self.save_unsaved())
+        a.setEnabled(self.data.dirty)
+        m.exec(self.data_view.viewport().mapToGlobal(pos))
+
+    # dialogs of the Data Manager (replaced in the tests)
+    def _confirm(self, title: str, text: str) -> bool:
+        return QtWidgets.QMessageBox.question(self, title, text) == QtWidgets.QMessageBox.Yes
+
+    def _ask_text(self, title: str, label: str, text: str):
+        val, ok = QtWidgets.QInputDialog.getText(self, title, label, text=text)
+        return val if ok else None
+
+    def _ask_unsaved(self, items) -> str:
+        """Closing with unsaved data: ``save`` / ``discard`` / ``cancel``."""
+        names = "\n".join(f"  {i.number}  {i.title}" for i in items[:12]) + ("\n  …" if len(items) > 12 else "")
+        mb = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Warning, "Unsaved EDS data",
+                                   f"{len(items)} item(s) have not been saved:\n\n{names}\n\n"
+                                   "Save them before closing?", parent=self)
+        save = mb.addButton("Save…", QtWidgets.QMessageBox.AcceptRole)
+        discard = mb.addButton("Discard", QtWidgets.QMessageBox.DestructiveRole)
+        mb.addButton(QtWidgets.QMessageBox.Cancel)
+        mb.setDefaultButton(save)
+        mb.exec()
+        b = mb.clickedButton()
+        return "save" if b is save else ("discard" if b is discard else "cancel")
+
+    def _ask_save_path(self, item: DataItem):
+        filt = "EMSA (*.msa);;NumPy (*.npz)" if item.kind == SPECTRUM else "Map / line scan (*.npz)"
+        start = item.path or os.path.join(self._folder(), default_filename(item))
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, f"Save {item.title}", start, filt)
+        return path or None
+
+    def _ask_folder(self):
+        return QtWidgets.QFileDialog.getExistingDirectory(self, "Save unsaved items to", self._folder()) or None
+
+    def rename_item(self, item: DataItem | None) -> None:
+        if item is None:
+            return
+        name = self._ask_text("Rename", f"Name of item {item.number}:", item.name or item.label)
+        if name is None:
+            return
+        self.data.rename(item, "" if name.strip() == item.label else name)
+        if item is self._current:
+            self._show_current()
+
+    def delete_items(self, items) -> None:
+        items = [i for i in items if i is not None and i in self.data]
+        busy = [i for i in items if i.acquiring]
+        if busy:
+            self.notify(f"{busy[0].title} is being acquired – stop it first")
+            items = [i for i in items if not i.acquiring]
+        if not items:
+            return
+        dirty = [i for i in items if i.dirty]
+        if dirty and not self._confirm(
+                "Delete", f"{len(dirty)} of the items are not saved.  Delete "
+                f"{', '.join(i.title for i in items[:6])}{' …' if len(items) > 6 else ''}?"):
+            return
+        for it in items:
+            if self._preview is not None and it.data is self._preview["sm"]:
+                self._clear_preview()
+                self._show_current()
+            if it.data is not None and it.data is self.map:
+                self.map = None
+                self._show_maps([])
+                self.imgview.set_overlay(None)
+            if it.data is not None and it.data is self.linescan:
+                self.linescan = None
+                self.profile.clear()
+                self._profile_cursor = None
+            self.data.remove(it)
+        self.notify("deleted " + ", ".join(i.title for i in items))
+
+    def save_items(self, items) -> list:
+        """Save each item to a file (a file dialog per item)."""
+        out = []
+        for it in [i for i in items if i is not None and i.data is not None]:
+            path = self._ask_save_path(it)
+            if not path:
+                break
+            try:
+                out.append(self.data.save(it, path))
+            except Exception as e:  # noqa: BLE001 - shown to the user
+                QtWidgets.QMessageBox.warning(self, "Save", f"{it.title}: {e}")
+                break
+            self.settings.save_folder = os.path.dirname(out[-1])
+            self.notify(f"saved {it.title} → {out[-1]}")
+        return out
+
+    def save_unsaved(self, folder: str | None = None) -> bool:
+        """Every unsaved item into *folder* (asked for if None).  False: not all saved."""
+        if not self.data.dirty:
+            return True
+        folder = folder or self._ask_folder()
+        if not folder:
+            return False
+        try:
+            paths = self.data.save_all(folder)
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            QtWidgets.QMessageBox.warning(self, "Save", str(e))
+            return False
+        self.settings.save_folder = folder
+        self.notify(f"saved {len(paths)} item(s) to {folder}")
+        return not self.data.dirty
+
+    def show_properties(self, item: DataItem | None):
+        if item is None:
+            return None
+        d = PropertiesDialog(item, self)
+        d.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        d.show()
+        return d
+
+    def open_data(self, paths=None) -> list:
+        """Open spectrum / line-scan / map files into the Data Manager (each a new item)."""
+        if paths is None:
+            paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+                self, "Open EDS data", self._folder(),
+                "EDS data (*.msa *.emsa *.txt *.npz);;Spectra (*.msa *.emsa *.txt *.npz);;Maps / line scans (*.npz)")
+        items = []
+        for path in paths or []:
+            try:
+                it = self.data.open(path)
+            except Exception as e:  # noqa: BLE001 - shown to the user
+                QtWidgets.QMessageBox.warning(self, "Open", f"{os.path.basename(path)}: {e}")
+                continue
+            if it.kind == SPECTRUM:
+                it.data.metadata.setdefault("beam_kv_source", "file")
+            items.append(it)
+            self.settings.save_folder = os.path.dirname(path)
+            self.notify(f"opened {it.title} ({it.kind}) from {path}")
+        if items:
+            self.select(items[-1])
+        return items
+
+    # compatibility with the former File menu
+    def open_spectrum(self):
+        return self.open_data()
+
+    open_map = open_spectrum
+
+    def save_spectrum(self):
+        return self.save_items(self.selected_items())
+
+    def _context(self, request: dict) -> dict:
+        """Conditions of a new acquisition: the request (what Remeasure repeats) and its context."""
+        mic = self._microscope_metadata()
+        speed = self.sp_speed.currentData() if self.sp_speed.count() else None
+        cond = {"request": dict(request), "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "field_um": self._field(),
+                "energy_calibration": self.ctrl.energy_calibration.to_dict(),
+                "nominal_beam_kv": float(self.settings.beam_kv), "takeoff_deg": float(self.ctrl.takeoff_deg),
+                "processor": {"name": self.ctrl.mca.name, "channels": int(self.ctrl.mca.channels),
+                              "speed": speed if speed is not None else "custom",
+                              "speed_text": self.sp_speed.currentText(),
+                              "min_energy_kev": float(self.settings.min_energy_kev)}}
+        if mic:
+            for k, key in (("mag", "magnification"), ("hv_kv", "hv_kv"), ("wd_mm", "working_distance_mm")):
+                if mic.get(k) is not None:
+                    cond[key] = mic[k]
+            cond["microscope"] = mic
+        return cond
+
+    def _run_item(self, item: DataItem, request: dict):
+        """Start the acquisition of *item* (its geometry at the present field) with *request*."""
+        if item.kind == SPECTRUM:
+            kw = {"live_time": bool(request.get("live_time", False)), "title": item.title}
+            if item.shape == "point":
+                kw["at_um"] = self._um(item.params)
+            elif item.shape in ("rect", "ellipse", "field"):
+                kw["region_um"] = self._um(item.params)
+                kw["shape"] = "ellipse" if item.shape == "ellipse" else "rect"
+            job = self._start(self.ctrl.acquire_spectrum, float(request["time_s"]), **kw)
+        elif item.kind == MAP:
+            nx, ny, dwell = int(request["nx"]), int(request["ny"]), float(request["dwell_s"])
+            job = self._start(self.ctrl.acquire_map, nx, ny, dwell, self._um(item.params),
+                              title=f"{item.title} ({nx}×{ny} @ {dwell * 1e3:g} ms)")
+        else:
+            x0, y0, x1, y1 = self._um(item.params)
+            n, dwell = int(request["n"]), float(request["dwell_s"])
+            job = self._start(self.ctrl.acquire_linescan, (x0, y0), (x1, y1), n, dwell,
+                              title=f"{item.title} ({n} pts @ {dwell * 1e3:g} ms)")
+        if job is None or not hasattr(job, "done"):
+            self._job = None
+            return None
+        job._item = item
+        item.conditions = self._context(request)
+        item.acquiring = True
+        self.data.touch(item)
+        return job
+
+    def _new_and_run(self, kind: str, shape: str, params, request: dict, **kw):
+        """A new item, acquired at once; removed again if the acquisition cannot start."""
+        item = self.data.new(kind, shape, params, **kw)
+        job = self._run_item(item, request)
+        if job is None:
+            self.data.remove(item)
+            return None
+        self.select(item)
+        return item
+
+    def remeasure(self, item: DataItem | None):
+        """A new item with *item*'s geometry and acquisition conditions (*item* stays as it is)."""
+        if item is None or not item.can_remeasure:
+            self.notify("nothing to remeasure (no recorded acquisition)")
+            return None
+        if self._busy():
+            return None
+        new = self.data.remeasure(item)
+        if self._run_item(new, new.conditions["request"]) is None:
+            self.data.remove(new)
+            return None
+        self.select(new)
+        self.notify(f"{new.title}: remeasuring {item.title}")
+        return new
 
     # ================================================================ acquisitions
     def acquire_image(self):
@@ -896,92 +1303,99 @@ class EDSWindow(QtWidgets.QMainWindow):
                 self.imgview.add_site("mapregion", "map", r, "#ffffff", "map")
             self.m_region.setText(self._region_text())
 
-    def _new_site(self, kind: str, params: tuple):
-        site = _Site(next(self._site_ids), kind, params)
-        self._sites.append(site)
-        self.site_list.addItem(site.describe(self._field()))
-        self.site_list.item(self.site_list.count() - 1).setForeground(QtGui.QColor(site.color))
-        if kind in ("point", "rect", "ellipse"):
-            self.imgview.add_site(site.id, kind, params, site.color, str(site.id))
-        self.site_list.setCurrentRow(self.site_list.count() - 1)
-        return site
+    def _new_site(self, kind: str, params: tuple) -> DataItem:
+        """A drawn point / rectangle / ellipse: a spectrum item without data (Acquire measures it)."""
+        item = self.data.new(SPECTRUM, kind, params)
+        self.select(item)
+        return item
+
+    def _spectrum_request(self) -> dict:
+        t, live = self.sp_time.value(), self.sp_live.isChecked()
+        self.settings.spectrum_time_s, self.settings.live_time_mode = t, live
+        return {"time_s": float(t), "live_time": bool(live)}
 
     def acquire(self):
-        """Acquire button: a spectrum at the selected site, or – none selected – over the whole image."""
-        site = self._current
-        if site is None or site.kind == "spot":
-            site = self._new_site("field", self._image_region())
-        self.acquire_site(site)
+        """Acquire button: a spectrum at the selected site, or – none selected – over the whole image.
+        A site already measured keeps its spectrum: the new one is a new item at the same place."""
+        item = self._current
+        if item is None or item.kind != SPECTRUM or item.shape == "spot":
+            if self._busy():
+                return None
+            return self._new_and_run(SPECTRUM, "field", self._image_region(), self._spectrum_request())
+        if item.data is not None or item.acquiring:
+            if self._busy():
+                return None
+            return self._new_and_run(SPECTRUM, item.shape, item.params, self._spectrum_request())
+        self.acquire_site(item)
+        return item
 
-    def acquire_site(self, site: _Site | None):
-        if site is None:
-            return
-        t = self.sp_time.value()
-        live = self.sp_live.isChecked()
-        self.settings.spectrum_time_s, self.settings.live_time_mode = t, live
-        kw = {"live_time": live, "title": site.name}
-        if site.kind == "point":
-            kw["at_um"] = self._um(site.params)
-        elif site.kind in ("rect", "ellipse"):
-            kw["region_um"], kw["shape"] = self._um(site.params), site.kind
-        elif site.kind == "field":
-            kw["region_um"], kw["shape"] = self._um(site.params), "rect"
-        job = self._start(self.ctrl.acquire_spectrum, t, **kw)
-        if job is not None:
-            job._site = site
+    def acquire_site(self, item: DataItem | None):
+        """Measure the (not yet acquired) spectrum item *item* with the Acquire tab's settings."""
+        if item is None:
+            return None
+        return self._run_item(item, self._spectrum_request())
 
     def start_map(self):
+        """A new map item (the map region, or the whole image) – earlier maps are kept."""
         self._limit_map_region()
-        region = self._um(self.map_region or self._image_region())
         s = self.settings
         s.map_nx, s.map_ny, s.map_dwell_ms = self.m_nx.value(), self.m_ny.value(), self.m_dwell.value()
-        job = self._start(self.ctrl.acquire_map, s.map_nx, s.map_ny, s.map_dwell_ms / 1e3, region)
-        if job is not None:
+        if self._busy():
+            return None
+        item = self._new_and_run(MAP, "map", self.map_region or self._image_region(),
+                                 {"nx": s.map_nx, "ny": s.map_ny, "dwell_s": s.map_dwell_ms / 1e3})
+        if item is not None:
             self.bottom.setCurrentWidget(self.maps_area)
             self.m_progress.setValue(0)
+        return item
 
     def start_linescan(self):
+        """A new line-scan item along the drawn line – earlier line scans are kept."""
         if self.line is None:
             self.notify("draw a line on the electron image first (Line tool)")
-            return
-        x0, y0, x1, y1 = self._um(self.line)
-        self._start(self.ctrl.acquire_linescan, (x0, y0), (x1, y1), self.l_n.value(), self.l_dwell.value() / 1e3)
+            return None
+        if self._busy():
+            return None
+        return self._new_and_run(LINE, "line", self.line, {"n": self.l_n.value(), "dwell_s": self.l_dwell.value() / 1e3})
 
     def stop(self):
         self.ctrl.cancel()
 
     # ================================================================ sites / spectra
     def clear_sites(self):
-        self._sites.clear()
-        self.site_list.clear()
-        self.imgview.clear_sites()
-        self._current = None
-        self.specview.clear_spectra()
+        """Remove the drawn sites that have no data; acquired items stay in the Data Manager."""
+        for it in self.data:
+            if it.data is None and not it.acquiring:
+                self.data.remove(it)
 
     def clear_all(self):
-        """Clear all: sites, the line, and the map region (back to the whole image)."""
-        self.clear_sites()  # also removes the line and map outlines from the image
+        """Clear all: unmeasured sites, the line, and the map region (back to the whole image)."""
+        self.clear_sites()
+        self.imgview.remove_site("line")
+        self.imgview.remove_site("mapregion")
         self.line = None
         self.l_line.setText(self._line_text())
         self.map_region = None
         self.m_region.setText(self._region_text())
         self.imgview.set_overlay(None)
 
-    def _select_site(self, row: int):
-        self._current = self._sites[row] if 0 <= row < len(self._sites) else None
-        self._show_current()
-
     def _show_current(self):
         self.specview.clear_spectra()
-        sites = self._sites if self.d_overlay.isChecked() else ([self._current] if self._current else [])
+        cur = self._current if self._current is not None and self._current.kind == SPECTRUM else None
+        sites = self.data.of_kind(SPECTRUM) if self.d_overlay.isChecked() else ([cur] if cur else [])
         cal = self.ctrl.energy_calibration
+        if self._preview is not None:  # a clicked map pixel / line point: shown alone
+            sp = self._preview["sp"]
+            sites = []
+            self.specview.set_spectrum("preview", sp.with_calibration(cal), "#ffffff", sp.title + " (not kept)")
         for s in sites:
             if s is None or s.spectrum is None:
                 continue
             sp = s.spectrum.with_calibration(cal)
             if self.d_norm.isChecked() and sp.live_time > 0:
                 sp = Spectrum(sp.counts / sp.live_time, cal, sp.real_time, sp.live_time, beam_kv=sp.beam_kv)
-            self.specview.set_spectrum(f"site{s.id}", sp, s.color, s.name, primary=(s is self._current))
+            self.specview.set_spectrum(f"site{s.number}", sp, _color(s), f"{s.number} {s.title}",
+                                       primary=(s is cur))
         self.specview.set_markers(self.elements, self._kv())
         self._show_fit()
         self.specview.autoscale()
@@ -1021,7 +1435,9 @@ class EDSWindow(QtWidgets.QMainWindow):
             self.specview.set_fit(None, None)
 
     def _spectrum_of_current(self):
-        return self._current.spectrum if self._current else None
+        if self._preview is not None:
+            return self._preview["sp"]
+        return self._current.spectrum if self._current is not None else None
 
     def current_spectrum(self) -> Spectrum | None:
         sp = self._spectrum_of_current()
@@ -1126,7 +1542,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         s.beam_kv, s.takeoff_deg = self.c_kv.value(), self.c_to.value()
         s.fwhm_mn_ev, s.window = self.c_fwhm.value(), self.c_win.currentText()
         self.ctrl.beam_kv, self.ctrl.takeoff_deg = s.beam_kv, s.takeoff_deg
-        for site in self._sites:
+        for site in self.data.of_kind(SPECTRUM):
             sp = site.spectrum
             if sp is not None:
                 sp.takeoff_deg = s.takeoff_deg
@@ -1146,7 +1562,7 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     def compute_maps(self):
         """Recompute the element maps now (of the finished map, or of the running one)."""
-        if self.map is None and self._map_running is None:
+        if self.map is None:
             self.notify("no map acquired")
             return
         self._maps_changed()
@@ -1164,8 +1580,8 @@ class EDSWindow(QtWidgets.QMainWindow):
         maps shown, or changed inputs.  One computation at a time, in its own worker."""
         if self._maps_fut is not None:
             return
-        running = self._map_running is not None
-        sm = self._map_running if running else self.map
+        sm = self.map  # the selected map (the running scan's, if it is selected)
+        running = sm is not None and sm is self._map_running
         if sm is None or (running and not self.m_live.isChecked() and not force):
             return
         px = int(sm.done.sum()) if sm.done is not None else int(np.prod(sm.shape))
@@ -1251,7 +1667,7 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     def _show_maps(self, maps):
         self._maps = list(maps)
-        sm = self._map_running if self._map_running is not None else self.map
+        sm = self.map
         tiles = []
         if sm is not None and sm.se is not None:
             se = sm.se if self.m_bin.value() <= 1 else None
@@ -1280,6 +1696,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         for i, (lbl, d, unit, col) in enumerate(tiles):
             t = MapTile(lbl, d, unit, col)
             t.clicked.connect(self._map_pixel)
+            t.menuRequested.connect(self._map_menu)
             self.maps_grid.addWidget(t, i // cols, i % cols)
             self._tiles.append(t)
         self.m_overlay.blockSignals(True)
@@ -1293,11 +1710,11 @@ class EDSWindow(QtWidgets.QMainWindow):
     def _refresh_overlay(self):
         """Live maps: the element overlay on the image follows the new data."""
         i = self.m_overlay.currentIndex()
-        if i > 0 and self._map_running is None:
+        if i > 0 and (self.map is None or self.map is not self._map_running):
             self._overlay_changed(i)
 
     def _overlay_changed(self, i):
-        if i <= 0 or self.map is None:
+        if i <= 0 or self.map is None or i - 1 >= len(self._maps):
             self.imgview.set_overlay(None)
             return
         m = self._maps[i - 1]
@@ -1307,39 +1724,131 @@ class EDSWindow(QtWidgets.QMainWindow):
             pass  # binned: same region, coarser
         self.imgview.set_overlay(m.data, region, col)
 
-    def _map_pixel(self, row, col):
-        sm = self._map_running if self._map_running is not None else self.map
+    def _derived(self, sm, sp, shape: str, params, what: str) -> DataItem:
+        """A spectrum taken from a map (a pixel, the sum) as a new item."""
+        src = self._map_item_of(sm)
+        sp.metadata = dict(sp.metadata or {}, beam_kv_source=sm.metadata.get("beam_kv_source", "nominal"),
+                           derived_from=(src.record() if src is not None else None))
+        text = f"{src.title if src is not None else 'map'} {what}"
+        sp.title = text
+        self._clear_preview()
+        item = DataItem(0, SPECTRUM, shape, params, data=sp, source=text,
+                        conditions={"derived_from": src.number if src is not None else None, "what": what})
+        self.data.add(item)
+        self.select(item)
+        return item
+
+    def _map_item_of(self, sm) -> DataItem | None:
+        return next((i for i in self.data if i.data is sm), None) if sm is not None else None
+
+    # A click in a map tile or on the line profile only *shows* the spectrum there (a preview,
+    # not an item); right-click → "Add to Data Manager" keeps it as an item.
+    def _show_preview(self, sm, sp, shape: str, params, what: str):
+        src = self._map_item_of(sm)
+        if src is not None and src is not self._current:
+            self.select(src)  # the map / line it comes from stays the selected item
+        sp.title = f"{src.title if src is not None else 'map'} {what}"
+        sp.metadata = dict(sp.metadata or {}, beam_kv_source=sm.metadata.get("beam_kv_source", "nominal"))
+        self._preview = {"sm": sm, "sp": sp, "shape": shape, "params": tuple(params), "what": what}
+        if shape == "point":
+            self.imgview.add_site("preview", "point", tuple(params), "#ffffff", "")
+        self._show_current()
+        return sp
+
+    def _clear_preview(self) -> None:
+        if getattr(self, "_preview", None) is not None:
+            self._preview = None
+            self.imgview.remove_site("preview")
+
+    def _map_pixel_spectrum(self, row, col):
+        sm = self.map
         if sm is None:
-            return
+            return None
         b = self.m_bin.value()
         r0, c0 = row * b, col * b
         mask = np.zeros(sm.shape, bool)
         mask[r0:r0 + b, c0:c0 + b] = True
         sp = sm.sum_spectrum(mask).with_calibration(self.ctrl.energy_calibration)
-        sp.title = f"map pixel ({col}, {row})"
-        sp.metadata = dict(sp.metadata or {}, beam_kv_source=sm.metadata.get("beam_kv_source", "nominal"))
-        site = _Site(next(self._site_ids), "point",
-                     self._frac(sm.pixel_to_um(c0 + (b - 1) / 2, r0 + (b - 1) / 2), sm.metadata.get("field_um")))
-        site.text = sp.title
-        site.spectrum = sp
-        self._sites.append(site)
-        self.site_list.addItem(f"{site.name} – {sp.title}")
-        self.site_list.setCurrentRow(self.site_list.count() - 1)
+        pos = self._frac(sm.pixel_to_um(c0 + (b - 1) / 2, r0 + (b - 1) / 2), sm.metadata.get("field_um"))
+        return sm, sp, "point", pos, f"pixel ({col}, {row})" + (f" bin {b}" if b > 1 else "")
+
+    def _map_pixel(self, row, col, add: bool = False):
+        """Left click in a map tile: the pixel's spectrum is shown; ``add``: kept as a Data Manager item."""
+        r = self._map_pixel_spectrum(row, col)
+        if r is None:
+            return None
+        return self._derived(*r) if add else self._show_preview(*r)
+
+    def _map_menu(self, row: int, col: int, pos) -> None:
+        if self.map is None:
+            return
+        m = QtWidgets.QMenu(self)
+        m.addAction(f"Add pixel ({col}, {row}) to Data Manager", lambda: self._map_pixel(row, col, add=True))
+        m.addAction("Show spectrum", lambda: self._map_pixel(row, col))
+        m.exec(pos)
+
+    def _line_point_spectrum(self, k: int):
+        sm = self.linescan
+        if sm is None or not 0 <= k < sm.shape[1]:
+            return None
+        sp = sm.pixel_spectrum(0, k).with_calibration(self.ctrl.energy_calibration)
+        meta = sm.metadata or {}
+        pts = meta.get("points_um")
+        if pts and k < len(pts):
+            xy = pts[k]
+        else:
+            p0, p1 = np.asarray(meta.get("p0_um", (0, 0)), float), np.asarray(meta.get("p1_um", (0, 0)), float)
+            xy = p0 + (k + 0.5) / sm.shape[1] * (p1 - p0)
+        pos = self._frac(tuple(xy), meta.get("field_um"))
+        return sm, sp, "point", pos, f"point {k + 1}/{sm.shape[1]}"
+
+    def _line_point(self, k: int, add: bool = False):
+        """Point *k* of the shown line scan: its spectrum shown, or (``add``) kept as an item."""
+        r = self._line_point_spectrum(k)
+        if r is None:
+            return None
+        out = self._derived(*r) if add else self._show_preview(*r)
+        if self._profile_cursor is not None:  # after the preview: selecting the line redraws the profile
+            self._profile_cursor.setPos(self._line_distance(r[0], k))
+            self._profile_cursor.setVisible(True)
+        return out
+
+    @staticmethod
+    def _line_distance(sm, k: float) -> float:
+        meta = sm.metadata or {}
+        p0, p1 = np.asarray(meta.get("p0_um", (0, 0)), float), np.asarray(meta.get("p1_um", (0, 0)), float)
+        return (k + 0.5) / sm.shape[1] * float(np.hypot(*(p1 - p0)))
+
+    def _profile_clicked(self, ev) -> None:
+        sm = self.linescan
+        vb = self.profile.getPlotItem().vb
+        if sm is None or not vb.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        x = vb.mapSceneToView(ev.scenePos()).x()
+        L = self._line_distance(sm, sm.shape[1] - 0.5)  # the line's length
+        k = int(np.clip(np.floor(x / L * sm.shape[1]), 0, sm.shape[1] - 1)) if L > 0 else 0
+        if ev.button() == QtCore.Qt.RightButton:
+            ev.accept()
+            m = QtWidgets.QMenu(self)
+            m.addAction(f"Add point {k + 1} to Data Manager", lambda: self._line_point(k, add=True))
+            m.addAction("Show spectrum", lambda: self._line_point(k))
+            sp = ev.screenPos()
+            m.exec(QtCore.QPoint(int(sp.x()), int(sp.y())))
+        elif ev.button() == QtCore.Qt.LeftButton:
+            self._line_point(k)
 
     def show_map_sum(self):
         if self.map is None:
-            return
-        sp = self.map.sum_spectrum().with_calibration(self.ctrl.energy_calibration)
-        sp.metadata = dict(sp.metadata or {}, beam_kv_source=self.map.metadata.get("beam_kv_source", "nominal"))
-        site = _Site(next(self._site_ids), "field", self._frac_of(self.map))
-        site.text = f"map sum ({int(self.map.done.sum())} px)"
-        site.spectrum = sp
-        self._sites.append(site)
-        self.site_list.addItem(f"{site.name} – map sum ({int(self.map.done.sum())} px)")
-        self.site_list.setCurrentRow(self.site_list.count() - 1)
+            return None
+        sm = self.map
+        sp = sm.sum_spectrum().with_calibration(self.ctrl.energy_calibration)
+        return self._derived(sm, sp, "field", self._frac_of(sm), f"sum ({int(sm.done.sum())} px)")
 
     def _show_linescan(self, sm: SpectrumMap):
         self.profile.clear()
+        self._profile_cursor = pg.InfiniteLine(angle=90, pen=pg.mkPen("#fff", width=1, style=QtCore.Qt.DotLine))
+        self._profile_cursor.setVisible(False)
+        self.profile.addItem(self._profile_cursor, ignoreBounds=True)
         meta = sm.metadata
         p0, p1 = np.asarray(meta["p0_um"]), np.asarray(meta["p1_um"])
         n = sm.shape[1]
@@ -1368,12 +1877,12 @@ class EDSWindow(QtWidgets.QMainWindow):
         sp = self._spectrum_of_current()
 
         def acquire(seconds):
-            site = self._current
+            site = self._current if self._current is not None and self._current.kind == SPECTRUM else None
             kw = {"live_time": True, "title": "calibration"}
-            if site is not None and site.kind == "point":
+            if site is not None and site.shape == "point":
                 kw["at_um"] = self._um(site.params)
-            elif site is not None and site.kind in ("rect", "ellipse", "field"):
-                kw["region_um"], kw["shape"] = self._um(site.params), ("ellipse" if site.kind == "ellipse" else "rect")
+            elif site is not None and site.shape in ("rect", "ellipse", "field"):
+                kw["region_um"], kw["shape"] = self._um(site.params), ("ellipse" if site.shape == "ellipse" else "rect")
             elif self.image is not None:
                 kw["region_um"] = self._um(self._image_region())
             return self.ctrl.acquire_spectrum(seconds, **kw)
@@ -1467,56 +1976,6 @@ class EDSWindow(QtWidgets.QMainWindow):
     # ================================================================ files
     def _folder(self):
         return self.settings.save_folder or os.getcwd()
-
-    def open_spectrum(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open spectrum", self._folder(),
-                                                        "Spectra (*.msa *.emsa *.txt *.npz)")
-        if not path:
-            return
-        try:
-            sp = load_spectrum(path)
-        except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "Open", str(e))
-            return
-        site = _Site(next(self._site_ids), "spot", ())
-        site.text = os.path.basename(path)
-        site.spectrum = sp
-        sp.title = sp.title or os.path.basename(path)
-        sp.metadata = dict(sp.metadata or {}, beam_kv_source="file")
-        self._sites.append(site)
-        self.site_list.addItem(f"{site.name} – {os.path.basename(path)}")
-        self.site_list.setCurrentRow(self.site_list.count() - 1)
-
-    def save_spectrum(self):
-        sp = self.current_spectrum()
-        if sp is None:
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save spectrum",
-                                                        os.path.join(self._folder(), f"{sp.title or 'spectrum'}.msa"),
-                                                        "EMSA (*.msa);;NumPy (*.npz)")
-        if path:
-            sp.save(path)
-            self.settings.save_folder = os.path.dirname(path)
-            self.notify(f"saved {path}")
-
-    def open_map(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open map", self._folder(), "Maps (*.npz)")
-        if path:
-            try:
-                self.map = load_map(path)
-            except Exception as e:  # noqa: BLE001
-                QtWidgets.QMessageBox.warning(self, "Open", str(e))
-                return
-            self._map_done(self.map)
-
-    def save_map(self):
-        if self.map is None:
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save map", os.path.join(self._folder(), "map.npz"),
-                                                        "Map (*.npz)")
-        if path:
-            self.map.save(path)
-            self.notify(f"saved {path}")
 
     def export_maps(self):
         if not self._maps:
@@ -1628,12 +2087,13 @@ class EDSWindow(QtWidgets.QMainWindow):
         if ev.kind == "spectrum":
             sp = d.get("spectrum")
             job = self._job
-            site = getattr(job, "_site", None) if job is not None and d.get("job") == job.id else None
-            if site is not None and sp is not None:
-                site.spectrum = sp
+            site = getattr(job, "_item", None) if job is not None and d.get("job") == job.id else None
+            if site is not None and sp is not None and job.kind == "spectrum":
+                self.data.set_data(site, sp, final=False)
                 if site is self._current:
-                    self.specview.set_spectrum(f"site{site.id}", sp.with_calibration(self.ctrl.energy_calibration),
-                                               site.color, site.name)
+                    self.specview.set_spectrum(f"site{site.number}",
+                                               sp.with_calibration(self.ctrl.energy_calibration),
+                                               _color(site), f"{site.number} {site.title}")
                     if time.monotonic() - getattr(self, "_last_auto", 0) > 1.0:
                         self._last_auto = time.monotonic()
                         self.specview.autoscale()
@@ -1653,11 +2113,16 @@ class EDSWindow(QtWidgets.QMainWindow):
                 self.m_progress.setValue(int(100 * d.get("progress", 0)))
                 self._live_from_map(sm)
                 job = self._job
+                item = getattr(job, "_item", None) if job is not None and d.get("job") in (None, job.id) else None
+                if item is not None and item.data is not sm:
+                    self.data.set_data(item, sm, final=False)  # the item shows the scan while it runs
+                    if item is self._current and job.kind == "map":
+                        self.map = sm
                 if job is not None and job.kind == "map" and d.get("job") in (None, job.id):
                     if self._map_running is not sm:
                         self._map_running = sm
                         self._maps_changed()
-                if time.monotonic() - self._map_live_t > 1.0 and sm.se is not None:
+                if sm is self.map and time.monotonic() - self._map_live_t > 1.0 and sm.se is not None:
                     self._map_live_t = time.monotonic()
                     se = np.where(sm.done, sm.se, np.nan)
                     if np.isfinite(se).any() and sm.shape[0] > 1:
@@ -1667,41 +2132,61 @@ class EDSWindow(QtWidgets.QMainWindow):
             self.p_job.setValue(int(1000 * float(d["progress"])))
 
     def _job_done(self, job):
+        item = getattr(job, "_item", None)
         try:
             res = job.result(0)
         except Exception as e:  # noqa: BLE001
             self.notify(f"{job.description} failed: {e}")
-            return
-        if job.kind == "spectrum" and isinstance(res, Spectrum):
-            site = getattr(job, "_site", None)
-            if site is not None:
-                site.spectrum = res
-                res.takeoff_deg = self.ctrl.takeoff_deg
-                self._assign_beam_kv(res)
-                mic = self._microscope_metadata()
-                if mic:
-                    res.metadata = dict(res.metadata or {}, microscope=mic)
-                if site is self._current:
-                    self._show_current()
-                if self.sp_autoid.isChecked() and site is self._current and res.total > 200 and not job.cancelled:
-                    self.analyse(autoid=True)
+            res = None
+        if item is not None and item in self.data:
+            self._item_done(job, item, res)
         elif job.kind == "image" and isinstance(res, ElectronImage):
             self._show_image(res)
             self._limit_map_region()
-        elif job.kind == "map" and isinstance(res, SpectrumMap):
+        if job.kind == "map":
             self._map_running = None
-            self._map_beam_kv(res)
-            self.map = res
-            self._map_done(res)
-        elif job.kind == "linescan" and isinstance(res, SpectrumMap):
-            self._map_beam_kv(res)
-            self.map = res
-            self._show_linescan(res)
         self.p_job.setValue(1000)
         if self._speed_pending is not None:
             self._apply_speed(self._speed_pending)
         if self._emin_pending:
             self.apply_min_energy()
+
+    def _item_done(self, job, item: DataItem, res) -> None:
+        """The acquisition of a Data Manager item ended: its data (also of a stopped scan) is kept."""
+        if job.cancelled:
+            item.conditions["stopped"] = True
+        if job.kind == "spectrum" and isinstance(res, Spectrum):
+            res.takeoff_deg = self.ctrl.takeoff_deg
+            self._assign_beam_kv(res)
+            mic = self._microscope_metadata()
+            if mic:
+                res.metadata = dict(res.metadata or {}, microscope=mic)
+            self.data.set_data(item, res)
+            if item is self._current:
+                self._show_current()
+            if self.sp_autoid.isChecked() and item is self._current and res.total > 200 and not job.cancelled:
+                self.analyse(autoid=True)
+        elif job.kind in ("map", "linescan") and isinstance(res, SpectrumMap) and res.done is not None \
+                and res.done.any():
+            self._map_running = None
+            self._map_beam_kv(res)
+            self.data.set_data(item, res)
+            if item is self._current:
+                if job.kind == "map":
+                    self.map = res
+                    self._map_done(res)
+                else:
+                    self.linescan = res
+                    self._show_linescan(res)
+            else:
+                self.notify(f"{item.title} done")
+        else:  # nothing acquired
+            item.data = None
+            self.data.finish(item)
+            if job.kind != "spectrum" or item.remeasure_of is not None:
+                self.data.remove(item)  # a map / line / remeasure with no data: nothing to keep
+            return
+        self.data.finish(item)
 
     def _map_beam_kv(self, sm: SpectrumMap):
         """E0 of a map / line scan from its sum spectrum (Duane–Hunt), else the nominal value."""
@@ -1714,7 +2199,6 @@ class EDSWindow(QtWidgets.QMainWindow):
     def _map_done(self, sm: SpectrumMap):
         self.imgview.set_overlay(None)
         self.m_progress.setValue(int(100 * sm.done.mean()))
-        self.imgview.add_site("mapregion", "map", self._frac_of(sm), "#ffffff", "map")
         oh = sm.metadata.get("overhead_s")
         self.notify(f"map {sm.shape[1]}×{sm.shape[0]}: {int(sm.done.sum())} px, "
                     f"{sm.sum_spectrum().total:,} counts" + (f", overhead {oh * 1e3:.0f} ms/px" if oh else ""))
@@ -1742,6 +2226,15 @@ class EDSWindow(QtWidgets.QMainWindow):
 
     # ================================================================ lifecycle
     def closeEvent(self, ev):
+        if self._closed:
+            return super().closeEvent(ev)
+        dirty = self.data.dirty_items()
+        if dirty:
+            ans = self._ask_unsaved(dirty)
+            if ans == "cancel" or (ans == "save" and not self.save_unsaved()):
+                ev.ignore()
+                return
+        self._closed = True
         self.timer.stop()
         self.ctrl.abort()  # stop counting now: cancel the job, stop the live read-out, MCA off
         self._save_settings()

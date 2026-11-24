@@ -212,6 +212,20 @@ elements are identified (AutoID, or pick them on the periodic table) and quantif
 (standardless ZA, optional oxygen by stoichiometry).  Draw a map area or a line for spectrum
 maps and line scans; maps can be shown as window, fitted (deconvolved) or quantitative
 (wt %) maps and clustered into phases.  Spectra save as EMSA `.msa`, maps as `.npz`.
+
+**Data Manager** (below the electron image): every point / area spectrum, line scan and map of
+the session is an item with a number (and a name if you give it one), kept in memory – a new map
+or line scan never replaces an earlier one, and acquiring again at a measured site makes a new
+item.  Clicking an item selects it: its outline is drawn thicker on the image with its number in
+bold, a map shows its element maps, a line scan its profile.  Clicking a map pixel or a point
+of the line profile only *shows* its spectrum; right-click there → **Add to Data Manager** keeps
+it as an item.  Right-click an item: **Delete**, **Save**
+(EMSA / `.npz`), **Remeasure** (a new item with the same geometry and conditions), **Rename**,
+**Properties** (dwell, real/live time, beam energy, magnification, field, region, processor
+speed and threshold, timestamp, microscope readbacks).  *Open…* reads spectrum, map and line
+files back in (the name, geometry and conditions are stored in the file, so they can be
+remeasured).  Unsaved items are marked; closing the window with unsaved items asks to save
+(into a folder), discard or cancel.  *Clear all* removes only sites not measured yet.
 Element maps are computed **while the map scans** (about once a second, from the pixels
 scanned so far; unscanned pixels stay blank) and follow any change of the elements, map type,
 binning or oxide mode – during the scan and after it.
