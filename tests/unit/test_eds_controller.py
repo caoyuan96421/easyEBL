@@ -65,6 +65,19 @@ def test_electron_image(rig):
     im = ctrl.acquire_image(96, 96, 4e-6).result(30)
     assert im.data.shape == (96, 96) and np.isfinite(im.data).all()
     assert np.std(im.data) > 0  # the simulated sample has contrast
+    f = ctrl.full_field_um()[2]
+    assert im.region_um == pytest.approx((0, 0, f, f))
+
+
+def test_electron_image_keeps_the_pixels_square(rig):
+    """4:3 pixels scan a 4:3 rectangle of the square field (full width), not the whole square."""
+    mgr, dpp, ctrl = rig
+    f = ctrl.full_field_um()[2]
+    im = ctrl.acquire_image(32, 24, 2e-6).result(30)
+    assert im.data.shape == (24, 32)
+    assert im.region_um == pytest.approx((0, 0, f, f * 0.75))
+    im = ctrl.acquire_image(24, 32, 2e-6).result(30)
+    assert im.region_um == pytest.approx((0, 0, f * 0.75, f))
 
 
 def test_map_acquires_every_pixel_and_saves(rig, tmp_path):

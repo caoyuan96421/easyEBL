@@ -49,11 +49,11 @@ def _wait_idle(qtbot, w, timeout=60000):
 def test_eds_window_workflow(qtbot, eds, tmp_path):
     w, mgr, dpp = eds
     # electron image
-    w.im_res.setCurrentIndex(w.im_res.findData("256x192"))
+    w.im_res.setCurrentIndex(w.im_res.findData("128x128"))
     w.im_dwell.setValue(2.0)
     w.acquire_image()
     _wait_idle(qtbot, w)
-    assert w.image is not None and w.image.data.shape == (192, 256) and np.isfinite(w.image.data).all()
+    assert w.image is not None and w.image.data.shape == (128, 128) and np.isfinite(w.image.data).all()
 
     # calibration from a whole-field spectrum (the DP5 mock sees a 55Fe source: Mn Kα + Kβ)
     w.sp_time.setValue(1.5)

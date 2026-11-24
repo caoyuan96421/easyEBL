@@ -43,7 +43,7 @@ class EDSSettings:
     map_ny: int = 48
     map_dwell_ms: float = 50.0
     image_nx: int = 512
-    image_ny: int = 384
+    image_ny: int = 512
     image_dwell_us: float = 4.0
     oxygen_by_stoichiometry: bool = False
     min_energy_kev: float = 0.22  # low-energy cut-off (DP5 slow threshold), just below C Kα (0.277 keV)

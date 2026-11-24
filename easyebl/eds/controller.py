@@ -673,9 +673,14 @@ class EDSController:
     # ============================================================== electron image
     def acquire_image(self, nx: int = 256, ny: int = 256, dwell_s: float = 4e-6, region_um=None) -> EDSJob:
         """SE image for navigation (one frame, raster, blanked flyback)."""
-        region = tuple(region_um) if region_um is not None else self.full_field_um()
         if not (nx >= 2 and ny >= 2 and dwell_s > 0):
             raise ValueError("bad image size / dwell")
+        if region_um is not None:
+            region = tuple(region_um)
+        else:  # the largest nx:ny rectangle in the square field, square pixels (like the SEM window)
+            f = self._cal.field_size_um
+            s = f / max(nx, ny)
+            region = (0.0, 0.0, nx * s, ny * s)
         if not self.options.video_channel:
             raise ValueError("no video channel configured")
         pts = grid_points(region[:2], region[2], region[3], nx, ny)

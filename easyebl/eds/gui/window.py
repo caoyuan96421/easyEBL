@@ -247,10 +247,12 @@ class EDSWindow(QtWidgets.QMainWindow):
         grid.setHorizontalSpacing(4)
         grid.setVerticalSpacing(2)
         self.im_res = QtWidgets.QComboBox()
-        for nx, ny in [(256, 192), (512, 384), (768, 576), (1024, 768), (256, 256), (512, 512)]:
+        for nx, ny in [(128, 128), (256, 256), (512, 512), (768, 768), (1024, 1024)]:  # the field is square
             self.im_res.addItem(f"{nx} × {ny}", f"{nx}x{ny}")
         i = self.im_res.findData(f"{s.image_nx}x{s.image_ny}")
-        self.im_res.setCurrentIndex(max(0, i))
+        if i < 0:  # e.g. a saved 4:3 size from before: the square one of the same width, else 512
+            i = self.im_res.findData(f"{s.image_nx}x{s.image_nx}")
+        self.im_res.setCurrentIndex(i if i >= 0 else self.im_res.findData("512x512"))
         self.im_res.setToolTip("resolution")
         self.im_dwell = QtWidgets.QDoubleSpinBox()
         self.im_dwell.setRange(0.5, 1000)
