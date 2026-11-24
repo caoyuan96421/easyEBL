@@ -342,6 +342,7 @@ class SimulatedBackend(DAQBackend):
             self._deposit_static()
             self.static_xyb = (float(x_v), float(y_v), bool(blank))
             self._beam = self.volts_to_true_um(np.array([[x_v, y_v]]))[0]
+        self._note_static(x_v, y_v, blank)
 
     def read_ai(self, channels, samples: int, rate: float, ai_range_v: float | None = None) -> np.ndarray:
         """The video signal with the beam held at its static position (blanked: no signal)."""
@@ -463,6 +464,7 @@ class SimulatedBackend(DAQBackend):
         mon.running, mon.t_start, mon.t_update = True, t0, t0
         self._require_present("run_stream")
         self._stream_pos = 0
+        self._tap("begin_stream")
         with self._lock:
             self._deposit_static()
             try:
@@ -478,6 +480,7 @@ class SimulatedBackend(DAQBackend):
                     if self.record:
                         self.recorded.append(c)
                     ai = self._process(c, rate, n_ai, ai_range_v)
+                    self._tap_output(c.x, c.y, c.blank)
                     self._stream_pos += len(c)
                     written += len(c)
                     mon.written = mon.generated = mon.ai_read = written
@@ -494,6 +497,7 @@ class SimulatedBackend(DAQBackend):
                         lag = written / rate - (time.perf_counter() - t0)
                         if lag > 0:
                             time.sleep(lag)
+                    self._tap("set_generated", written)  # (realtime: the beam is here now)
             finally:
                 self._static_t = time.perf_counter()
                 mon.running = False

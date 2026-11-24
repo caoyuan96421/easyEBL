@@ -290,7 +290,7 @@ class HardwareDialog(QtWidgets.QDialog):
                       invert_y=self.daq_inv_y.isChecked(), swap_xy=self.daq_swap.isChecked())
         eds = replace(b.eds, mca=self.eds_mca.currentData(), external_control=self.eds_external.isChecked())
         mic = replace(b.microscope, port=self.port(), baudrate=int(self.mic_baud.currentData()))
-        out = SystemConfig(daq, eds, mic)
+        out = SystemConfig(daq, eds, mic, b.monitor)
         out.path = b.path
         return out
 
@@ -310,7 +310,11 @@ class MenuWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("easyEBL")
         self.setWindowIcon(make_icon())
         w = QtWidgets.QWidget()
-        grid = QtWidgets.QGridLayout(w)
+        outer = QtWidgets.QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0)
+        top = QtWidgets.QWidget()
+        outer.addWidget(top)
+        grid = QtWidgets.QGridLayout(top)
         grid.setContentsMargins(12, 10, 12, 10)
         grid.setHorizontalSpacing(10)
         self.rows: dict[str, tuple[QtWidgets.QLabel, QtWidgets.QLabel]] = {}
@@ -329,11 +333,42 @@ class MenuWindow(QtWidgets.QMainWindow):
         self.l_config = QtWidgets.QLabel()
         self.l_config.setStyleSheet("color:#9aa")
         grid.addWidget(self.l_config, len(COMPONENTS), 0, 1, 3)
+        # --- scan monitor: X/Y/blanker as an oscilloscope in XY mode with persistence
+        from ..gui.scanmonitor import ScanMonitorWidget
+
+        mc = app.config.monitor
+        self.monitor_box = QtWidgets.QGroupBox("Scan monitor (image coordinates, blanked samples hidden)")
+        ml = QtWidgets.QVBoxLayout(self.monitor_box)
+        d = app.config.daq
+        self.monitor = ScanMonitorWidget(app.scan_tap, mc.resolution, mc.retention_s, mc.fade,
+                                         on_settings=app.set_monitor_settings,
+                                         orientation=(d.invert_x, d.invert_y, d.swap_xy))
+        ml.addWidget(self.monitor)
+        outer.addWidget(self.monitor_box, 1)
+        outer.setContentsMargins(0, 0, 8, 8)
         self.setCentralWidget(w)
         self._build_menus()
-        self.statusBar().setSizeGripEnabled(False)
-        self.setFixedSize(self.sizeHint().expandedTo(QtCore.QSize(460, 0)))
+        self._compact = top.sizeHint().expandedTo(QtCore.QSize(460, 0))
+        self.show_monitor(mc.visible, save=False)
         self._hint_shown = False
+
+    def show_monitor(self, on: bool, save: bool = True):
+        """Show or hide the scan monitor (the window is a fixed-size status panel without it)."""
+        on = bool(on)
+        self.monitor_box.setVisible(on)
+        blocked = self.a_monitor.blockSignals(True)
+        self.a_monitor.setChecked(on)
+        self.a_monitor.blockSignals(blocked)
+        self.statusBar().setSizeGripEnabled(on)
+        if on:
+            self.setMinimumSize(460, 0)
+            self.setMaximumSize(16777215, 16777215)
+            self.resize(max(self.width(), 480), 640)
+        else:
+            self.setFixedSize(self._compact.width(), self._compact.height() + self.menuBar().sizeHint().height()
+                              + self.statusBar().sizeHint().height())
+        if save:
+            self.app.set_monitor_settings(visible=on)
 
     def _build_menus(self):
         mb = self.menuBar()
@@ -344,6 +379,11 @@ class MenuWindow(QtWidgets.QMainWindow):
         m = mb.addMenu("&Hardware")
         m.addAction("Configure…", self.app.configure)
         m.addAction("Reconnect all", self.app.reconnect)
+        m = mb.addMenu("&View")
+        self.a_monitor = m.addAction("Scan monitor")
+        self.a_monitor.setCheckable(True)
+        self.a_monitor.toggled.connect(self.show_monitor)
+        m.addAction("Clear scan monitor", lambda: self.monitor.clear())
         self.m_open = mb.addMenu("&Open")
         self.app.fill_open_menu(self.m_open)
 
@@ -395,6 +435,9 @@ class EasyEBLApp(QtCore.QObject):
         qapp.setQuitOnLastWindowClosed(False)  # the backend outlives every window
         qapp.setWindowIcon(make_icon())
         self.backend = SystemBackend(config, **self._backend_kw)
+        from ..hal.scanmonitor import ScanTap
+
+        self.scan_tap = ScanTap()  # outlives backend restarts; attached to each new DAQ backend
         self.menu = MenuWindow(self)
         self.tray = None
         if use_tray and QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
@@ -425,6 +468,10 @@ class EasyEBLApp(QtCore.QObject):
         return self
 
     def _wire_backend(self):
+        if self.backend.manager is not None:
+            self.backend.manager.backend.output_tap = self.scan_tap
+        d = self.config.daq
+        self.menu.monitor.set_orientation(d.invert_x, d.invert_y, d.swap_xy)  # same coordinates as the images
         if self.backend.microscope is not None:
             self.backend.microscope.opener = lambda: self.open("microscope")
 
@@ -439,6 +486,7 @@ class EasyEBLApp(QtCore.QObject):
                 return False
         self.closing = True
         self.timer.stop()
+        self.menu.monitor.stop()
         self.close_windows()
         self.backend.close()
         self.menu.close()
@@ -479,6 +527,24 @@ class EasyEBLApp(QtCore.QObject):
         self._wire_backend()
         self.refresh_status()
         return True
+
+    def set_monitor_settings(self, resolution: int | None = None, retention_s: float | None = None,
+                             fade: bool | None = None, visible: bool | None = None):
+        """Remember the scan-monitor settings (saved with the configuration unless --sim)."""
+        m = self.config.monitor
+        if resolution is not None:
+            m.resolution = int(resolution)
+        if retention_s is not None:
+            m.retention_s = float(retention_s)
+        if fade is not None:
+            m.fade = bool(fade)
+        if visible is not None:
+            m.visible = bool(visible)
+        if self.persistent:
+            try:
+                self.config.save()
+            except OSError:
+                pass
 
     def reconnect(self):
         return self.restart_backend()

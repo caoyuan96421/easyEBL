@@ -229,6 +229,7 @@ class NIDAQBackend(DAQBackend):
         else:
             self._write_xy_static(x_v, y_v)
             self._write_blank_static(False)
+        self._note_static(x_v, y_v, blank)
 
     def read_ai(self, channels, samples: int, rate: float, ai_range_v: float | None = None) -> np.ndarray:
         """Finite, hardware-timed AI-only acquisition (no AO / DO task is touched)."""
@@ -377,6 +378,7 @@ class NIDAQBackend(DAQBackend):
         t0 = time.perf_counter()
         mon.t_start = mon.t_update = t0
         it = rechunk(chunks, piece)
+        self._tap("begin_stream")  # the scan monitor's spot follows the generated samples from here
 
         try:
             ao = nidaqmx.Task("easyebl_ao")
@@ -457,6 +459,7 @@ class NIDAQBackend(DAQBackend):
                 np.clip(xy, -lim, lim, out=xy)
                 ao_w.write_many_sample(xy, timeout=write_timeout)
                 do_w.write_many_sample_port_uint32(self._do_words(c), timeout=write_timeout)
+                self._tap_output(xy[0], xy[1], c.blank)  # the scan monitor sees exactly what was written
                 st["queued"] += n
                 last_xy = (float(c.x[-1]), float(c.y[-1]))
                 mon.writes += 1
@@ -491,6 +494,7 @@ class NIDAQBackend(DAQBackend):
                     return
                 gen = int(ao.out_stream.total_samp_per_chan_generated)
                 mon.generated = gen
+                self._tap("set_generated", gen)
                 fill = st["queued"] - gen
                 if mon.out_fill_min is None or fill < mon.out_fill_min:
                     mon.out_fill_min = fill
@@ -544,6 +548,7 @@ class NIDAQBackend(DAQBackend):
                 drain()
                 gen = int(ao.out_stream.total_samp_per_chan_generated)
                 mon.generated = gen
+                self._tap("set_generated", gen)
                 mon.t_update = time.perf_counter()
                 if gen >= target and (aborted or reader is None or st["ai_read"] >= n_real):
                     break

@@ -65,6 +65,14 @@ microscope, whether it is connected (green), simulated (blue), waiting or needin
   simulator or none, and the baud rate.  *Apply & reconnect* saves it to
   `%APPDATA%\easyEBL\system.json` and reconnects; *All simulators* fills in the simulators.
   **Reconnect all** reopens everything with the same settings.
+* **Scan monitor** (*View → Scan monitor*): the X/Y deflection as an oscilloscope in XY mode with
+  persistence, over the full ±10 V field, in the same image coordinates as the other windows (the
+  scan orientation's invert X/Y and swap X/Y are undone).  A bright dot always marks where the beam
+  is now (solid: beam on, hollow ring: blanked), following the samples the DAQ has actually generated
+  and every static move.  It is fed with exactly the samples written to the DAQ;
+  blanked samples are not plotted.  Resolution (default 256²) and persistence time (∞ = until
+  *Clear*) are saved in `system.json`.  The stream hands samples off through a lock-free ring buffer
+  (decimated or skipped when full, never waited for); binning and drawing run in their own thread.
 * **The hardware stays connected in the background.**  All subsystems share the one backend (one
   DAQ manager, one DP5, one serial port), so SEM and EDS share the DAQ through the HAL lease.
   Closing a subsystem window, or the menu window itself, does not disconnect anything.

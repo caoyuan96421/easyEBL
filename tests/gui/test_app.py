@@ -174,3 +174,68 @@ def test_single_instance(qtbot):
         if p.poll() is None:
             p.kill()
         server.close()
+
+
+def test_scan_monitor_in_the_menu(ui, qtbot):
+    import numpy as np
+
+    from easyebl.core import OutputChunk
+
+    mon = ui.menu.monitor
+    assert ui.menu.monitor_box.isVisible() and mon.worker.running and ui.scan_tap.enabled
+    assert ui.backend.manager.backend.output_tap is ui.scan_tap
+    mon.retention.setValue(0)  # keep everything: the test must not race the persistence
+    # unblanked at (+5 V, +5 V), blanked at (−5 V, −5 V)
+    n = 20000
+    c = OutputChunk(np.r_[np.full(n, 5.0), np.full(n, -5.0)], np.r_[np.full(n, 5.0), np.full(n, -5.0)],
+                    np.r_[np.zeros(n, bool), np.ones(n, bool)])
+    h = ui.backend.manager.get_handle("monitor-test")
+    h.run_stream(500e3, [c])
+    h.close()
+    qtbot.waitUntil(lambda: mon.stats.total >= n, timeout=5000)
+    img = mon.screen.image
+    res = mon.settings()[0]
+    assert img.width() == img.height() == res == 256
+
+    def lit(xv, yv):
+        col = int((xv + 10) / 20 * res)
+        row = res - 1 - int((yv + 10) / 20 * res)
+        return img.pixelIndex(col, row)
+
+    assert lit(5, 5) == 255 and lit(-5, -5) == 0 and lit(0, 0) == 0
+    # the beam spot is always shown: parked and blanked after the stream (hollow) …
+    cfg = ui.backend.manager.config
+    qtbot.waitUntil(lambda: mon.screen.spot == (cfg.park_x_v, cfg.park_y_v, True), timeout=5000)
+    # … and solid where the beam is switched on
+    h = ui.backend.manager.get_handle("monitor-test-2")
+    h.park(-3.0, 7.0, blank=False)
+    qtbot.waitUntil(lambda: mon.screen.spot == (-3.0, 7.0, False), timeout=5000)
+    h.park()
+    h.close()
+    pt = mon.screen.spot_point()
+    r = mon.screen.screen_rect()
+    assert r.contains(pt.toPoint())
+    mon.grab()  # paints offscreen
+    # settings are saved with the configuration
+    mon.res.setCurrentIndex(mon.res.findData(128))
+    mon.retention.setValue(3.5)
+    saved = SystemConfig.load(ui.config.path).monitor
+    assert (saved.resolution, saved.retention_s) == (128, 3.5)
+    qtbot.waitUntil(lambda: mon.screen.image.width() == 128, timeout=5000)
+    # View → Scan monitor hides it, stops the worker and remembers that
+    ui.menu.a_monitor.trigger()
+    assert not ui.menu.monitor_box.isVisible() and not mon.worker.running and not ui.scan_tap.enabled
+    assert SystemConfig.load(ui.config.path).monitor.visible is False
+    ui.menu.a_monitor.trigger()
+    assert mon.worker.running
+
+
+def test_scan_monitor_follows_the_scan_orientation(ui):
+    new = SystemConfig()
+    new.path = ui.config.path
+    new.daq.invert_x, new.daq.swap_xy = True, True
+    assert ui.restart_backend(new, ask=False)
+    mon = ui.menu.monitor
+    mon.worker.step()  # the worker applies the setting
+    assert mon.worker.acc.orientation == (True, False, True)
+    assert ui.backend.engine.calibration.swap_xy and ui.backend.engine.calibration.invert_x

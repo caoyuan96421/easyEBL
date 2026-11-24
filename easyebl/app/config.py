@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 import json
 import os
 
-__all__ = ["DAQSection", "EDSSection", "MicroscopeSection", "SystemConfig", "default_config_path",
+__all__ = ["DAQSection", "EDSSection", "MicroscopeSection", "ScanMonitorSection", "SystemConfig", "default_config_path",
            "AI_TERMINALS", "BAUD_RATES"]
 
 AI_TERMINALS = ("DIFF", "RSE", "NRSE", "PSEUDO_DIFF")
@@ -64,13 +64,25 @@ class MicroscopeSection:
 
 
 @dataclass
+class ScanMonitorSection:
+    """X/Y/blanker monitor in the menu window (oscilloscope XY mode with persistence)."""
+
+    visible: bool = True
+    resolution: int = 256  # pixels per axis over the full ±10 V field
+    retention_s: float = 2.0  # persistence; 0 = keep until cleared
+    fade: bool = True  # older samples fade out over the retention time
+
+
+@dataclass
 class SystemConfig:
     daq: DAQSection = field(default_factory=DAQSection)
     eds: EDSSection = field(default_factory=EDSSection)
     microscope: MicroscopeSection = field(default_factory=MicroscopeSection)
+    monitor: ScanMonitorSection = field(default_factory=ScanMonitorSection)
     path: str = field(default="", repr=False, compare=False)
 
-    _SECTIONS = {"daq": DAQSection, "eds": EDSSection, "microscope": MicroscopeSection}
+    _SECTIONS = {"daq": DAQSection, "eds": EDSSection, "microscope": MicroscopeSection,
+                 "monitor": ScanMonitorSection}
 
     @classmethod
     def simulators(cls) -> "SystemConfig":

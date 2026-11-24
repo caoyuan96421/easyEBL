@@ -147,6 +147,8 @@ class DAQBackend(ABC):
         self.config = config
         self._open = False
         self.aux_values: dict = {k: 0.0 for k in AUX_OUTPUTS}  # last value set per aux output
+        self._output_tap = None
+        self.last_static: tuple[float, float, bool] | None = None  # last software-timed (x, y, blank)
 
     # ---------------------------------------------------------------- lifecycle
     @property
@@ -250,7 +252,42 @@ class DAQBackend(ABC):
             self._open = False
         self.open()
 
+    # ------------------------------------------------------------------ output tap
+    @property
+    def output_tap(self):
+        """Watcher of the outputs, e.g. a :class:`~easyebl.hal.scanmonitor.ScanTap` (None = nobody).
+
+        It gets every streamed chunk as written (``push(x, y, blank)``, must not block), the
+        stream's progress (``begin_stream()``, ``set_generated(n)``) and every software-timed
+        write (``set_static(x, y, blank)``), so it knows where the beam is at any time.
+        """
+        return self._output_tap
+
+    @output_tap.setter
+    def output_tap(self, tap) -> None:
+        self._output_tap = tap
+        if tap is not None and self.last_static is not None:
+            self._tap("set_static", *self.last_static)
+
+    def _tap(self, method: str, *args) -> None:
+        tap = self._output_tap
+        if tap is not None:
+            try:
+                getattr(tap, method)(*args)
+            except Exception:  # noqa: BLE001 - a monitor must never disturb the outputs
+                pass
+
+    def _tap_output(self, x: np.ndarray, y: np.ndarray, blank: np.ndarray) -> None:
+        """Hand a written chunk to :attr:`output_tap` (called from the streaming thread)."""
+        self._tap("push", x, y, blank)
+
+    def _note_static(self, x_v: float, y_v: float, blank: bool) -> None:
+        """Record a software-timed output (implementations call this after :meth:`write_static`)."""
+        self.last_static = (float(x_v), float(y_v), bool(blank))
+        self._tap("set_static", *self.last_static)
+
     # ------------------------------------------------------------------ helpers
+
     def blank_level(self, blank: bool) -> bool:
         """Electrical level for a logical blank state."""
         return bool(blank) if self.config.blank_active_high else not bool(blank)
