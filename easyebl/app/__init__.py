@@ -2,7 +2,7 @@
 
     easyebl                  # the instrument configuration saved in Hardware → Configure…
     easyebl --sim            # this session on simulators only (nothing saved)
-    easyebl --open sem,eds   # also open these windows
+    easyebl --open sem,eds   # also open these windows (sem, eds, microscope, litho, …)
     python -m easyebl        # the same
 
 Starting it opens a small menu window showing whether the scan DAQ, the EDS
@@ -26,7 +26,7 @@ from .config import SystemConfig
 
 __all__ = ["SystemConfig", "SystemBackend", "ComponentStatus", "main", "instance_name"]
 
-SUBSYSTEM_KEYS = ("sem", "eds", "microscope", "vector", "gds", "dose", "alignment", "raster", "hal")
+SUBSYSTEM_KEYS = ("sem", "eds", "microscope", "litho", "vector", "gds", "dose", "alignment", "raster", "hal")
 
 
 def instance_name() -> str:

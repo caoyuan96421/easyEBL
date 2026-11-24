@@ -39,6 +39,7 @@ SUBSYSTEMS = (
     Subsystem("sem", "SEM imaging", "daq"),
     Subsystem("eds", "EDS", "eds"),
     Subsystem("microscope", "Microscope (column && stage)", "microscope"),
+    Subsystem("litho", "Lithography", "daq"),
     Subsystem("vector", "Vector lithography", "daq", tool=True),
     Subsystem("gds", "GDS lithography", "daq", tool=True),
     Subsystem("dose", "Dose calculator", "daq", tool=True),
@@ -780,6 +781,17 @@ class EasyEBLApp(QtCore.QObject):
             m = b.microscope
             w = MicroscopeWindow(m.link, m.sem, m.stage, m.settings, owns_link=False)
             w.resize(1200, 860)
+            return w
+        if key == "litho":
+            from ..litho.module import LithoWindow
+            from ..litho.module.hardware import BackendHardware
+
+            def hardware(win):
+                return BackendHardware(b.engine, b.manager, b.microscope, win.bridge, open_sem=lambda: self.open("sem"),
+                                       parent_widget=win)
+
+            w = LithoWindow(hardware)
+            w.resize(1500, 950)
             return w
         from ..gui.common import Session
 

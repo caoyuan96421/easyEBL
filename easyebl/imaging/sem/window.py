@@ -227,7 +227,7 @@ class SEMWindow(QtWidgets.QMainWindow):
         sc("F9", self.capture.request)
         sc("Ctrl+S", self.save_dialog)
         sc("Ctrl+A", self.auto_contrast)
-        sc("Esc", lambda: self.engine.stop())
+        sc("Esc", lambda: self.cancel_pick() if self.view.pick_mode else self.engine.stop())
         for key, dx, dy in (("Shift+Left", -1, 0), ("Shift+Right", 1, 0), ("Shift+Up", 0, 1), ("Shift+Down", 0, -1)):
             sc(key, lambda dx=dx, dy=dy: self.fov.step(dx, dy))
         sc("Ctrl++", lambda: self.fov.zoom(+1))
@@ -385,6 +385,38 @@ class SEMWindow(QtWidgets.QMainWindow):
     def _pointer(self, xy):
         self.l_ptr.setText("" if xy is None else f"x {xy[0]:+.3f} µm, y {xy[1]:+.3f} µm")
 
+    # ---------------------------------------------------------------- pick (lithography alignment)
+    def request_pick(self, prompt: str, callback, targets=()) -> None:
+        """Ask the user to click a point in the image: ``callback((x_um, y_um))`` with the field
+        position, or ``callback(None)`` when cancelled (Esc, another request, window closed).
+        *targets* are drawn as crosses (e.g. the predicted mark position)."""
+        self.cancel_pick()
+        self._pick_cb = callback
+        self.view.pointPicked.connect(self._picked)
+        self.view.start_pick(prompt + "   (click the mark · Esc cancels)", targets)
+        self.notify("pick: " + prompt)
+
+    def _picked(self, x: float, y: float) -> None:
+        cb = self._end_pick()
+        if cb is not None:
+            self.notify(f"picked ({x:+.3f}, {y:+.3f}) µm")
+            cb((x, y))
+
+    def _end_pick(self):
+        cb = getattr(self, "_pick_cb", None)
+        self._pick_cb = None
+        try:
+            self.view.pointPicked.disconnect(self._picked)
+        except (RuntimeError, TypeError):
+            pass
+        self.view.stop_pick()
+        return cb
+
+    def cancel_pick(self) -> None:
+        cb = self._end_pick() if getattr(self, "_pick_cb", None) is not None else None
+        if cb is not None:
+            cb(None)
+
     # ---------------------------------------------------------------- actions
     def _center_at(self, x, y):
         try:
@@ -481,6 +513,7 @@ class SEMWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ close
     def closeEvent(self, ev):  # noqa: N802
+        self.cancel_pick()
         if self._own_scale:
             self.field_scale.close()
         self.timer.stop()

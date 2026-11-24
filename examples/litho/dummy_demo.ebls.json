@@ -1,0 +1,102 @@
+{
+ "format": "easyebl-schedule",
+ "version": 2,
+ "name": "dummy demo",
+ "settings": {
+  "fill_direction": "x",
+  "serpentine": false,
+  "order": "as_is",
+  "on_out_of_field": "ask"
+ },
+ "vector_settings": {},
+ "operations": [
+  {
+   "type": "column",
+   "label": "",
+   "enabled": true,
+   "preset": "",
+   "magnification": 1000,
+   "current_pa": 100.0
+  },
+  {
+   "type": "expose",
+   "label": "dummy 1",
+   "enabled": true,
+   "centre": [
+    5000.0,
+    5000.0
+   ],
+   "correct_centre": true,
+   "pattern": {
+    "kind": "dummy",
+    "size_um": 40.0
+   },
+   "dwell_us": 1.0,
+   "step_nm": 20.0,
+   "global_align": false,
+   "markers": [],
+   "local_xy": false,
+   "local_marker": [
+    0.0,
+    0.0
+   ],
+   "view_um": 10.0
+  },
+  {
+   "type": "expose",
+   "label": "dummy 2",
+   "enabled": true,
+   "centre": [
+    5100.0,
+    5000.0
+   ],
+   "correct_centre": true,
+   "pattern": {
+    "kind": "dummy",
+    "size_um": 60.0
+   },
+   "dwell_us": 0.5,
+   "step_nm": 20.0,
+   "global_align": false,
+   "markers": [],
+   "local_xy": false,
+   "local_marker": [
+    0.0,
+    0.0
+   ],
+   "view_um": 10.0
+  },
+  {
+   "type": "expose",
+   "label": "align only",
+   "enabled": true,
+   "centre": [
+    5200.0,
+    5000.0
+   ],
+   "correct_centre": true,
+   "pattern": {
+    "kind": "none"
+   },
+   "dwell_us": 1.0,
+   "step_nm": 20.0,
+   "global_align": true,
+   "markers": [
+    [
+     -45.0,
+     -45.0
+    ],
+    [
+     45.0,
+     45.0
+    ]
+   ],
+   "local_xy": false,
+   "local_marker": [
+    0.0,
+    0.0
+   ],
+   "view_um": 10.0
+  }
+ ]
+}

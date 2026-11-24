@@ -1,0 +1,215 @@
+"""The litho runner's hardware on the easyEBL backend, and the GUI-thread bridge.
+
+:class:`BackendHardware` drives the shared backend:
+
+* stage – :class:`~easyebl.microscope.stage.StageControl` (taken from hand control for a move);
+* magnification – the SEM (the field follows through the global field calibration);
+* beam condition – the microscope module's beam presets (never HV, never the beam itself);
+* marks – the SEM imaging window: the scan zooms onto the predicted mark (beam shift + scan
+  width, the column is not touched) and the user clicks the mark (pick mode);
+* exposure – :class:`~easyebl.litho.writer.LithoWriter` on its own DAQ handle (the imaging
+  engine is stopped first, so it does not scan over the resist).
+
+Interactive steps run on the GUI thread through :class:`GuiBridge`; the runner thread waits.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import threading
+
+from PySide6 import QtCore, QtWidgets
+
+from ..runner import LithoHardware
+
+__all__ = ["GuiBridge", "BackendHardware"]
+
+
+class GuiBridge(QtCore.QObject):
+    """Run ``fn(future)`` on the GUI thread (it resolves the future, now or later) and wait for it."""
+
+    _call = QtCore.Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._call.connect(self._run, QtCore.Qt.QueuedConnection)
+        self.cancelled = threading.Event()
+
+    def _run(self, item):
+        fn, fut = item
+        try:
+            fn(fut)
+        except Exception as e:  # noqa: BLE001 - handed to the waiting thread
+            if not fut.done():
+                fut.set_exception(e)
+
+    def call(self, fn, timeout: float | None = None, on_cancel=None):
+        """Blocking (not on the GUI thread).  Returns the future's result, or None when
+        :attr:`cancelled` is set while waiting (then ``on_cancel()`` runs on the GUI thread)."""
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        if QtCore.QThread.currentThread() is self.thread():
+            self._run((fn, fut))
+            return fut.result(timeout)
+        self._call.emit((fn, fut))
+        waited = 0.0
+        while True:
+            try:
+                return fut.result(0.1)
+            except concurrent.futures.TimeoutError:
+                waited += 0.1
+                if self.cancelled.is_set():
+                    if on_cancel is not None:
+                        self._call.emit((lambda f: (on_cancel(), f.set_result(None)), concurrent.futures.Future()))
+                    return None
+                if timeout is not None and waited >= timeout:
+                    raise
+
+
+class BackendHardware(LithoHardware):
+    def __init__(self, engine, manager, bundle, bridge: GuiBridge, open_sem=None, parent_widget=None,
+                 owner: str = "litho", progress=None):
+        self.engine = engine
+        self.manager = manager
+        self.bundle = bundle
+        self.bridge = bridge
+        self.open_sem = open_sem  # () -> SEMWindow
+        self.parent = parent_widget
+        self.progress = progress
+        self.handle = manager.get_handle(owner) if manager is not None else None
+        self.status = lambda text: None  # set by the window (what the run waits for)
+
+    # ---------------------------------------------------------------- stage
+    @property
+    def stage(self):
+        return self.bundle.stage if self.bundle is not None else None
+
+    def stage_position(self):
+        st = self.stage
+        if st is None:
+            return None
+        x, y = st.positions.get("X"), st.positions.get("Y")
+        return None if x is None or y is None else (float(x), float(y))
+
+    def read_stage(self):
+        st = self.stage
+        if st is None:
+            raise RuntimeError("no stage (microscope not connected)")
+        st.refresh(("X", "Y")).result(30)
+        pos = self.stage_position()
+        if pos is None:
+            raise RuntimeError("the stage position is not known")
+        return pos
+
+    def move_stage(self, x, y):
+        st = self.stage
+        if st is None:
+            raise RuntimeError("no stage (microscope not connected)")
+        if st.hand_control:
+            st.engage().result(30)
+        self.status(f"stage moving to ({x:.1f}, {y:.1f}) µm")
+        st.move({"X": x, "Y": y}).result(st.move_timeout_s + 30)
+
+    # ---------------------------------------------------------------- column
+    def field_um(self):
+        return float(self.engine.calibration.field_size_um)
+
+    def field_at_1x_um(self):
+        fs = getattr(self.bundle, "field_scale", None)
+        if fs is not None:
+            return float(fs.k_um)
+        mag = self.bundle.sem.magnification() if self.bundle is not None else None
+        return self.field_um() * float(mag or 1000.0)
+
+    def set_magnification(self, mag):
+        if self.bundle is None or not self.bundle.connected:
+            raise RuntimeError("no microscope: the magnification cannot be set")
+        m = float(mag)
+        self.bundle.sem.set_magnification(int(m) if m.is_integer() else m).result(30)  # the driver takes ints
+        fs = self.bundle.field_scale
+        if fs is not None:
+            fs.apply()
+        return self.field_um()
+
+    def preset_names(self):
+        if self.bundle is None:
+            return None
+        return [p.get("name", "") for p in self.bundle.settings.beam_presets]
+
+    def apply_preset(self, name):
+        from ...microscope.sem import PRESET_KEYS
+
+        if self.bundle is None or not self.bundle.connected:
+            raise RuntimeError("no microscope: the beam preset cannot be recalled")
+        p = next((p for p in self.bundle.settings.beam_presets if p.get("name") == name), None)
+        if p is None:
+            raise KeyError(f"no beam preset named {name!r} (Microscope → Beam presets…)")
+        self.status(f"recalling beam preset {name!r}")
+        self.bundle.sem.apply_preset({k: p[k] for k in PRESET_KEYS}).result(60)
+
+    # ---------------------------------------------------------------- interactive
+    def measure_marks(self, requests):
+        if self.open_sem is None:
+            raise RuntimeError("the SEM imaging window is not available for mark picking")
+        out = []
+        try:
+            for r in requests:
+                self.status(f"{r.label}: click the mark in the SEM window")
+
+                def show(fut, r=r):
+                    sem = self.open_sem()
+                    if sem is None:
+                        raise RuntimeError("cannot open the SEM imaging window")
+                    self._sem = sem
+                    self.engine.set_field_of_view(r.view_um, center_um=r.predicted_bcs)
+                    self.engine.run()
+                    sem.request_pick(f"{r.label} (stage {r.nominal_scs[0]:.1f}, {r.nominal_scs[1]:.1f} µm) – "
+                                     "predicted at the cross",
+                                     lambda xy: fut.done() or fut.set_result(xy), targets=[r.predicted_bcs])
+
+                def cancel():
+                    sem = getattr(self, "_sem", None)
+                    if sem is not None:
+                        sem.cancel_pick()
+
+                xy = self.bridge.call(show, on_cancel=cancel)
+                if xy is None:
+                    return None
+                out.append((float(xy[0]), float(xy[1])))
+            return out
+        finally:
+            self.bridge._call.emit((lambda f: self._after_marks(), concurrent.futures.Future()))
+
+    def _after_marks(self):
+        try:  # stop scanning over the resist; the next scan starts from the full field
+            self.engine.stop()
+            self.engine.full_field()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def ask(self, text):
+        def show(fut):
+            r = QtWidgets.QMessageBox.question(self.parent, "Lithography", text)
+            fut.set_result(r == QtWidgets.QMessageBox.Yes)
+
+        return bool(self.bridge.call(show))
+
+    # ---------------------------------------------------------------- exposure
+    def expose(self, pattern, params, transform, settings):
+        from ..writer import LithoWriter
+
+        self.engine.stop()
+        self.engine.wait_idle(5.0)
+        self.status(f"exposing {len(pattern)} element(s)")
+        w = LithoWriter(self.handle, self.engine.calibration, settings)
+        return w.expose(pattern, params, transform, progress=self.progress)
+
+    def abort(self):
+        self.bridge.cancelled.set()
+        if self.handle is not None:
+            self.handle.abort()
+
+    def close(self):
+        if self.handle is not None:
+            try:
+                self.handle.close()
+            except Exception:  # noqa: BLE001
+                pass

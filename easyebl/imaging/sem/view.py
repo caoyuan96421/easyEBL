@@ -6,6 +6,9 @@ Mouse:
 * wheel – zoom: the swept range narrows / widens (the column magnification is not touched)
 * Measure mode (:attr:`SEMImageView.measure_mode`): drag draws a line instead; its length is shown on
   the image.  The line is kept in field µm, so it stays on the feature while the scan pans or zooms.
+* Pick mode (:meth:`SEMImageView.start_pick`): a click emits :attr:`SEMImageView.pointPicked` with the
+  field position (µm); the prompt is shown on top of the image and the targets (e.g. a predicted
+  mark position) as crosses.  Used by the lithography alignment.
 
 The data bar shows the image magnification (column magnification × full field / scan
 width); the inset in the lower-left corner shows the scanned region within the full field.
@@ -163,6 +166,7 @@ class SEMImageView(QtWidgets.QWidget):
     zoomSteps = QtCore.Signal(int)  # wheel notches: + zoom in, − zoom out (the scan range, not the column)
     pointerMoved = QtCore.Signal(object)  # (x_um, y_um) or None
     measureChanged = QtCore.Signal(object)  # the measuring line ((x0, y0), (x1, y1)) in field µm, or None
+    pointPicked = QtCore.Signal(float, float)  # pick mode: the clicked field position (µm)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -182,6 +186,8 @@ class SEMImageView(QtWidgets.QWidget):
         self._drawing = False
         self._drag = None
         self._paint_ms = 0.0
+        self._pick_prompt: str | None = None  # pick mode on when not None
+        self._pick_targets: list = []  # crosses (field µm)
 
     # ---------------------------------------------------------------- data
     def set_frame(self, frame, levels) -> None:
@@ -239,6 +245,25 @@ class SEMImageView(QtWidgets.QWidget):
         """All field µm changed by *r* (a new field calibration): keep the line on the same feature."""
         if self._line is not None:
             self.set_measure_line(*[(x * r, y * r) for x, y in self._line])
+
+    # ---------------------------------------------------------------- pick
+    @property
+    def pick_mode(self) -> bool:
+        return self._pick_prompt is not None
+
+    def start_pick(self, prompt: str, targets=()) -> None:
+        """Pick mode: the next left click emits :attr:`pointPicked` (beam shift by drag is off)."""
+        self._pick_prompt = str(prompt)
+        self._pick_targets = [tuple(map(float, t)) for t in targets]
+        self.setCursor(QtCore.Qt.CrossCursor)
+        self.update()
+
+    def stop_pick(self) -> None:
+        self._pick_prompt = None
+        self._pick_targets = []
+        if not self._measure_mode:
+            self.unsetCursor()
+        self.update()
 
     def _widget_point(self, x: float, y: float) -> QtCore.QPointF:
         cfg, r = self._frame.config, self.image_rect()
@@ -301,9 +326,29 @@ class SEMImageView(QtWidgets.QWidget):
             field, scan = self.info.get("field_um"), self.info.get("scan")
             if self.show_fov_inset and field and scan is not None:
                 _draw_fov_inset(p, r, float(field), scan)
+            if self._pick_targets and f is not None:
+                p.save()
+                p.setClipRect(r)
+                for t in self._pick_targets:
+                    c = self._widget_point(*t)
+                    for pen in (QtGui.QPen(QtGui.QColor(0, 0, 0, 170), 4), QtGui.QPen(QtGui.QColor(255, 80, 200), 2)):
+                        p.setPen(pen)
+                        p.drawLine(QtCore.QPointF(c.x() - 14, c.y()), QtCore.QPointF(c.x() - 4, c.y()))
+                        p.drawLine(QtCore.QPointF(c.x() + 4, c.y()), QtCore.QPointF(c.x() + 14, c.y()))
+                        p.drawLine(QtCore.QPointF(c.x(), c.y() - 14), QtCore.QPointF(c.x(), c.y() - 4))
+                        p.drawLine(QtCore.QPointF(c.x(), c.y() + 4), QtCore.QPointF(c.x(), c.y() + 14))
+                p.restore()
         else:
             p.setPen(QtGui.QColor(120, 120, 120))
             p.drawText(self.rect().adjusted(0, 0, 0, -BAR_H), QtCore.Qt.AlignCenter, "No image – press Run")
+        if self._pick_prompt is not None:
+            font = QtGui.QFont("Segoe UI", 11, QtGui.QFont.Bold)
+            p.setFont(font)
+            box = QtCore.QRectF(8, 8, self.width() - 16, QtGui.QFontMetrics(font).height() * 2 + 12)
+            p.fillRect(box, QtGui.QColor(120, 20, 90, 215))
+            p.setPen(QtGui.QColor(255, 255, 255))
+            p.drawText(box.adjusted(8, 4, -8, -4), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter | QtCore.Qt.TextWordWrap,
+                       self._pick_prompt)
         info = dict(self.info)
         info["image_width_px"] = r.width()
         bar = QtCore.QRectF(0, self.height() - BAR_H, self.width(), BAR_H)
@@ -317,11 +362,16 @@ class SEMImageView(QtWidgets.QWidget):
     # --------------------------------------------------------------- mouse
     def mouseDoubleClickEvent(self, ev):  # noqa: N802
         px = self._to_pixel(ev.position())
-        if px is not None and self._frame is not None and not self._measure_mode:
+        if px is not None and self._frame is not None and not self._measure_mode and not self.pick_mode:
             self.centerRequested.emit(*_pixel_to_field(self._frame.config, *px))
 
     def mousePressEvent(self, ev):  # noqa: N802
         if ev.button() != QtCore.Qt.LeftButton or self._frame is None:
+            return
+        if self._pick_prompt is not None:
+            px = self._to_pixel(ev.position())
+            if px is not None:
+                self.pointPicked.emit(*_pixel_to_field(self._frame.config, *px))
             return
         if self._measure_mode:
             px = self._to_pixel(ev.position())

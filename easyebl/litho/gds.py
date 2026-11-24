@@ -24,7 +24,7 @@ import numpy as np
 
 from .geometry import Pattern, Polygon, Polyline
 
-__all__ = ["GDSDoseMapping", "read_gds", "write_gds", "gds_info", "parse_dose_value", "GDSError"]
+__all__ = ["GDSDoseMapping", "read_gds", "load_library", "pattern_from_cell", "write_gds", "gds_info", "parse_dose_value", "GDSError"]
 
 _NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
@@ -134,9 +134,7 @@ def read_gds(
     ``layers``: iterable of layer numbers or (layer, datatype) tuples to keep.
     ``stats``: optional dict filled with counts per dose source.
     """
-    gdstk = _gdstk()
-    dose = dose or GDSDoseMapping()
-    lib = gdstk.read_gds(str(path), unit=1e-6)
+    lib = load_library(path)
     if cell is None:
         tops = lib.top_level()
         if len(tops) != 1:
@@ -147,6 +145,24 @@ def read_gds(
         if not found:
             raise GDSError(f"cell '{cell}' not found")
         src = found[0]
+    pat = pattern_from_cell(src, layers, dose, stats)
+    pat.source = str(path)
+    return pat
+
+
+def load_library(path: str):
+    """The gdstk library of a file (µm units) – read once, then :func:`pattern_from_cell` per cell."""
+    return _gdstk().read_gds(str(path), unit=1e-6)
+
+
+def pattern_from_cell(
+    src,
+    layers: Iterable | None = None,
+    dose: GDSDoseMapping | None = None,
+    stats: dict | None = None,
+) -> Pattern:
+    """Flatten a gdstk cell (of a library read in µm) into a :class:`Pattern`; *src* is not modified."""
+    dose = dose or GDSDoseMapping()
     flat = src.copy(f"{src.name}__flat", deep_copy=True)
     flat.flatten()
     layers = list(layers) if layers is not None else None
@@ -185,7 +201,7 @@ def read_gds(
                     continue
     if stats is not None:
         stats.update(counts)
-    return Pattern(els, name=src.name, source=str(path))
+    return Pattern(els, name=src.name)
 
 
 def write_gds(

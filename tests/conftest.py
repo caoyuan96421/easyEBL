@@ -64,3 +64,9 @@ def _microscope_settings_in_tmp(tmp_path, monkeypatch):
 def _system_config_in_tmp(tmp_path, monkeypatch):
     """The easyEBL hardware configuration never touches the user's file during tests."""
     monkeypatch.setenv("EASYEBL_SYSTEM_CONFIG", str(tmp_path / "system.json"))
+
+
+@pytest.fixture(autouse=True)
+def _litho_settings_in_tmp(tmp_path, monkeypatch):
+    """Lithography settings (stage positions, SCS–WCS) never touch the user's file during tests."""
+    monkeypatch.setenv("EASYEBL_LITHO_SETTINGS", str(tmp_path / "litho.json"))
