@@ -89,7 +89,7 @@ class SimulatedInstrument:
             "BEAM F": "50",
             "BEAM2 C": "50",
             "BEAM2 F": "50",
-            "FOCUS C": "8192",
+            "FOCUS C": "10670",  # WD 15 (see focus_wd)
             "FOCUS F": "2048",
             "MAG": "100",
             "STG X": "2048",
@@ -212,6 +212,10 @@ class SimulatedInstrument:
                 return "G0", (s["HV_SET"] if s["HV_ON"] else "OFF")
             if key in ("ROTATION", "DYNF", "TILTC"):
                 return "G0", (s[key + "_SET"] if s[key] == "ON" else "OFF")
+            if key == "WD":  # like the S-3000: the focus read through the WD table, whole mm
+                from .focus_wd import wd_from_focus
+
+                return "G0", str(int(round(wd_from_focus(int(s["FOCUS C"]), int(s["FOCUS F"])))))
             return "G0", s[key]
 
         def num(v: str, lo: int, hi: int) -> bool:
@@ -264,7 +268,12 @@ class SimulatedInstrument:
         if head in ("BEAM", "BEAM2") and n == 2 and args[0] in ("C", "F"):
             return setv(f"{head} {args[0]}", args[1], 0, 99), None
         if head == "FOCUS" and n == 2 and args[0] in ("C", "F"):
-            return setv(f"FOCUS {args[0]}", args[1], 0, 16383 if args[0] == "C" else 4095), None
+            r = setv(f"FOCUS {args[0]}", args[1], 0, 16383 if args[0] == "C" else 4095)
+            if r == "G0" and args[0] == "C":
+                from .focus_wd import COARSE_MIN
+
+                s["FOCUS C"] = str(max(int(s["FOCUS C"]), COARSE_MIN))  # the S-3000 holds it there
+            return r, None
         if head == "STG" and n == 2 and args[0] in ("X", "Y"):
             return setv(f"STG {args[0]}", args[1], 0, 4095), None
         if head == "MAG" and n == 1:
@@ -315,8 +324,16 @@ class SimulatedInstrument:
             s["VAC"] = args[0]
             return "G0", None
         if head == "WD" and n == 1:
-            return setv("WD", args[0], 3, 60), None
+            r = setv("WD", args[0], 3, 60)
+            if r == "G0":  # like the S-3000: WD n sets the coarse focus and centres the fine focus
+                from .focus_wd import WD_TABLE
+
+                c, f = WD_TABLE.get(int(args[0]), (16383, 4095))
+                s["FOCUS C"], s["FOCUS F"] = str(c), str(f)
+            return r, None
         if head == "#STAGE" and args in (["ON"], ["OFF"]):
+            if args[0] == "OFF" and s["STAGE"] == "OFF":
+                return "E6", None  # like the S-3000: #STAGE OFF while already off
             s["STAGE"] = args[0]
             return "G0", None
         if head == "LINEP" and n == 1:

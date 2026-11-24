@@ -37,6 +37,7 @@ import time
 
 from .link import READ, STAGE_CMD, MicroscopeLink
 from .s3000 import Axis, MotionError, MotionState, StageRejectedBySem, axis_unit, from_pulses, to_pulses
+from .s3000.errors import CommandFailed
 from .s3000.stage import AxisEvent
 
 __all__ = ["StageControl", "AXES", "POLL_LEVELS"]
@@ -158,7 +159,14 @@ class StageControl:
                 self._stage_off(session)
 
     def _stage_off(self, session) -> None:
-        session.sem.stage_control(False)
+        was_on = self._stage_on
+        try:
+            session.sem.stage_control(False)
+        except CommandFailed as e:
+            # the S-3000 answers ``#STAGE OFF`` with E6 when the relay is already off (e.g. the
+            # hand-back when the window opens, before anything switched it on): nothing to do
+            if was_on or getattr(e.reply, "result", None) != "E6":
+                raise
         self._stage_on = False
 
     # ------------------------------------------------------------------ hand control

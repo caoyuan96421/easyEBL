@@ -49,11 +49,11 @@ def test_microscope_window(qtbot, bundle):
     qtbot.waitUntil(lambda: bundle.sem.state.get("hv_setpoint_kv") == 12.5, timeout=3000)
     # readbacks changed elsewhere (the SEM panel) appear without sending anything back
     n_sent = len(bundle.link.session.simulator.received)
-    bundle.link.session.simulator.sem["WD"] = "22"
-    bundle.sem.refresh(("WD",)).result(5)
-    qtbot.waitUntil(lambda: w.wd.value() == 22, timeout=2000)
+    bundle.link.session.simulator.sem["FOCUS C"] = "9262"  # focused at WD 22 on the SEM panel
+    bundle.sem.refresh(("FOCUS C",)).result(5)
+    qtbot.waitUntil(lambda: w.focus_c.value() == 9262 and w.l_wd.text().startswith("22.0"), timeout=2000)
     time.sleep(0.3)
-    assert len(bundle.link.session.simulator.received) == n_sent + 1  # only the R WD read
+    assert len(bundle.link.session.simulator.received) == n_sent + 1  # only the R FOCUS C read
     # stage: the SEM PC has it (#STAGE OFF) until enabled
     sim = bundle.link.session.simulator
     assert sim.sem["STAGE"] == "OFF" and bundle.stage.hand_control and not w.g_jog.isEnabled()
@@ -125,7 +125,7 @@ def test_sem_window_with_microscope(qtbot, bundle, tmp_path):
     w.show()
     try:
         # data bar and column panel show the microscope readbacks
-        qtbot.waitUntil(lambda: w.view.info.get("kv") == "20 kV" and w.view.info.get("wd") == "WD 15 mm",
+        qtbot.waitUntil(lambda: w.view.info.get("kv") == "20 kV" and w.view.info.get("wd") == "WD 15.00 mm",
                         timeout=3000)
         assert "×1k" in w.column.l_mag.text() or "×1000" in w.column.l_mag.text()
         # the mouse wheel zooms the swept range only: the column magnification stays

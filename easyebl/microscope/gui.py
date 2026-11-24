@@ -195,7 +195,9 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         g = QtWidgets.QGroupBox("Focus && working distance")
         f = QtWidgets.QGridLayout(g)
         self.wd = _spin(3, 60, 15, 1, " mm")
-        self.wd.setToolTip("WD the column computes for (WD n, 3–60 mm)")
+        self.wd.setToolTip("WD n (3–60 mm): the SEM sets the coarse focus for it and centres the fine focus")
+        self.l_wd = QtWidgets.QLabel("—")
+        self.l_wd.setToolTip("working distance computed from the coarse and fine focus (the SEM reports whole mm)")
         self.wd.valueChanged.connect(lambda v: self._user(sem.set_working_distance, v))
         self.focus_c = _spin(0, 16383, 8192, sem.coarse_focus_step)
         self.focus_c.valueChanged.connect(lambda v: self._user(sem.set_focus, "C", v))
@@ -203,6 +205,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.focus_f.valueChanged.connect(lambda v: self._user(sem.set_focus, "F", v))
         f.addWidget(QtWidgets.QLabel("Working distance"), 0, 0)
         f.addWidget(self.wd, 0, 1)
+        f.addWidget(self.l_wd, 0, 2)
         f.addWidget(QtWidgets.QLabel("Focus coarse"), 1, 0)
         f.addWidget(self.focus_c, 1, 1)
         f.addWidget(QtWidgets.QLabel("Focus fine"), 2, 0)
@@ -567,7 +570,9 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             self.l_mag.setText(_fmt_mag(s.get("mag")))
             if s.get("mag") in MAGNIFICATIONS and not self.mag_combo.view().isVisible():
                 self.mag_combo.setCurrentIndex(MAGNIFICATIONS.index(s["mag"]))
-            for box, key in ((self.wd, "wd_mm"), (self.focus_c, "focus_coarse"), (self.focus_f, "focus_fine"),
+            wd = s.get("wd_mm")
+            self.l_wd.setText(f"{wd:.3f} mm" if isinstance(wd, float) else "—")
+            for box, key in ((self.wd, "wd_readback_mm"), (self.focus_c, "focus_coarse"), (self.focus_f, "focus_fine"),
                              (self.stig_x, "stig_x"), (self.stig_y, "stig_y"), (self.beam_c, "beam_coarse"),
                              (self.beam_f, "beam_fine"), (self.cont, "contrast"), (self.brt, "brightness")):
                 v = s.get(key)

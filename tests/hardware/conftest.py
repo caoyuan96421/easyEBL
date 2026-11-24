@@ -98,7 +98,7 @@ def dp5():
 
 # ====================================================================== microscope
 #: settings the tests may change -> how to restore them
-_RESTORE = ("mag", "wd_mm", "focus_coarse", "focus_fine", "stig_x", "stig_y", "beam_coarse", "beam_fine",
+_RESTORE = ("mag", "wd_readback_mm", "focus_coarse", "focus_fine", "stig_x", "stig_y", "beam_coarse", "beam_fine",
             "contrast", "brightness", "running", "detector")
 
 
@@ -112,7 +112,7 @@ def _restore(sem, original: dict) -> list[str]:
             continue
         if key == "mag":
             futs.append(sem.set_magnification(v))
-        elif key == "wd_mm":
+        elif key == "wd_readback_mm":  # sets the focus: the focus values are restored after it
             futs.append(sem.set_working_distance(v))
         elif key in ("focus_coarse", "focus_fine"):
             futs.append(sem.set_focus("C" if key == "focus_coarse" else "F", v))

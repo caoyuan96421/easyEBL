@@ -476,4 +476,4 @@ class ColumnPanel(QtWidgets.QGroupBox):
         mag = self.mic.magnification()
         self.l_mag.setText(f"×{mag:g}" if mag else "×—")
         wd = self.mic.working_distance_mm()
-        self.l_wd.setText(f"WD {wd:g} mm" if wd else "WD —")
+        self.l_wd.setText(f"WD {wd:.2f} mm" if wd else "WD —")

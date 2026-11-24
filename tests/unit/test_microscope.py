@@ -39,7 +39,7 @@ def _block(link, seconds, priority=POLL):
 def test_readbacks_and_settings(mic):
     link, sem, stage = mic
     assert sem.magnification() == 1000 and sem.accelerating_voltage_kv() == 20.0
-    assert sem.working_distance_mm() == 15 and sem.connected
+    assert sem.working_distance_mm() == pytest.approx(15, abs=0.01) and sem.connected
     sem.set_magnification("2.5k").result(10)
     assert sem.magnification() == 2500 and link.session.simulator.sem["MAG"] == "2.5k"
     sem.set_hv(15).result(10)
@@ -57,6 +57,52 @@ def test_readbacks_and_settings(mic):
         sem.set_beam("C", 100)
     snap = sem.snapshot()
     assert snap["mag"] == 2500 and "hv_setpoint_kv" in snap
+
+
+def test_wd_from_focus_table():
+    """WD is the objective focus read through the S-3000's table (measured 2026-11-23)."""
+    from easyebl.microscope.s3000.focus_wd import (FINE_WEIGHT, WD_TABLE, effective_focus, focus_for_wd,
+                                                   wd_from_focus)
+
+    for wd, (c, f) in WD_TABLE.items():  # WD n -> its own table focus
+        assert wd_from_focus(c, f) == pytest.approx(wd, abs=1e-6)
+    # the SEM's readback steps (bisected on the instrument, fine 2048) fall at n + 0.5
+    for c_step, n in ((15654, 4), (12100, 10), (10543, 15), (9509, 20), (8194, 30), (7375, 40), (6424, 59)):
+        assert wd_from_focus(c_step + 0.5, 2048) == pytest.approx(n + 0.5, abs=0.01)
+    # fine focus: 1 count = FINE_WEIGHT coarse counts; the 15 -> 16 step moves with it
+    assert effective_focus(10000, 2048 + 100) == pytest.approx(10000 + 100 * FINE_WEIGHT)
+    assert wd_from_focus(10711, 0) == pytest.approx(15.5, abs=0.01)
+    assert wd_from_focus(10377, 4095) == pytest.approx(15.5, abs=0.01)
+    # monotone, held to the SEM's 3-60 mm, and invertible
+    w = [wd_from_focus(c, 2048) for c in range(5174, 16384, 97)]
+    assert all(b <= a for a, b in zip(w, w[1:])) and min(w) >= 3 and max(w) <= 60
+    for wd in (4.0, 7.3, 11.137, 15.0, 33.3, 59.9):
+        c, f = focus_for_wd(wd)
+        assert 0 <= f <= 4095 and wd_from_focus(c, f) == pytest.approx(wd, abs=0.002)
+
+
+def test_sem_computes_wd_from_the_focus(mic):
+    link, sem, stage = mic
+    sim = link.session.simulator
+    sem.set_working_distance(22).result(10)  # the SEM sets the table focus for WD 22
+    assert sim.sem["FOCUS C"] == "9262" and sem.state["focus_coarse"] == 9262
+    assert sem.working_distance_mm() == pytest.approx(22, abs=0.01) and sem.state["wd_readback_mm"] == 22
+    sem.set_focus("F", 2048 + 1000).result(10)  # fine focus: a fraction of a mm
+    wd = sem.working_distance_mm()
+    assert 21.4 < wd < 21.6
+    sem.set_focus("C", 100).result(10)  # the SEM holds the coarse focus at its minimum
+    assert sem.state["focus_coarse"] == 5174 and sem.working_distance_mm() == 60.0
+    # the whole-mm readback is a cross-check only: a disagreement is reported once
+    sub = link.events.subscribe()
+    sem.set_focus("C", 9262).result(10)
+    sim.sem["FOCUS C"] = "9598"  # (the SEM's own WD readback now says 20) ...
+    sem.refresh(("WD",)).result(10)  # ... while the focus last read says 21.5
+    notes = [e.message for e in sub.drain() if e.kind == "info"]
+    assert any("differs from the SEM's WD readback (20 mm)" in m for m in notes)
+    sem.refresh(("WD",)).result(10)
+    assert not [e for e in sub.drain() if e.kind == "info"]  # not repeated
+    sub.close()
+    assert "SEM WD" not in {t.name for t in link.poller.tasks()}  # WD is not polled
 
 
 def test_sem_settings_go_before_polling(mic):
@@ -108,10 +154,10 @@ def test_poller_schedule_on_the_simulator(monkeypatch):
         stage = StageControl(link)
         poller = link.poller
         names = {t.name for t in poller.tasks()}
-        assert {f"SEM {i}" for i in ("MAG", "HV", "WD", "STG X")} <= names
+        assert {f"SEM {i}" for i in ("MAG", "HV", "FOCUS C", "STG X")} <= names and "SEM WD" not in names
         assert {"stage X/Y", "stage Z/T", "stage R"} <= names
         lv = {x.name: x.level for x in poller.tasks()}
-        assert lv["SEM MAG"] == lv["SEM HV"] == 1 and lv["SEM FOCUS F"] == lv["SEM STG X"] == lv["SEM WD"] == 2
+        assert lv["SEM MAG"] == lv["SEM HV"] == 1 and lv["SEM FOCUS F"] == lv["SEM STG X"] == lv["SEM BEAM C"] == 2
         assert lv["stage X/Y"] == lv["stage Z/T"] == 3 and lv["stage R"] == lv["SEM CONT"] == 4
         t0 = time.monotonic()
         while (any(t.reads < 2 for t in poller.tasks()) and time.monotonic() - t0 < 60):
@@ -223,6 +269,9 @@ def test_stage_starts_under_hand_control():
         assert link.session.simulator.sem["STAGE"] == "OFF" and stage.positions["X"] is not None
         with pytest.raises(RuntimeError):
             stage.move({"X": 1.0}, relative=True)
+        # handing back a stage that is already off: the SEM answers E6, which is not an error
+        assert stage.release().result(10) is True
+        assert link.session.simulator.sem["STAGE"] == "OFF"
     finally:
         link.close()
 

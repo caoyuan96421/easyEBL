@@ -337,7 +337,7 @@ class SEMWindow(QtWidgets.QMainWindow):
         kv, wd = self.mic.accelerating_voltage_kv(), self.mic.working_distance_mm()
         info = self.view.info
         new_kv = f"{kv:g} kV" if kv else "-- kV"
-        new_wd = f"WD {wd:g} mm" if wd else "WD --"
+        new_wd = f"WD {wd:.2f} mm" if wd else "WD --"
         if info.get("kv") != new_kv or info.get("wd") != new_wd:
             info["kv"], info["wd"] = new_kv, new_wd
             self.view.update()

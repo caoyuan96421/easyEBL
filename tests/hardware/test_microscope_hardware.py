@@ -32,9 +32,11 @@ def test_every_readback_parses(microscope):
     link, sem, stage = microscope
     got = sem.refresh().result(30)
     assert link.state == "connected"
-    for key in ("mag", "wd_mm", "focus_coarse", "focus_fine", "stig_x", "stig_y", "beam_coarse", "beam_fine",
+    for key in ("mag", "wd_readback_mm", "focus_coarse", "focus_fine", "stig_x", "stig_y", "beam_coarse", "beam_fine",
                 "contrast", "brightness"):
         assert isinstance(got.get(key), int), (key, got.get(key))
+    # the working distance computed from the focus agrees with the SEM's whole-mm readback
+    assert sem.working_distance_mm() == pytest.approx(got["wd_readback_mm"], abs=0.75)
     assert got["mag"] in MAGNIFICATIONS
     assert isinstance(got.get("hv_on"), bool) and isinstance(got.get("running"), bool)
     assert len(ALL_ITEMS) == len({i for i in ALL_ITEMS})
@@ -99,14 +101,15 @@ def test_repeated_magnification_steps_coalesce(microscope):
 
 def test_working_distance_and_restore(microscope):
     link, sem, stage = microscope
-    wd0 = sem.refresh(("WD",)).result(10)["wd_mm"]
+    wd0 = sem.refresh(("WD",)).result(10)["wd_readback_mm"]
     new = wd0 + 1 if wd0 < 60 else wd0 - 1
     try:
         sem.set_working_distance(new).result(10)
-        assert sem.refresh(("WD",)).result(10)["wd_mm"] == new
+        assert sem.refresh(("WD",)).result(10)["wd_readback_mm"] == new
+        assert sem.working_distance_mm() == pytest.approx(new, abs=0.05)  # WD n -> the table focus
     finally:
         sem.set_working_distance(wd0).result(10)
-    assert sem.refresh(("WD",)).result(10)["wd_mm"] == wd0
+    assert sem.refresh(("WD",)).result(10)["wd_readback_mm"] == wd0
 
 
 def test_freeze_and_run(microscope):
