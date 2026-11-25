@@ -82,6 +82,9 @@ class SEMWindow(QtWidgets.QMainWindow):
         # a MicroscopeBundle (easyebl.microscope.bundle) gives the stage, the microscope window and the
         # magnification ↔ field coupling; a bare MicroscopeControl only the column
         self.bundle = microscope_bundle
+        #: stage axes against the image (Hardware → Configure… → Microscope): moving the stage to +X
+        #: moves the image of the sample to +x when mirrored (S-3000: X yes, Y no) – for Center with stage
+        self.stage_mirror = (True, False)
         self.mic = microscope or (microscope_bundle.sem if microscope_bundle is not None else StubMicroscope())
         # the global field calibration (field = K / magnification): the bundle's, else one of our own
         self.field_scale = getattr(microscope_bundle, "field_scale", None)
@@ -155,6 +158,7 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.view.centerRequested.connect(self._center_at)
         self.view.shiftDragged.connect(self._drag_shift)
         self.view.zoomSteps.connect(self.fov.zoom)  # the swept range – never the column magnification
+        self.view.contextRequested.connect(self._context_menu)
         self.view.pointerMoved.connect(self._pointer)
         self.view.measureChanged.connect(self._measure_changed)
 
@@ -178,12 +182,6 @@ class SEMWindow(QtWidgets.QMainWindow):
         a = tb.addAction("Crosshair")
         a.setCheckable(True)
         a.toggled.connect(lambda on: (setattr(self.view, "show_crosshair", on), self.view.update()))
-        self.a_measure = a = tb.addAction("Measure")
-        a.setCheckable(True)
-        a.setShortcut(QtGui.QKeySequence("M"))
-        a.setToolTip("drag on the image to measure a distance (M); the line can calibrate the field "
-                     "(Advanced… → Calibration)")
-        a.toggled.connect(self._measure_mode)
         a = tb.addAction("Scan line")
         a.setCheckable(True)
         a.setChecked(True)
@@ -361,10 +359,6 @@ class SEMWindow(QtWidgets.QMainWindow):
             info.update(new)
             self.view.update()
 
-    def _measure_mode(self, on: bool):
-        self.view.measure_mode = on
-        self.notify("Measure: drag on the image to draw a line" if on else "Measure off")
-
     def _measure_changed(self, line):
         if line is None:
             self.l_meas.setText("")
@@ -504,6 +498,56 @@ class SEMWindow(QtWidgets.QMainWindow):
         cb = self._end_pick() if getattr(self, "_pick_cb", None) is not None else None
         if cb is not None:
             cb(None)
+
+    # ---------------------------------------------------------------- context menu
+    def _stage(self):
+        b = self.bundle
+        st = getattr(b, "stage", None) if b is not None else None
+        return st if st is not None and getattr(b, "connected", False) else None
+
+    def _context_menu(self, xy, global_pos) -> None:
+        m = QtWidgets.QMenu(self)
+        a = m.addAction("Center with beam")
+        a.setEnabled(xy is not None)
+        a.triggered.connect(lambda: self._center_at(*xy))
+        a = m.addAction("Center with stage")
+        a.setEnabled(xy is not None and self._stage() is not None)
+        a.setToolTip("move the stage so the clicked point comes to the image centre")
+        a.triggered.connect(lambda: self.center_with_stage(*xy))
+        m.addSeparator()
+        a = m.addAction("Clear measurement")
+        a.setEnabled(self.view.measure_line() is not None)
+        a.triggered.connect(self.view.clear_measure)
+        m.addAction("Reset to Full FoV").triggered.connect(self.reset_full_fov)
+        self._last_menu = m
+        m.popup(global_pos)
+
+    def stage_move_for(self, x: float, y: float) -> tuple:
+        """The relative stage move (µm) that brings the field point (x, y) to the image centre: the
+        sample moves by −M·d in the field (M: the stage mirror, stage and scan axes parallel)."""
+        cx, cy = self.engine.config.center_um
+        mx = -1.0 if self.stage_mirror[0] else 1.0
+        my = -1.0 if self.stage_mirror[1] else 1.0
+        return (mx * (x - cx), my * (y - cy))
+
+    def center_with_stage(self, x: float, y: float) -> None:
+        st = self._stage()
+        if st is None:
+            self.notify("no stage (microscope not connected)")
+            return
+        dx, dy = self.stage_move_for(x, y)
+        from ...microscope.movewait import run_blocking_move
+
+        try:
+            run_blocking_move(st, {"X": dx, "Y": dy}, relative=True, parent=self)
+            self.notify(f"stage moved by ({dx:+.2f}, {dy:+.2f}) µm")
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"stage: {type(e).__name__}: {e}")
+
+    def reset_full_fov(self) -> None:
+        """The whole field of view (beam scan) and no digital zoom."""
+        self.view.reset_digital_zoom()
+        self.fov._do(self.engine.full_field)
 
     # ---------------------------------------------------------------- actions
     def _center_at(self, x, y):

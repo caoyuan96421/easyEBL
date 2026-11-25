@@ -13,18 +13,6 @@ from PySide6 import QtCore, QtWidgets
 
 __all__ = ["BeamCalWindow"]
 
-_MAX_SHOWN = 1024  # the image is shown binned down to this many pixels across
-
-
-def _binned(img: np.ndarray, n: int = _MAX_SHOWN) -> np.ndarray:
-    a = np.asarray(img, np.float32)
-    f = int(np.ceil(max(a.shape) / n))
-    if f <= 1:
-        return a
-    h, w = (a.shape[0] // f) * f, (a.shape[1] // f) * f
-    return a[:h, :w].reshape(h // f, f, w // f, f).mean(axis=(1, 3))
-
-
 class BeamCalWindow(QtWidgets.QDialog):
     """``decided(bool)`` when the user accepts (True) or discards (False) a result;
     ``abortRequested`` from the Abort button."""
@@ -50,9 +38,12 @@ class BeamCalWindow(QtWidgets.QDialog):
         self._vb = self.image.addViewBox()
         self._vb.setAspectLocked(True)
         self._vb.invertY(True)
-        self._img = pg.ImageItem(axisOrder="row-major")
+        # the full image (e.g. 5000 x 5000): drawn downsampled to the screen, every pixel when zoomed in
+        self._img = pg.ImageItem(axisOrder="row-major", autoDownsample=True)
         self._vb.addItem(self._img)
         self.image.setMinimumSize(320, 320)
+        self.image_hint = QtWidgets.QLabel("wheel: zoom · drag: pan · right click: View All")
+        self.image_hint.setStyleSheet("color:#9aa")
 
         self.numbers = QtWidgets.QLabel()
         self.numbers.setTextFormat(QtCore.Qt.RichText)
@@ -98,7 +89,10 @@ class BeamCalWindow(QtWidgets.QDialog):
             bb.addWidget(b)
 
         top = QtWidgets.QHBoxLayout()
-        top.addWidget(self.image, 1)
+        il = QtWidgets.QVBoxLayout()
+        il.addWidget(self.image, 1)
+        il.addWidget(self.image_hint)
+        top.addLayout(il, 1)
         top.addWidget(self.results, 1)
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(self.header)
@@ -133,7 +127,9 @@ class BeamCalWindow(QtWidgets.QDialog):
         self._buttons("running")
 
     def set_image(self, image, pixel_um) -> None:
-        self._img.setImage(_binned(image), autoLevels=True)
+        img = np.asarray(image, np.float32)
+        lo, hi = np.percentile(img[:: max(1, img.shape[0] // 512), :: max(1, img.shape[1] // 512)], (0.5, 99.5))
+        self._img.setImage(img, levels=(float(lo), float(hi)))
         self._vb.autoRange(padding=0)
         self.step.setText("fitting the grid…")
 

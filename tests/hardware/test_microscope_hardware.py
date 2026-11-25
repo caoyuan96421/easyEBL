@@ -208,3 +208,36 @@ def test_stop_halts_a_move(microscope):
         stage.acknowledge()
         stage.move({"X": x0}).result(60)
     assert _read(stage, ["X"])["X"] == pytest.approx(x0, abs=1.0)
+
+
+@pytest.mark.skipif(NO_STAGE, reason="stage moves switched off (EASYEBL_HW_NO_STAGE)")
+def test_a_move_is_exclusive_and_hands_the_stage_back(microscope):
+    """#STAGE ON … S2 … #STAGE OFF around the move; a SEM read sent meanwhile waits for it;
+    a second move is refused."""
+    from easyebl.microscope import StageBusy
+
+    link, sem, stage = microscope
+    x0 = _read(stage, ["X"])["X"]
+    n0 = len(link.log_entries())
+    m = stage.move({"X": 300.0}, relative=True)
+    try:
+        t0 = time.monotonic()
+        while not stage.busy and time.monotonic() - t0 < 5:
+            time.sleep(0.02)
+        with pytest.raises(StageBusy):
+            stage.move({"Y": 10.0}, relative=True)
+        r = sem.refresh(("MAG",))
+        m.result(90)
+        t_move = time.monotonic()
+        r.result(30)
+        assert not stage.busy and link.exclusive is None and link.state == "connected"
+        tx = [e.format() for e in link.log_entries()[n0:]]
+        text = "\n".join(tx)
+        i_on, i_s2, i_off = text.find("#STAGE ON"), text.find("S2"), text.rfind("#STAGE OFF")
+        assert -1 < i_on < i_s2 < i_off, text[-2000:]
+        assert text.rfind("R MAG") > i_off  # the SEM read went out after the move
+        assert time.monotonic() - t_move < 30
+    finally:
+        stage.acknowledge()
+        stage.move({"X": x0}).result(90)
+    assert _read(stage, ["X"])["X"] == pytest.approx(x0, abs=1.0)

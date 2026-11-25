@@ -35,6 +35,10 @@ class _AxisSim:
     end_time: float = 0.0
     direction: str = "+"
     timer: threading.Timer | None = None
+    #: after the completion report: read-back closes in from settle_from to position until settle_end
+    settle_from: int = 0
+    settle_start: float = 0.0
+    settle_end: float = 0.0
 
 
 @dataclass
@@ -53,6 +57,12 @@ class SimOptions:
     e0_after_queries: frozenset = frozenset({"R0", "R4"})
     #: R3 separator between fields ("" observed, or " ").
     r3_separator: str = ""
+    #: X / Y (controller 0) report completion this many pulses short of the target, then the
+    #: encoder loop closes in over settle_time_s (observed on the S-3000: seconds after "stopped").
+    settle_error_pulses: int = 0
+    settle_time_s: float = 0.0
+    #: {(controller, motor): pulses} – a lasting error at the end of every move (lost steps), for tests
+    final_error_pulses: dict = field(default_factory=dict)
     #: Initial #STAGE state. While off, stage lines are answered "<line> E2" by the SEM.
     stage_enabled: bool = False
     #: Line terminator for replies (CR per the manual; "\r\n" to test LF tolerance).
@@ -377,6 +387,10 @@ class SimulatedInstrument:
     def _pos_now(self, key) -> int:
         ax = self.axes[key]
         if not ax.moving:
+            now = time.monotonic()
+            if now < ax.settle_end:
+                frac = (now - ax.settle_start) / max(1e-9, ax.settle_end - ax.settle_start)
+                return int(round(ax.settle_from + (ax.position - ax.settle_from) * frac))
             return ax.position
         frac = min(1.0, (time.monotonic() - ax.start_time) / max(1e-9, ax.end_time - ax.start_time))
         target = ax.target if ax.target is not None else ax.position
@@ -469,6 +483,8 @@ class SimulatedInstrument:
         ax = self.axes[key]
         if ax.target is None:
             ax.target = ax.position
+        ax.position = self._pos_now(key)  # a correction still in progress ends here
+        ax.settle_end = 0.0
         ax.start_pos = ax.position
         dist = abs(ax.target - ax.position)
         ax.direction = "+" if ax.target >= ax.position else "-"
@@ -484,8 +500,14 @@ class SimulatedInstrument:
             ax = self.axes[key]
             if not ax.moving or ax.target is None:
                 return
-            ax.position = ax.target
+            travel = ax.target - ax.start_pos
+            ax.position = ax.target + self.options.final_error_pulses.get(key, 0)
             ax.moving = False
+            err = self.options.settle_error_pulses
+            if key[0] == 0 and err and travel and self.options.settle_time_s > 0:
+                ax.settle_from = ax.position - (err if travel > 0 else -err)
+                ax.settle_start = time.monotonic()
+                ax.settle_end = ax.settle_start + self.options.settle_time_s
         self._send(f"{key[0]}{key[1]}0")
 
 

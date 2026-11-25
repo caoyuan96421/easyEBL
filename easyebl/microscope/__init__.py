@@ -14,7 +14,6 @@ Quick start (simulator)::
     from easyebl.microscope import open_microscope
     link, sem, stage = open_microscope("sim")
     sem.set_magnification(2000).result()
-    stage.engage().result()          # take the stage from the SEM PC (#STAGE ON)
     stage.move({"X": 100}, relative=True).result()
     link.close()
 
@@ -25,9 +24,9 @@ from .control import MicroscopeControl, NotAvailable, StubMicroscope
 from .link import POLL, READ, SEM_SET, STAGE_CMD, MicroscopeLink
 from .sem import MAGNIFICATIONS, PRESET_KEYS, SEMControl
 from .poll import Poller
-from .stage import AXES, StageControl
+from .stage import AXES, StageBusy, StageControl
 
-__all__ = ["MicroscopeControl", "NotAvailable", "StubMicroscope", "MicroscopeLink", "SEMControl", "StageControl",
+__all__ = ["MicroscopeControl", "NotAvailable", "StubMicroscope", "MicroscopeLink", "SEMControl", "StageControl", "StageBusy",
            "AXES", "Poller", "MAGNIFICATIONS", "PRESET_KEYS", "SEM_SET", "STAGE_CMD", "READ", "POLL",
            "open_microscope"]
 

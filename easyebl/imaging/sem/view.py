@@ -1,14 +1,16 @@
 """SEM image display: fitted image, scan-line marker, data bar with scale bar.
 
 Mouse:
-* double-click – move the beam so that the clicked point becomes the centre
-* drag (left button) – beam shift, the image follows the mouse
-* wheel – zoom: the swept range narrows / widens (the column magnification is not touched)
-* Measure mode (:attr:`SEMImageView.measure_mode`): drag draws a line instead; its length is shown on
-  the image.  The line is kept in field µm, so it stays on the feature while the scan pans or zooms.
-* Pick mode (:meth:`SEMImageView.start_pick`): a click emits :attr:`SEMImageView.pointPicked` with the
+* left drag – the measuring line (its length is shown on the image; kept in field µm, so it stays
+  on the feature while the scan pans or zooms); a click without a drag clears it
+* Shift + left drag – beam shift (pans the scanned region), the image follows the mouse
+* Shift + wheel – zooms the scanned region (the swept range; the column magnification is not touched)
+* wheel – digital zoom of the image itself, about the cursor (down to single pixels; only the
+  visible part is drawn); middle drag pans the zoomed image
+* right click – :attr:`SEMImageView.contextRequested` (the window's menu)
+* Pick mode (:meth:`SEMImageView.start_pick`): a left click emits :attr:`SEMImageView.pointPicked` with the
   field position (µm); the prompt is shown on top of the image and the targets (e.g. a predicted
-  mark position) as crosses.  Used by the lithography alignment.
+  mark position) as crosses, optionally a cross at the image centre.  Used by the lithography alignment.
 
 The data bar shows the image magnification (column magnification × full field / scan
 width); the inset in the lower-left corner shows the scanned region within the full field.
@@ -162,6 +164,7 @@ def render_annotated(frame, levels, info: dict | None = None) -> QtGui.QImage:
 
 class SEMImageView(QtWidgets.QWidget):
     centerRequested = QtCore.Signal(float, float)  # absolute beam shift target (µm)
+    contextRequested = QtCore.Signal(object, object)  # right click: (x_um, y_um) or None, global QPoint
     shiftDragged = QtCore.Signal(float, float)  # incremental beam shift (µm)
     zoomSteps = QtCore.Signal(int)  # wheel notches: + zoom in, − zoom out (the scan range, not the column)
     pointerMoved = QtCore.Signal(object)  # (x_um, y_um) or None
@@ -172,6 +175,7 @@ class SEMImageView(QtWidgets.QWidget):
         super().__init__(parent)
         self.setMinimumSize(480, 380)
         self.setMouseTracking(True)
+        self.setCursor(QtCore.Qt.CrossCursor)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent)
         self._qimg: QtGui.QImage | None = None
@@ -181,7 +185,9 @@ class SEMImageView(QtWidgets.QWidget):
         self.show_scan_line = True
         self.show_crosshair = False
         self.show_fov_inset = True
-        self._measure_mode = False
+        self._dz = 1.0  # digital zoom (1: the image fits the view)
+        self._dz_c = (0.5, 0.5)  # image fraction at the view centre
+        self._dpan = None  # middle-drag start
         self._line = None  # measuring line: [(x0, y0), (x1, y1)] in field µm
         self._drawing = False
         self._drag = None
@@ -206,21 +212,6 @@ class SEMImageView(QtWidgets.QWidget):
         self.update()
 
     # ------------------------------------------------------------- measure
-    @property
-    def measure_mode(self) -> bool:
-        return self._measure_mode
-
-    @measure_mode.setter
-    def measure_mode(self, on: bool) -> None:
-        """On: left drag draws the measuring line (no beam shift).  Off: the line is removed."""
-        self._measure_mode = bool(on)
-        if on:
-            self.setCursor(QtCore.Qt.CrossCursor)
-        else:
-            self.unsetCursor()
-            self._drawing = False
-            self.clear_measure()
-
     def measure_line(self):
         """((x0, y0), (x1, y1)) in field µm, or None."""
         return None if self._line is None else (tuple(self._line[0]), tuple(self._line[1]))
@@ -265,8 +256,7 @@ class SEMImageView(QtWidgets.QWidget):
         self._pick_prompt = None
         self._pick_targets = []
         self._pick_centre_cross = False
-        if not self._measure_mode:
-            self.unsetCursor()
+        self.setCursor(QtCore.Qt.CrossCursor)
         self.update()
 
     def _widget_point(self, x: float, y: float) -> QtCore.QPointF:
@@ -276,20 +266,78 @@ class SEMImageView(QtWidgets.QWidget):
                               r.top() + (row + 0.5) / cfg.ny * r.height())
 
     # ------------------------------------------------------------ geometry
+    def _area(self) -> QtCore.QRectF:
+        return QtCore.QRectF(0, 0, self.width(), self.height() - BAR_H)
+
     def image_rect(self) -> QtCore.QRectF:
-        area = QtCore.QRectF(0, 0, self.width(), self.height() - BAR_H)
+        """Where the whole image is drawn (widget px): fitted, times the digital zoom; may reach
+        beyond the view when zoomed in."""
+        area = self._area()
         if self._qimg is None:
             return area
         iw, ih = self._qimg.width(), self._qimg.height()
-        s = min(area.width() / iw, area.height() / ih)
+        s = min(area.width() / iw, area.height() / ih) * self._dz
         w, h = iw * s, ih * s
-        return QtCore.QRectF((area.width() - w) / 2, (area.height() - h) / 2, w, h)
+        fx, fy = self._dz_c
+        left = area.center().x() - fx * w
+        top = area.center().y() - fy * h
+        if w >= area.width():
+            left = min(area.left(), max(area.right() - w, left))
+        else:
+            left = area.center().x() - w / 2
+        if h >= area.height():
+            top = min(area.top(), max(area.bottom() - h, top))
+        else:
+            top = area.center().y() - h / 2
+        return QtCore.QRectF(left, top, w, h)
+
+    def visible_rect(self) -> QtCore.QRectF:
+        """The part of the view the image covers."""
+        return self.image_rect().intersected(self._area())
+
+    @property
+    def digital_zoom(self) -> float:
+        return self._dz
+
+    def _max_zoom(self) -> float:
+        if self._qimg is None:
+            return 1.0
+        area = self._area()
+        s0 = min(area.width() / self._qimg.width(), area.height() / self._qimg.height())
+        return max(1.0, 32.0 / max(s0, 1e-9))  # up to 32 screen px per image pixel
+
+    def set_digital_zoom(self, z: float, anchor: QtCore.QPointF | None = None) -> None:
+        """Digital zoom *z* (≥ 1), keeping the image point under *anchor* (widget px) in place."""
+        z = min(max(1.0, float(z)), self._max_zoom())
+        if self._qimg is None:
+            self._dz = z
+            return
+        r = self.image_rect()
+        area = self._area()
+        anchor = anchor if anchor is not None else area.center()
+        fx = (anchor.x() - r.left()) / r.width()
+        fy = (anchor.y() - r.top()) / r.height()
+        self._dz = z
+        r2 = self.image_rect()
+        self._dz_c = (fx + (area.center().x() - anchor.x()) / r2.width(),
+                      fy + (area.center().y() - anchor.y()) / r2.height())
+        self._clamp_dz_centre()
+        self.update()
+
+    def reset_digital_zoom(self) -> None:
+        self._dz, self._dz_c = 1.0, (0.5, 0.5)
+        self.update()
+
+    def _clamp_dz_centre(self) -> None:
+        r, area = self.image_rect(), self._area()
+        # the stored centre = what image_rect actually shows (after its edge clamp)
+        self._dz_c = ((area.center().x() - r.left()) / r.width(), (area.center().y() - r.top()) / r.height())
 
     def _to_pixel(self, pos: QtCore.QPointF):
         if self._qimg is None:
             return None
         r = self.image_rect()
-        if not r.contains(pos):
+        if not r.contains(pos) or not self._area().contains(pos):
             return None
         col = (pos.x() - r.left()) / r.width() * self._qimg.width() - 0.5
         row = (pos.y() - r.top()) / r.height() * self._qimg.height() - 0.5
@@ -301,10 +349,27 @@ class SEMImageView(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         p.fillRect(self.rect(), QtGui.QColor(16, 16, 18))
         r = self.image_rect()
+        vis = r.intersected(self._area())
         if self._qimg is not None:
             down = r.width() < self._qimg.width()
             p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, down)
-            p.drawImage(r, self._qimg)
+            if not vis.isEmpty():  # only the visible part of the image (a 5000² capture zoomed in)
+                sx, sy = self._qimg.width() / r.width(), self._qimg.height() / r.height()
+                src = QtCore.QRectF((vis.left() - r.left()) * sx, (vis.top() - r.top()) * sy,
+                                    vis.width() * sx, vis.height() * sy)
+                p.save()
+                p.setClipRect(vis)
+                if down:
+                    p.drawImage(vis, self._qimg, src)
+                else:  # whole pixels: the pixels themselves, edges included
+                    i0, j0 = max(0, int(src.left())), max(0, int(src.top()))
+                    i1 = min(self._qimg.width(), int(np.ceil(src.right())))
+                    j1 = min(self._qimg.height(), int(np.ceil(src.bottom())))
+                    tgt = QtCore.QRectF(r.left() + i0 / sx, r.top() + j0 / sy, (i1 - i0) / sx, (j1 - j0) / sy)
+                    p.drawImage(tgt, self._qimg, QtCore.QRectF(i0, j0, i1 - i0, j1 - j0))
+                p.restore()
+            p.save()
+            p.setClipRect(vis)
             f = self._frame
             if self.show_scan_line and f is not None and not f.complete and f.scan_row is not None:
                 y = r.top() + (f.scan_row + 1) / f.config.ny * r.height()
@@ -328,8 +393,13 @@ class SEMImageView(QtWidgets.QWidget):
                               format_length(self.measure_length_um(), 4))
                 p.restore()
             field, scan = self.info.get("field_um"), self.info.get("scan")
+            p.restore()
             if self.show_fov_inset and field and scan is not None:
-                _draw_fov_inset(p, r, float(field), scan)
+                _draw_fov_inset(p, vis, float(field), scan)
+            if self._dz > 1.0 + 1e-9:
+                p.setPen(QtGui.QColor(255, 220, 120))
+                p.drawText(vis.adjusted(6, 4, -6, -4), QtCore.Qt.AlignRight | QtCore.Qt.AlignTop,
+                           f"digital zoom ×{self._dz:.3g}")
             if self._pick_targets and f is not None:
                 p.save()
                 p.setClipRect(r)
@@ -368,45 +438,52 @@ class SEMImageView(QtWidgets.QWidget):
         info["image_width_px"] = r.width()
         bar = QtCore.QRectF(0, self.height() - BAR_H, self.width(), BAR_H)
         if self._frame is not None:
-            # the data bar spans the image width, like on the SEM screen
-            bar = QtCore.QRectF(r.left(), self.height() - BAR_H, r.width(), BAR_H)
+            # the data bar spans the (visible) image width, like on the SEM screen
+            bar = QtCore.QRectF(vis.left(), self.height() - BAR_H, vis.width(), BAR_H)
         _draw_data_bar(p, bar, self._frame, info)
         p.end()
         self._paint_ms = (time.perf_counter() - t0) * 1e3
 
     # --------------------------------------------------------------- mouse
-    def mouseDoubleClickEvent(self, ev):  # noqa: N802
-        px = self._to_pixel(ev.position())
-        if px is not None and self._frame is not None and not self._measure_mode and not self.pick_mode:
-            self.centerRequested.emit(*_pixel_to_field(self._frame.config, *px))
+    def _field_at(self, pos):
+        px = self._to_pixel(pos)
+        return None if px is None or self._frame is None else _pixel_to_field(self._frame.config, *px)
 
     def mousePressEvent(self, ev):  # noqa: N802
-        if ev.button() != QtCore.Qt.LeftButton or self._frame is None:
+        btn, shift = ev.button(), bool(ev.modifiers() & QtCore.Qt.ShiftModifier)
+        if btn == QtCore.Qt.RightButton:
+            self.contextRequested.emit(self._field_at(ev.position()), ev.globalPosition().toPoint())
+            return
+        if btn == QtCore.Qt.MiddleButton:
+            if self._qimg is not None and self._dz > 1.0:
+                self._dpan = ev.position()
+                self.setCursor(QtCore.Qt.ClosedHandCursor)
+            return
+        if btn != QtCore.Qt.LeftButton or self._frame is None:
+            return
+        if shift:  # pan the scanned region (beam shift)
+            self._drag = ev.position()
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
             return
         if self._pick_prompt is not None:
-            px = self._to_pixel(ev.position())
-            if px is not None:
-                self.pointPicked.emit(*_pixel_to_field(self._frame.config, *px))
+            xy = self._field_at(ev.position())
+            if xy is not None:
+                self.pointPicked.emit(*xy)
             return
-        if self._measure_mode:
-            px = self._to_pixel(ev.position())
-            if px is not None:
-                xy = _pixel_to_field(self._frame.config, *px)
-                self._drawing = True
-                self.set_measure_line(xy, xy)
-            return
-        self._drag = ev.position()
-        self.setCursor(QtCore.Qt.ClosedHandCursor)
+        xy = self._field_at(ev.position())
+        if xy is not None:
+            self._drawing = True
+            self.set_measure_line(xy, xy)
 
     def mouseMoveEvent(self, ev):  # noqa: N802
         f = self._frame
         if self._drawing and f is not None:
-            r = self.image_rect()
+            r = self.visible_rect()
             pos = QtCore.QPointF(min(max(ev.position().x(), r.left()), r.right() - 1e-6),
                                  min(max(ev.position().y(), r.top()), r.bottom() - 1e-6))
-            px = self._to_pixel(pos)
-            if px is not None:
-                self.set_measure_line(self._line[0], _pixel_to_field(f.config, *px))
+            xy = self._field_at(pos)
+            if xy is not None:
+                self.set_measure_line(self._line[0], xy)
         elif self._drag is not None and f is not None:
             d = ev.position() - self._drag
             r = self.image_rect()
@@ -417,8 +494,14 @@ class SEMImageView(QtWidgets.QWidget):
                 c, s = math.cos(cfg.rotation_rad), math.sin(cfg.rotation_rad)
                 self.shiftDragged.emit(c * um_x - s * um_y, s * um_x + c * um_y)
                 self._drag = ev.position()
-        px = self._to_pixel(ev.position())
-        self.pointerMoved.emit(None if px is None or f is None else _pixel_to_field(f.config, *px))
+        elif self._dpan is not None and self._qimg is not None:
+            d = ev.position() - self._dpan
+            r = self.image_rect()
+            self._dz_c = (self._dz_c[0] - d.x() / r.width(), self._dz_c[1] - d.y() / r.height())
+            self._clamp_dz_centre()
+            self._dpan = ev.position()
+            self.update()
+        self.pointerMoved.emit(self._field_at(ev.position()))
 
     def mouseReleaseEvent(self, ev):  # noqa: N802
         if self._drawing:
@@ -427,15 +510,19 @@ class SEMImageView(QtWidgets.QWidget):
                 self.clear_measure()  # a click without a drag
             return
         self._drag = None
-        if self._measure_mode:
-            self.setCursor(QtCore.Qt.CrossCursor)
-        else:
-            self.unsetCursor()
+        self._dpan = None
+        self.setCursor(QtCore.Qt.CrossCursor)
 
     def wheelEvent(self, ev):  # noqa: N802
-        steps = int(round(ev.angleDelta().y() / 120))
-        if steps:
-            self.zoomSteps.emit(steps)
+        a = ev.angleDelta()
+        delta = a.y() or a.x()  # with Shift some platforms report the wheel as horizontal
+        steps = int(round(delta / 120))
+        if not steps:
+            return
+        if ev.modifiers() & QtCore.Qt.ShiftModifier:
+            self.zoomSteps.emit(steps)  # the scanned region
+        else:
+            self.set_digital_zoom(self._dz * (2 ** (steps / 3)), ev.position())  # three notches: ×2
 
     def leaveEvent(self, ev):  # noqa: N802
         self.pointerMoved.emit(None)

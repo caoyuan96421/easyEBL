@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import pytest
 
@@ -151,7 +152,7 @@ def microscope():
     except Exception as e:  # noqa: BLE001 - port open, SEM silent
         link.close()
         pytest.skip(f"no reply from the SEM on {MICROSCOPE_PORT} (switched off or not connected): {e}")
-    stage = StageControl(link, polling=False, hand_control=False)
+    stage = StageControl(link, polling=False)
     sem.refresh().result(30)
     original = {k: sem.state.get(k) for k in _RESTORE}
     try:
@@ -164,16 +165,18 @@ def microscope():
     try:
         if link.state == "uncertain":
             link.resync()
-        if stage.moving:
+        if stage.moving or stage.busy:
             stage.stop().result(10)
+            t_end = time.monotonic() + 30
+            while stage.busy and time.monotonic() < t_end:
+                time.sleep(0.1)
         if xy0 and all(v is not None for v in xy0.values()):
             stage.refresh(["X", "Y"]).result(30)
             back = {a: v for a, v in xy0.items() if abs((stage.positions.get(a) or v) - v) > 0.5}
             if back:
                 stage.acknowledge()
                 stage.move(back).result(120)
-        problems = _restore(sem, original)
-        stage.release().result(30)  # #STAGE OFF: the SEM PC (trackball) has the stage again
+        problems = _restore(sem, original)  # every move ended with #STAGE OFF: the SEM PC has the stage
     finally:
         stage.close()
         sem.close()

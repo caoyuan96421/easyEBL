@@ -203,9 +203,7 @@ def test_measure_line_and_global_calibration(qtbot, sem):
     w.scan.b_run.click()
     qtbot.waitUntil(lambda: w.view.frame() is not None and w.view.frame().complete, timeout=15000)
     eng.freeze()
-    w.a_measure.setChecked(True)
-    assert w.view.measure_mode
-    # drag a line across the image: its length in field µm
+    # left drag: a line across the image, its length in field µm
     v = w.view
     r = v.image_rect()
     a, b = QtCore.QPoint(int(r.left() + 0.2 * r.width()), int(r.center().y())), \
@@ -238,5 +236,68 @@ def test_measure_line_and_global_calibration(qtbot, sem):
     d.apply()
     assert eng.calibration.field_size_um == pytest.approx(200.0)
     d.close()
-    w.a_measure.setChecked(False)
+    v.clear_measure()
     assert v.measure_line() is None and w.l_meas.text() == ""
+
+
+def test_sem_mouse_shift_pan_zoom_digital_zoom_and_menu(qtbot, sem):
+    from PySide6 import QtGui
+
+    w, eng = sem, sem.engine
+    w.scan.b_run.click()
+    qtbot.waitUntil(lambda: w.view.frame() is not None and w.view.frame().complete, timeout=15000)
+    eng.freeze()
+    v = w.view
+    r = v.image_rect()
+    c = r.center().toPoint()
+
+    def wheel(steps, mods=QtCore.Qt.NoModifier, pos=c):
+        ev = QtGui.QWheelEvent(QtCore.QPointF(pos), QtCore.QPointF(v.mapToGlobal(pos)), QtCore.QPoint(0, 0),
+                               QtCore.QPoint(0, 120 * steps), QtCore.Qt.NoButton, mods, QtCore.Qt.NoScrollPhase,
+                               False)
+        v.wheelEvent(ev)
+
+    # plain wheel: digital zoom only (the scan is untouched); about the cursor
+    w0, c0 = eng.config.width_um, eng.config.center_um
+    corner = QtCore.QPoint(int(r.left() + 0.25 * r.width()), int(r.top() + 0.25 * r.height()))
+    before = v._to_pixel(QtCore.QPointF(corner))
+    wheel(3, pos=corner)
+    assert v.digital_zoom == pytest.approx(2.0) and eng.config.width_um == w0 and eng.config.center_um == c0
+    after = v._to_pixel(QtCore.QPointF(corner))
+    assert after == pytest.approx(before, abs=0.6)  # the point under the cursor stays put
+    assert v.image_rect().width() == pytest.approx(2 * r.width())
+    for _ in range(40):
+        wheel(3)
+    assert v.digital_zoom == pytest.approx(v._max_zoom())
+    v.grab()  # paints only the visible part
+    v.reset_digital_zoom()
+    # Shift + wheel: the scanned region zooms
+    wheel(3, QtCore.Qt.ShiftModifier)
+    assert eng.config.width_um == pytest.approx(w0 / 2) and v.digital_zoom == 1.0
+    # Shift + left drag: beam shift; a plain drag measures instead
+    r = v.image_rect()
+    a, b = QtCore.QPoint(int(r.center().x()), int(r.center().y())), QtCore.QPoint(int(r.center().x() + 60),
+                                                                                 int(r.center().y()))
+    c1 = eng.config.center_um
+    qtbot.mousePress(v, QtCore.Qt.LeftButton, QtCore.Qt.ShiftModifier, a)
+    qtbot.mouseMove(v, b)
+    qtbot.mouseRelease(v, QtCore.Qt.LeftButton, QtCore.Qt.ShiftModifier, b)
+    assert eng.config.center_um[0] < c1[0] and v.measure_line() is None  # the image followed the mouse
+    # right click: the menu
+    got = []
+    v.contextRequested.connect(lambda xy, pos: got.append(xy))
+    qtbot.mousePress(v, QtCore.Qt.RightButton, pos=a)
+    assert got and got[0] is not None
+    acts = {x.text(): x for x in w._last_menu.actions() if x.text()}
+    assert list(acts) == ["Center with beam", "Center with stage", "Clear measurement", "Reset to Full FoV"]
+    assert not acts["Center with stage"].isEnabled()  # no microscope here
+    w._last_menu.close()
+    w._center_at(*got[0])
+    assert eng.config.center_um == pytest.approx(got[0])
+    wheel(3)
+    w.reset_full_fov()
+    assert v.digital_zoom == 1.0 and eng.config.center_um == (0.0, 0.0)
+    # Center with stage: the stage moves the clicked point to the image centre (S-3000 mirror: X)
+    assert w.stage_move_for(eng.config.center_um[0] + 5.0, 3.0) == pytest.approx((-5.0, 3.0))
+    w.stage_mirror = (False, False)
+    assert w.stage_move_for(5.0, 3.0) == pytest.approx((5.0, 3.0))

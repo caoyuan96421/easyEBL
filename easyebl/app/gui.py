@@ -777,6 +777,7 @@ class EasyEBLApp(QtCore.QObject):
             from ..imaging.sem.window import SEMWindow
 
             w = SEMWindow(b.engine, owns_engine=False, simulated=sim, microscope_bundle=b.microscope)
+            w.stage_mirror = (b.config.microscope.stage_mirror_x, b.config.microscope.stage_mirror_y)
             w.resize(1500, 950)
             return w
         if key == "eds":

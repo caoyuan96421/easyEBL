@@ -7,16 +7,17 @@ import pytest
 
 from easyebl.core import FieldCalibration
 from easyebl.microscope import (MAGNIFICATIONS, POLL, SEM_SET, MicroscopeLink, NotAvailable, SEMControl,
-                                StageControl, StubMicroscope)
+                                StageBusy, StageControl, StubMicroscope)
 from easyebl.microscope.coupling import FieldScale
 from easyebl.microscope.s3000 import MotionError
 
 
 @pytest.fixture
 def mic():
-    link = MicroscopeLink.simulated(command_delay_s=0.01)
+    # no late X / Y correction here (the moves end on target): test_move_waits_until_* models it
+    link = MicroscopeLink.simulated(command_delay_s=0.01, settle_error_um=0.0)
     sem = SEMControl(link, polling=False)
-    stage = StageControl(link, polling=False, hand_control=False)
+    stage = StageControl(link, polling=False)
     sem.refresh().result(10)
     stage.refresh().result(10)
     yield link, sem, stage
@@ -227,7 +228,7 @@ def test_stage_moves_relative_and_absolute(mic):
     assert pos["X"] == pytest.approx(50000.0, abs=0.05) and pos["Y"] == pytest.approx(30000.0, abs=0.05)
     pos = stage.move({"T": 2.0}, relative=True).result(30)
     assert pos["T"] == pytest.approx(2.0 + 0x62 / 3528, abs=1e-3)
-    assert link.session.simulator.sem["STAGE"] == "ON"  # #STAGE ON was sent automatically
+    assert link.session.simulator.sem["STAGE"] == "OFF"  # the SEM PC has the stage again after each move
     with pytest.raises(ValueError):
         stage.move({"Q": 1})
     with pytest.raises(ValueError):
@@ -241,8 +242,14 @@ def test_xy_moves_end_with_a_one_way_approach(mic):
     link, sem, stage = mic
     assert stage.backlash_um == 50.0
     sent = []
-    orig = stage._move_once
-    stage._move_once = lambda targets, relative=False: (sent.append(dict(targets)), orig(targets, relative))[1]
+    orig = link.session.stage.move
+
+    def spy(pulses, **kw):  # the legs, in µm, as sent to the controllers
+        from easyebl.microscope.s3000 import from_pulses
+        sent.append({a: from_pulses(a, p) for a, p in pulses.items()})
+        return orig(pulses, **kw)
+
+    link.session.stage.move = spy
     x0, y0 = stage.positions["X"], stage.positions["Y"]
     pos = stage.move({"X": x0 + 200.0}).result(30)  # + by more than 50: one move
     assert sent == [{"X": x0 + 200.0}] and pos["X"] == pytest.approx(x0 + 200.0, abs=0.05)
@@ -254,48 +261,163 @@ def test_xy_moves_end_with_a_one_way_approach(mic):
     stage.move({"Z": 10.0}, relative=True).result(30)  # Z: direct
     assert len(sent) == 1
     sent.clear()
+    x1 = stage.positions["X"]
     stage.move({"X": -100.0}, relative=True, approach=False).result(30)
-    assert sent == [{"X": -100.0}]
+    assert sent == [{"X": pytest.approx(x1 - 100.0, abs=0.05)}]
 
 
-def test_hand_control_release_and_engage(mic):
+def _settling_mic(error_um=3.0, settle_s=1.5, **stage_kw):
+    link = MicroscopeLink.simulated(command_delay_s=0.01, settle_error_um=error_um, settle_time_s=settle_s)
+    stage = StageControl(link, polling=False, **stage_kw)
+    stage.refresh().result(10)
+    return link, stage
+
+
+def test_move_waits_until_xy_read_within_the_tolerance_of_the_setpoint():
+    """The controllers report STOPPED 3 µm short; the move waits for the encoder correction."""
+    link, stage = _settling_mic()
+    try:
+        assert stage.settle_tol["X"] == 0.5 and stage.settle_tol["R"] == 0.01
+        x0 = stage.positions["X"]
+        offs = []
+        fut = stage.move({"X": x0 + 200.0})
+        t0 = time.monotonic()
+        while not fut.done() and time.monotonic() - t0 < 30:
+            if stage.settling:
+                offs.append(stage.settling["X"])
+            time.sleep(0.02)
+        pos = fut.result(1)
+        assert time.monotonic() - t0 > 0.7  # STOPPED came almost at once; the correction took ~1 s
+        assert offs and min(offs) < -0.5  # it was seen short of the target meanwhile
+        assert abs(pos["X"] - (x0 + 200.0)) <= 0.5 and stage.settling is None
+        # the backlash pre-leg does not wait: a move in − has the same single settling phase at the end
+        pos = stage.move({"X": x0 + 100.0}).result(30)
+        assert abs(pos["X"] - (x0 + 100.0)) <= 0.5
+    finally:
+        link.close()
+
+
+def test_move_fails_when_xy_do_not_settle_in_time():
+    link, stage = _settling_mic(error_um=5.0, settle_s=20.0, settle_timeout_s=0.8)
+    try:
+        with pytest.raises(MotionError, match="did not settle"):
+            stage.move({"Y": stage.positions["Y"] + 100.0}).result(30)
+        assert not stage.busy and stage.settling is None
+    finally:
+        link.close()
+
+
+def test_stop_ends_the_settling_wait():
+    link, stage = _settling_mic(error_um=5.0, settle_s=20.0)
+    try:
+        fut = stage.move({"X": stage.positions["X"] + 100.0})
+        t0 = time.monotonic()
+        while not stage.settling and time.monotonic() - t0 < 10:
+            time.sleep(0.02)
+        assert stage.settling
+        stage.stop()
+        with pytest.raises(concurrent.futures.CancelledError):
+            fut.result(10)
+        assert time.monotonic() - t0 < 5 and not stage.busy
+    finally:
+        link.close()
+
+
+def test_zrt_off_the_setpoint_fail_at_once():
+    """Z / R / T do not correct: a lasting error (lost steps) fails without waiting out the timeout."""
+    link, stage = _settling_mic(error_um=0.0, settle_timeout_s=30.0)
+    try:
+        sim = link.session.simulator
+        pos = stage.move({"T": 1.0}, relative=True).result(30)  # on target: fine
+        assert pos["T"] == pytest.approx(1.0 + 0x62 / 3528, abs=0.01)
+        sim.options.final_error_pulses[(2, 1)] = 100  # T: 100 / 3528 ° ≈ 0.028° off
+        t0 = time.monotonic()
+        with pytest.raises(MotionError, match="did not reach the setpoint: T"):
+            stage.move({"T": 1.0}, relative=True).result(30)
+        assert time.monotonic() - t0 < 5
+        sim.options.final_error_pulses[(2, 1)] = 10  # 0.003°: within 0.01°
+        stage.move({"T": 1.0}, relative=True).result(30)
+    finally:
+        link.close()
+
+
+def _stage_lines(sim, n0=0):
+    """The #STAGE / S2 / move lines the simulator received since index *n0*."""
+    return [ln for ln in sim.received[n0:] if ln.startswith("#STAGE") or "S2" in ln or "C0" in ln or "M0" in ln]
+
+
+def test_every_move_is_wrapped_in_stage_on_and_off(mic):
+    """#STAGE ON right before a move, S2 (motors free) and #STAGE OFF right after – also for reads."""
     link, sem, stage = mic
     sim = link.session.simulator
-    m = stage.move({"X": 20000.0}, relative=True)  # still running when released
-    t0 = time.monotonic()
-    while not stage.moving and time.monotonic() - t0 < 5:
-        time.sleep(0.01)
-    stage.release().result(15)
-    with pytest.raises((MotionError, concurrent.futures.CancelledError)):
-        m.result(15)
-    assert stage.hand_control and not stage.moving and sim.sem["STAGE"] == "OFF"
-    assert not any("S2" in line for line in sim.received)  # the SEM PC decides about motor power
-    # positions are still read; #STAGE OFF follows each read (the trackball keeps working)
-    sim.axes[(0, 0)].position += 2560  # moved with the trackball: +100 µm
-    x = stage.positions["X"]
-    stage.refresh(["X"]).result(15)
-    assert stage.positions["X"] == pytest.approx(x + 100.0, abs=0.05) and sim.sem["STAGE"] == "OFF"
-    with pytest.raises(RuntimeError, match="hand control"):
-        stage.move({"X": 10.0}, relative=True)
-    stage.engage().result(10)
-    assert not stage.hand_control and sim.sem["STAGE"] == "ON"
-    stage.move({"X": 10.0}, relative=True).result(30)
+    assert sim.sem["STAGE"] == "OFF"  # reads left the relay off
+    n0 = len(sim.received)
+    stage.move({"X": 300.0}, relative=True).result(30)
+    lines = _stage_lines(sim, n0)
+    assert lines[0] == "#STAGE ON" and lines[-1] == "#STAGE OFF" and lines.count("#STAGE ON") == 1
+    assert any("S2" in ln for ln in lines) and "S2" in lines[-2]
+    assert sim.sem["STAGE"] == "OFF" and not stage.busy
+    # a read: ON, read, OFF
+    n0 = len(sim.received)
+    stage.refresh(["X"]).result(10)
+    assert [ln for ln in sim.received[n0:] if ln.startswith("#STAGE")] == ["#STAGE ON", "#STAGE OFF"]
+    # a failed move ends with #STAGE OFF too
+    n0 = len(sim.received)
+    with pytest.raises(ValueError, match="below the stage zero"):
+        stage.move({"X": -1e9}, relative=True).result(30)
+    assert _stage_lines(sim, n0)[-1] == "#STAGE OFF" and not stage.busy
 
 
-def test_stage_starts_under_hand_control():
+def test_stage_off_already_off_is_not_an_error():
+    """#STAGE OFF while the relay is already off: the S-3000 answers E6, which is ignored."""
     link = MicroscopeLink.simulated(command_delay_s=0.01)
     try:
         stage = StageControl(link, polling=False)
-        assert stage.hand_control
-        stage.refresh().result(10)
-        assert link.session.simulator.sem["STAGE"] == "OFF" and stage.positions["X"] is not None
-        with pytest.raises(RuntimeError):
-            stage.move({"X": 1.0}, relative=True)
-        # handing back a stage that is already off: the SEM answers E6, which is not an error
-        assert stage.release().result(10) is True
+        link.call(lambda s: stage._stage_off(s))
         assert link.session.simulator.sem["STAGE"] == "OFF"
     finally:
         link.close()
+
+
+def test_a_move_holds_the_port_and_refuses_a_second_move(mic):
+    """During a move: a second move is refused, SEM settings wait in line and go out after it,
+    the background reads pause; STOP still gets through."""
+    link, sem, stage = mic
+    sim = link.session.simulator
+    stage.set_polling(True)
+    sem.set_polling(True)
+    time.sleep(0.5)
+    m = stage.move({"X": 4000.0}, relative=True)
+    t0 = time.monotonic()
+    while not stage.moving and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    assert stage.busy and link.exclusive
+    with pytest.raises(StageBusy):
+        stage.move({"Y": 10.0}, relative=True)
+    n0 = len(sim.received)
+    f = sem.set_magnification(MAGNIFICATIONS[5])
+    time.sleep(0.6)
+    assert not f.done() and stage.moving  # queued behind the move
+    during = sim.received[n0:]
+    assert not any(ln.startswith("R ") or ln.startswith("MAG") for ln in during)  # no SEM traffic, no polls
+    pos = m.result(60)
+    f.result(10)
+    after = sim.received[n0:]
+    i_off = after.index("#STAGE OFF")
+    assert any(ln.startswith("MAG") for ln in after[i_off:])  # the setting went out after the move
+    assert pos["X"] is not None and not stage.busy and link.exclusive is None
+    # STOP during a move: halted, then S2 and #STAGE OFF
+    m = stage.move({"X": 20000.0}, relative=True)
+    t0 = time.monotonic()
+    while not stage.moving and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    n0 = len(sim.received)
+    assert stage.stop().result(10) is True
+    with pytest.raises((MotionError, concurrent.futures.CancelledError)):
+        m.result(30)
+    lines = sim.received[n0:]
+    assert any("S0" in ln for ln in lines) and _stage_lines(sim, n0)[-1] == "#STAGE OFF"
+    assert sim.sem["STAGE"] == "OFF" and not stage.busy
 
 
 @pytest.mark.parametrize("delay", [0.0, 0.03, 0.4])
@@ -318,13 +440,15 @@ def test_stop_is_not_queued_behind_sem_work(mic):
     t0 = time.monotonic()
     while not stage.moving and time.monotonic() - t0 < 5:
         time.sleep(0.01)
-    busy = _block(link, 2.0, priority=SEM_SET)  # a long SEM transaction holds the port
+    queued = sem.set_contrast(321)  # waits behind the move (the move job holds the port)
+    time.sleep(0.2)
+    assert link.busy_with.startswith("stage move") and not queued.done()
     t = time.monotonic()
     stage.stop().result(5)
-    assert time.monotonic() - t < 1.5  # S0 went out while the port was busy
+    assert time.monotonic() - t < 1.5  # S0 went out while the move job held the port
     with pytest.raises(MotionError):
         m.result(15)
-    busy.result(5)
+    queued.result(10)  # and the queued setting went out after it
 
 
 def test_timeout_makes_the_link_uncertain_until_resync(mic):

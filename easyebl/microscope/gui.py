@@ -257,6 +257,12 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         b.setToolTip("save and recall named settings: beam coarse / fine, stigmator, contrast / brightness")
         b.clicked.connect(self.open_presets)
         f.addWidget(b, 0, 2, 2, 1)
+        self.b_aga = QtWidgets.QPushButton("Auto gun alignment")
+        self.b_aga.setToolTip("AGA ON: the SEM's automatic gun alignment (holds the port until it ends)")
+        self.b_aga.clicked.connect(lambda: self._confirmed(
+            "Run the SEM's automatic gun alignment? It takes the port until the SEM has finished.",
+            lambda: sem.alignment("gun"), "auto gun alignment"))
+        f.addWidget(self.b_aga, 3, 0, 1, 3)
         lay.addWidget(g)
 
         # --- SEM display
@@ -270,9 +276,12 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         b_abc.setToolTip("automatic brightness / contrast of the SEM's own display")
         b_abc.clicked.connect(lambda: self._call(sem.auto_brightness_contrast))
         self.scan_combo = QtWidgets.QComboBox()
+        self.scan_combo.addItem("unknown", None)  # until the first read
         for k, v in SCAN_MODES.items():
             self.scan_combo.addItem(v, k)
-        self.scan_combo.activated.connect(lambda i: self._call(sem.set_scan, self.scan_combo.itemData(i)))
+        self.scan_combo.setToolTip("the SEM's own scan mode (its display), read back from the SEM")
+        self.scan_combo.activated.connect(
+            lambda i: self.scan_combo.itemData(i) is not None and self._call(sem.set_scan, self.scan_combo.itemData(i)))
         self.det_combo = QtWidgets.QComboBox()
         self.det_combo.addItems(list(C.SIGNAL_TOKENS))
         self.det_combo.activated.connect(lambda i: self._call(sem.set_detector, self.det_combo.itemText(i)))
@@ -318,15 +327,14 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self.stop_all)
         lay.addWidget(self.b_stop)
 
-        # --- who drives the stage: easyEBL (#STAGE ON) or the SEM PC (#STAGE OFF)
-        self.b_enable = QtWidgets.QPushButton()
-        self.b_enable.setCheckable(True)
-        self.b_enable.setMinimumHeight(44)
-        self.b_enable.setToolTip("Enabled: easyEBL drives the stage (#STAGE ON).\n"
-                                 "Disabled: the SEM PC has it (#STAGE OFF) – its trackball works and it\n"
-                                 "decides about motor power; positions are still read.")
-        self.b_enable.toggled.connect(self._motion_enabled)
-        lay.addWidget(self.b_enable)
+        # --- who has the stage: the SEM PC, except during an easyEBL move (#STAGE ON … #STAGE OFF)
+        self.l_move = QtWidgets.QLabel()
+        self.l_move.setMinimumHeight(32)
+        self.l_move.setAlignment(QtCore.Qt.AlignCenter)
+        self.l_move.setToolTip("Between moves the SEM PC has the stage (#STAGE OFF: its trackball works and it\n"
+                               "decides about motor power).  A move switches #STAGE ON, moves, waits until every\n"
+                               "axis has stopped and switches #STAGE OFF; meanwhile SEM settings wait in line.")
+        lay.addWidget(self.l_move)
 
         # --- DRO
         g = QtWidgets.QGroupBox("Position  (double-click an axis to move it)")
@@ -404,13 +412,14 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         f.addWidget(QtWidgets.QLabel("X/Y approach"), 4, 0)
         f.addWidget(self.backlash, 4, 1, 1, 3)
         lay.addWidget(self.g_jog)
-        note = QtWidgets.QLabel("Moves wait in line behind SEM settings; STOP never waits.  The stage has no "
-                                "homing or collision model – watch the chamber camera when moving Z, R or T.")
+        note = QtWidgets.QLabel("During a move the port carries nothing else (SEM settings wait until it ends) "
+                                "and a second move is refused; STOP never waits.  The stage has no homing or "
+                                "collision model – watch the chamber camera when moving Z, R or T.")
         note.setWordWrap(True)
         note.setStyleSheet(_NOTE)
         lay.addWidget(note)
         lay.addStretch(1)
-        self._motion_enabled(False)
+        self._show_move_state()
         return w
 
     # ================================================================ helpers
@@ -502,33 +511,26 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
     # ================================================================ stage actions
     def stop_all(self):
-        if self.stage.hand_control:
-            self.notify("STOP not sent: the SEM PC has the stage (use its controls)")
-            return
         self.stage.stop()
         self.notify("STOP sent to all axes")
 
     @property
     def motion_enabled(self) -> bool:
-        return self.b_enable.isChecked()
+        """False while a move is in progress (a second one would be refused)."""
+        return not self.stage.busy
 
-    def _motion_enabled(self, on: bool):
-        """Enabled: easyEBL drives the stage (#STAGE ON).  Disabled: stop, then #STAGE OFF –
-        the SEM PC (trackball) has the stage."""
-        self.b_enable.setText("STAGE: easyEBL control  –  click to hand back to the SEM PC" if on else
-                              "STAGE: SEM PC (trackball)  –  click to enable easyEBL control")
-        self.b_enable.setStyleSheet("QPushButton{font-size:15px;font-weight:bold;"
-                                    + ("background:#2e7d32;color:white}" if on else "background:#455a64;color:#ddd}"))
-        self.g_jog.setEnabled(on)
-        try:  # a failure is reported through the link's error events (log)
-            self.stage.engage() if on else self.stage.release()
-        except Exception as e:  # noqa: BLE001 - link closed
-            self.notify(f"stage: {e}")
+    def _show_move_state(self):
+        busy = self.stage.busy
+        self.l_move.setText("STAGE MOVING – easyEBL has the stage (#STAGE ON)" if busy else
+                            "STAGE: SEM PC (trackball) – a move takes it for its duration")
+        self.l_move.setStyleSheet("font-size:15px;font-weight:bold;"
+                                  + ("background:#ef6c00;color:white" if busy else "background:#455a64;color:#ddd"))
+        self.g_jog.setEnabled(not busy)
 
     def open_move_dialog(self, axis: str):
         """Direct move of one axis (double-click on its readout)."""
         if not self.motion_enabled:
-            self.notify("stage motion is not enabled (the SEM PC has the stage)")
+            self.notify("a stage move is in progress – wait for it to end (or STOP)")
             return None
         d = MoveDialog(axis, self.stage.unit(axis), self.stage.positions.get(axis), self)
         d.setAttribute(QtCore.Qt.WA_DeleteOnClose)
@@ -542,7 +544,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
     def move(self, targets: dict, relative: bool, confirm: bool | None = None):
         if not self.motion_enabled:
-            self.notify("stage motion is not enabled (the SEM PC has the stage)")
+            self.notify("a stage move is in progress – wait for it to end (or STOP)")
             return None
         desc = ", ".join(f"{a} {'by ' if relative else 'to '}{v:+g} {self.stage.unit(a)}" if relative else
                          f"{a} to {v:g} {self.stage.unit(a)}" for a, v in targets.items())
@@ -551,7 +553,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             return None
         fut = self._call(self.stage.move, targets, relative, what=f"move {desc}")
         if fut is not None:
-            self.notify(f"move queued: {desc}")
+            self.notify(f"move: {desc}")
         return fut
 
     # ================================================================ updates
@@ -596,7 +598,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
                 self.b_run.setChecked(not s["running"])
                 self.b_run.setText("Frozen – Run" if not s["running"] else "Freeze")
             if s.get("scan") in SCAN_MODES:
-                self.scan_combo.setCurrentIndex(list(SCAN_MODES).index(s["scan"]))
+                self.scan_combo.setCurrentIndex(self.scan_combo.findData(s["scan"]))
             det = s.get("detector")
             if det and self.det_combo.findText(det) >= 0:
                 self.det_combo.setCurrentIndex(self.det_combo.findText(det))
@@ -611,6 +613,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             self.dro_state[a].setStyleSheet("color:" + {"moving": "#fb4", "completed": "#4c4", "halted": "#f90",
                                                         "limit": "#f55", "fault": "#f55",
                                                         "uncertain": "#f55"}.get(state, "#bbb"))
+        self._show_move_state()
         t = max((v for v in st.t_read.values() if v), default=None)
         self.l_read.setText("read " + time.strftime("%H:%M:%S", time.localtime(t)) if t else "not read yet")
         state = self.link.state
@@ -624,8 +627,8 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
     def _poll_text(self) -> str:
         st = self.stage
-        if st.moving:
-            return "stage moving"
+        if st.busy or st.moving:
+            return "stage moving – background reads paused"
         p = st.poll_period_s() if st.polling else None
         tasks = self.link.poller.tasks()
         self.l_poll.setToolTip("background reads – level: measured read time / period:\n" + "\n".join(

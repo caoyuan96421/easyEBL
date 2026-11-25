@@ -54,24 +54,23 @@ def test_microscope_window(qtbot, bundle):
     qtbot.waitUntil(lambda: w.focus_c.value() == 9262 and w.l_wd.text().startswith("22.0"), timeout=2000)
     time.sleep(0.3)
     assert len(bundle.link.session.simulator.received) == n_sent + 1  # only the R FOCUS C read
-    # stage: the SEM PC has it (#STAGE OFF) until enabled
+    # stage: the SEM PC has it (#STAGE OFF) between moves; no enable button any more
     sim = bundle.link.session.simulator
-    assert sim.sem["STAGE"] == "OFF" and bundle.stage.hand_control and not w.g_jog.isEnabled()
+    assert sim.sem["STAGE"] == "OFF" and not bundle.stage.busy and w.g_jog.isEnabled() and "SEM PC" in w.l_move.text()
+    assert not hasattr(w, "b_enable")
     x0 = bundle.stage.positions["X"]
     assert w.dro["X"].text() == f"{x0:,.1f}"
-    assert w.move({"X": 100}, relative=True) is None and w.open_move_dialog("X") is None
-    w.b_enable.click()
-    qtbot.waitUntil(lambda: sim.sem["STAGE"] == "ON" and not bundle.stage.hand_control, timeout=5000)
     w.jog("X", +1)  # default jog step 100 µm
-    qtbot.waitUntil(lambda: abs(bundle.stage.positions["X"] - (x0 + w.jog_um.value())) < 0.05, timeout=10000)
+    qtbot.waitUntil(lambda: abs(bundle.stage.positions["X"] - (x0 + w.jog_um.value())) <= 0.5, timeout=10000)
+    qtbot.waitUntil(lambda: not bundle.stage.busy and w.motion_enabled, timeout=5000)  # S2, #STAGE OFF
     # double-click on the Y readout: move to a position
     qtbot.mouseDClick(w.dro["Y"], QtCore.Qt.LeftButton)
     d = w.findChild(MoveDialog)
     assert d is not None and not d.relative() and d.value() == pytest.approx(bundle.stage.positions["Y"], abs=0.1)
     d.val.setValue(30000.0)
     d.accept()
-    qtbot.waitUntil(lambda: abs(bundle.stage.positions["Y"] - 30000.0) < 0.05, timeout=15000)
-    qtbot.waitUntil(lambda: w.dro["Y"].text() == "30,000.0", timeout=2000)
+    qtbot.waitUntil(lambda: abs(bundle.stage.positions["Y"] - 30000.0) <= 0.5, timeout=15000)
+    qtbot.waitUntil(lambda: w.dro["Y"].text() == f"{bundle.stage.positions['Y']:,.1f}", timeout=2000)
     # STOP ALL during a long (relative) move
     d = w.open_move_dialog("X")
     d.rb_rel.setChecked(True)
@@ -82,15 +81,17 @@ def test_microscope_window(qtbot, bundle):
     w.b_stop.click()
     qtbot.waitUntil(lambda: not bundle.stage.moving, timeout=5000)
     qtbot.waitUntil(lambda: "halted" in w.log.toPlainText() or "Halted" in w.log.toPlainText(), timeout=5000)
-    # disable: back to the SEM PC (#STAGE OFF, the trackball works); a running move is stopped
+    qtbot.waitUntil(lambda: not bundle.stage.busy and sim.sem["STAGE"] == "OFF", timeout=5000)
+    # during a move: controls greyed out, a second move refused; afterwards the SEM PC has the stage
     d = w.open_move_dialog("X")
     d.rb_rel.setChecked(True)
-    d.val.setValue(20000.0)
+    d.val.setValue(3000.0)
     d.accept()
     qtbot.waitUntil(lambda: bundle.stage.moving, timeout=5000)
-    w.b_enable.click()
-    qtbot.waitUntil(lambda: sim.sem["STAGE"] == "OFF" and not bundle.stage.moving, timeout=8000)
-    assert bundle.stage.hand_control and not w.g_jog.isEnabled() and "SEM PC" in w.b_enable.text()
+    qtbot.waitUntil(lambda: not w.g_jog.isEnabled() and "MOVING" in w.l_move.text(), timeout=2000)
+    assert w.move({"X": 10}, relative=True) is None and w.open_move_dialog("X") is None
+    qtbot.waitUntil(lambda: not bundle.stage.busy and sim.sem["STAGE"] == "OFF", timeout=20000)
+    qtbot.waitUntil(lambda: w.g_jog.isEnabled() and "SEM PC" in w.l_move.text(), timeout=2000)
     # stage auto-read on / off (stored)
     w.cb_poll.setChecked(True)
     assert bundle.stage.polling and bundle.settings.stage_polling is True
@@ -218,4 +219,66 @@ def test_beam_preset_dialog(qtbot, bundle, monkeypatch):
     d.delete_selected()
     assert [p["name"] for p in bundle.settings.beam_presets] == ["EDS high current"]
     d.close()
+    w.close()
+
+
+def test_stage_move_wait_dialog(qtbot, bundle):
+    """Programmed moves: a modal dialog until the move ends; STOP from the dialog; a second move refused."""
+    from easyebl.microscope import StageBusy
+    from easyebl.microscope.movewait import StageMoveDialog, run_blocking_move
+
+    stage = bundle.stage
+    x0 = stage.positions["X"]
+    pos = run_blocking_move(stage, {"X": 200.0}, relative=True)
+    assert pos["X"] == pytest.approx(x0 + 200.0, abs=0.5) and not stage.busy
+    assert stage.settling is None  # the move ended after the simulated X correction (settle_tol 0.5 µm)
+    # STOP from the dialog of a move started elsewhere (e.g. a worker thread)
+    fut = stage.move({"X": 20000.0}, relative=True)
+    d = StageMoveDialog(stage, fut, "X by +20000 µm")
+    qtbot.addWidget(d)
+    d.open()
+    with pytest.raises(StageBusy):
+        stage.move({"Y": 10.0}, relative=True)
+    qtbot.waitUntil(lambda: stage.moving, timeout=5000)
+    d.b_stop.click()
+    qtbot.waitUntil(lambda: fut.done(), timeout=15000)
+    qtbot.waitUntil(lambda: not d.isVisible(), timeout=2000)
+    assert d.stopped and d.result() == 0 and not stage.busy
+
+
+
+def test_sem_scan_mode_is_read_back(qtbot, bundle):
+    """R SCAN (answered by the S-3000 though not in its manual): the window shows the SEM's own scan mode;
+    nothing is set on connect."""
+    from easyebl.microscope.gui import MicroscopeWindow
+
+    sim = bundle.link.session.simulator
+    assert sim.sem["SCAN"] == "F" and bundle.sem.state.get("scan") == "F"  # read on start, not changed
+    assert not any(ln.startswith("SCAN") for ln in sim.received)
+    sim.sem["SCAN"] = "1"  # set on the SEM's own panel
+    bundle.sem.refresh(["SCAN"]).result(10)
+    w = MicroscopeWindow(bundle.link, bundle.sem, bundle.stage, bundle.settings, owns_link=False)
+    qtbot.addWidget(w)
+    qtbot.waitUntil(lambda: w.scan_combo.currentText() == "Slow scan 1", timeout=5000)
+    w.scan_combo.setCurrentIndex(w.scan_combo.findData("2"))
+    w.scan_combo.activated.emit(w.scan_combo.currentIndex())
+    qtbot.waitUntil(lambda: sim.sem["SCAN"] == "2", timeout=5000)
+    w.close()
+
+
+def test_auto_gun_alignment_button(qtbot, bundle, monkeypatch):
+    from PySide6 import QtWidgets
+
+    from easyebl.microscope.gui import MicroscopeWindow
+
+    sim = bundle.link.session.simulator
+    w = MicroscopeWindow(bundle.link, bundle.sem, bundle.stage, bundle.settings, owns_link=False)
+    qtbot.addWidget(w)
+    w.confirm = True
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *a, **k: QtWidgets.QMessageBox.No)
+    w.b_aga.click()  # declined: nothing sent
+    assert "AGA ON" not in sim.received
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *a, **k: QtWidgets.QMessageBox.Yes)
+    w.b_aga.click()
+    qtbot.waitUntil(lambda: "AGA ON" in sim.received, timeout=5000)
     w.close()

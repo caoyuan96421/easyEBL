@@ -53,6 +53,8 @@ READ_COMMANDS: dict[str, str] = {
     "AREAP Y": "Area analysis Y position",
     "AREAI X": "Area analysis X size",
     "AREAI Y": "Area analysis Y size",
+    # not in the manual's list, but answered by the S-3000 ("R SCAN 1 G0"; checked 2026-11-25)
+    "SCAN": "Scan mode (F, S, 1-4, R as for SCAN)",
 }
 
 #: Magnifications exactly as printed in the source table (manual section 8).

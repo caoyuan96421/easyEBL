@@ -34,7 +34,7 @@ __all__ = ["SEMControl", "STATUS_ITEMS", "ALL_ITEMS", "POLL_LEVELS", "MAGNIFICAT
 
 #: read on start and by "Refresh"
 ALL_ITEMS = ("HV", "MAG", "WD", "EMI", "BEAM C", "BEAM F", "FOCUS C", "FOCUS F", "STG X", "STG Y",
-             "CONT", "BRT", "RUN", "INPUTS AF")
+             "CONT", "BRT", "RUN", "INPUTS AF", "SCAN")
 #: the readbacks that matter most to imaging / EDS
 STATUS_ITEMS = ("MAG", "HV", "WD")
 #: background-read priority levels (easyebl.microscope.poll; each level is read half as often as the
@@ -52,7 +52,8 @@ SCAN_MODES = C.SCAN_MODES  # {"F": "TV scan 1", …}
 # readback item -> state key
 _KEYS = {"HV": "hv_kv", "MAG": "mag", "WD": "wd_readback_mm", "EMI": "emission", "BEAM C": "beam_coarse",
          "BEAM F": "beam_fine", "FOCUS C": "focus_coarse", "FOCUS F": "focus_fine", "STG X": "stig_x",
-         "STG Y": "stig_y", "CONT": "contrast", "BRT": "brightness", "RUN": "running", "INPUTS AF": "detector"}
+         "STG Y": "stig_y", "CONT": "contrast", "BRT": "brightness", "RUN": "running", "INPUTS AF": "detector",
+         "SCAN": "scan"}
 _LIMITS = {"focus_coarse": (0, 16383), "focus_fine": (0, 4095), "stig_x": (0, 4095), "stig_y": (0, 4095),
            "beam_coarse": (0, 99), "beam_fine": (0, 99), "contrast": (0, 4095), "brightness": (0, 4095)}
 #: what a beam preset holds (state key -> readback item), in the order a recall sends them
@@ -74,6 +75,8 @@ def _parse(item: str, data: str) -> dict:
         return {"mag": C.MAG_VALUES.get(d.lower())}
     if item == "RUN":
         return {"running": d.upper() == "ON"}
+    if item == "SCAN":
+        return {"scan": d.upper()}
     if item == "INPUTS AF":
         inv = {v: k for k, v in C.SIGNAL_TOKENS.items()}
         return {"detector": inv.get(d.upper(), d)}

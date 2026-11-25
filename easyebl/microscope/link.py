@@ -72,6 +72,9 @@ class MicroscopeLink:
         self._error: str | None = None
         self._busy: _Request | None = None
         self.completed = 0
+        #: set while a job reserves the port for itself (a stage move): what it is; the background
+        #: reads pause, other requests wait in the queue until it ends
+        self.exclusive: str | None = None
         self.executed: list[tuple[int, str]] = []  # (priority, what) – last 200, for tests and the log
         self._closed = threading.Event()
         self._worker = threading.Thread(target=self._run, name="easyebl-microscope", daemon=True)

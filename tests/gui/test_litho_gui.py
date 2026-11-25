@@ -213,6 +213,7 @@ def test_beam_then_field_calibration_from_the_menu(win, qtbot, monkeypatch):
     assert win.run_beam_calibration()
     bw = _waits(qtbot, lambda: win.beamcal_window)
     assert bw.isVisible() and "X scale" in bw.numbers.text() and "+2" in bw.numbers.text()
+    assert bw._img.image.shape == (800, 800)  # the full image, not binned
     assert win.hw.z == 11.0 and win.beamcal() is None  # not before Accept
     bw.b_accept.click()
     assert win.wait(30)
@@ -387,3 +388,16 @@ def test_field_calibration_in_the_program(ui, qtbot):
     assert w.calibration is not None, w.log_box.toPlainText()
     assert np.allclose(w.calibration.stage_to_beam, np.asarray(SIM_STAGE_TO_BEAM), atol=5e-3)
     assert mic.stage.positions["X"] == pytest.approx(300.0, abs=0.5)
+
+
+def test_sem_center_with_stage_in_the_program(ui, qtbot):
+    """Right click → Center with stage: the stage moves by the click's offset through the configured mirror."""
+    sem = ui.open("sem")
+    st = ui.backend.microscope.stage
+    assert sem.stage_mirror == (True, False) and sem._stage() is st
+    st.refresh(("X", "Y")).result(30)
+    x0, y0 = st.positions["X"], st.positions["Y"]
+    c = sem.engine.config.center_um
+    sem.center_with_stage(c[0] + 4.0, c[1] - 3.0)  # behind the modal stage dialog, which closes itself
+    assert st.positions["X"] == pytest.approx(x0 - 4.0, abs=0.5) and st.positions["Y"] == pytest.approx(y0 - 3.0,
+                                                                                                        abs=0.5)

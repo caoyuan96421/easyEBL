@@ -121,14 +121,20 @@ Open → *SEM imaging*.  The window looks and works like a commercial SEM screen
 * **Capture** (F9): photo scan at its own size, speed and integration. Saved automatically as a 16‑bit TIFF (raw volts), a PNG, a PNG with the data bar, and JSON metadata.
 * **Contrast / Brightness**, **Auto C/B** (Ctrl+A, one-shot or continuous), and running **averaging**.
 * **Field of view** group: **size** (the swept range), **position** (beam shift) and **rotation**.  The
-  mouse wheel on the image zooms by changing the swept range (×2 per three notches; Ctrl+± / Ctrl+0) – the
-  column magnification is never touched; zooming out stops at the full field of view.  Drag the image to
-  pan, double-click a point to centre it.  The inset in the lower-left corner shows the scanned region
-  within the full field.
-* **Measure** (toolbar, M): drag a line on the image; its length is shown on the line and, with Δx, Δy
-  and the angle, in the status bar.  While measuring, dragging draws instead of panning.  The line is
-  kept in field µm, so it stays on its feature while the scan pans or zooms; switching Measure off
-  removes it.
+  inset in the lower-left corner shows the scanned region within the full field.
+* **Mouse on the image**:
+  - **left drag** – the measuring line: its length is shown on the line and, with Δx, Δy and the
+    angle, in the status bar; it is kept in field µm, so it stays on its feature while the scan pans
+    or zooms.  A click without a drag clears it.
+  - **Shift + left drag** – pans the scanned region (beam shift); the image follows the mouse.
+  - **Shift + wheel** – zooms the scanned region (the swept range, ×2 per three notches; Ctrl+± /
+    Ctrl+0) – the column magnification is never touched; zooming out stops at the full field of view.
+  - **wheel** – digital zoom of the image itself about the cursor, down to single pixels (a 5000 ×
+    5000 capture can be inspected pixel by pixel); **middle drag** pans the zoomed image.
+  - **right click** – *Center with beam* (beam shift to the clicked point), *Center with stage* (the
+    stage moves the clicked point to the image centre, through the stage mirror of Hardware →
+    Configure…, behind the modal stage dialog), *Clear measurement*, *Reset to Full FoV* (the full
+    beam field and no digital zoom).
 * **Data bar** with the scale bar, the image magnification (the column's magnification is that of the
   full field of view; zooming in multiplies it by full field / scan width) and date. There is also a
   scan-line marker during slow scans.
@@ -277,10 +283,17 @@ S-3000. On top of it:
   S0 is sent at once, also while a long SEM command holds the port, and a move that is being sent
   at that moment is halted too.  Negative coordinates stay disabled until their encoding is checked
   on the instrument.
-* **Who drives the stage.** By default the **SEM PC** has it (`#STAGE OFF`: its trackball works and
-  it decides about motor power).  Positions are still read – each read sends `#STAGE ON`, the query
-  and `#STAGE OFF`.  `engage()` (`#STAGE ON`) gives easyEBL the stage for moves; `release()` stops
-  any move and hands it back.
+* **Who drives the stage.** The **SEM PC** has it between requests (`#STAGE OFF`: its trackball
+  works).  Each position read sends `#STAGE ON`, the query and `#STAGE OFF`.  A **move** is one
+  exclusive job on the port: `#STAGE ON`, the legs (backlash clearing included), the wait until
+  every axis has stopped, the wait until every commanded axis *reads* within tolerance of its
+  setpoint (X / Y / Z 0.5 µm, R / T 0.01°: X / Y keep correcting on their encoders for seconds
+  after reporting stopped – up to 30 s, then the move fails; Z / R / T do not correct, so one left
+  off fails at once), `S2` (motors free – the worm gears hold the stage)
+  and `#STAGE OFF` – also when it fails or is stopped.  Meanwhile SEM settings wait in line and go
+  out after the move, the background reads pause, and a second move is refused (`StageBusy`);
+  only STOP gets through.  Subsystems that move the stage on their own show the modal wait dialog
+  of `easyebl.microscope.movewait` (`run_blocking_move`, `StageMoveDialog`, with STOP).
 * **Wiring.** Imaging and EDS use the column through `MicroscopeControl`.  `FieldScale`
   (`microscope/coupling.py`) keeps the DAQ field at `K / magnification` (the global field calibration,
   see the SEM window); zooming keeps the scan's share of the field.  EDS takes the
@@ -289,7 +302,10 @@ S-3000. On top of it:
   the right a big **STOP ALL** (also *Esc*), the **Enable / Disable** button (easyEBL or the SEM PC
   drives the stage), a digital readout of X, Y, Z, R (and T) – double-click a value to move that
   axis to / by a value – the X/Y/Z/R/T jogs, and the raw TX/RX log.  On the
-  real instrument, HV switching, automatic routines and moves ask for confirmation.
+  real instrument, HV switching, automatic routines and moves ask for confirmation.  Automatic
+  routines: auto focus (coarse / fine), auto stigma, ABC and **Auto gun alignment** (`AGA ON`, in the
+  beam current group).  The SEM's own scan mode is read back (`R SCAN`: answered by the S-3000
+  although its manual does not list it) and shown in the display group.
 * **Beam presets** (*Beam presets…* in the toolbar or *Presets…* in the beam group): any number of
   named settings of beam 1 coarse / fine, stigmator X / Y and contrast / brightness.  *Save current…*
   reads the six values fresh from the SEM; *Recall* (or double-click) sends them, after checking all

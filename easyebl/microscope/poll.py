@@ -22,6 +22,7 @@ Settings and moves (higher link priorities) wait at most for the read in progres
 """
 from __future__ import annotations
 
+import concurrent.futures
 import threading
 import time
 from dataclasses import dataclass, field
@@ -118,7 +119,8 @@ class Poller:
     # ------------------------------------------------------------------ loop
     def _loop(self) -> None:
         while not self._stop.is_set():
-            t = self._next() if self.link.connected else None
+            # nothing is queued behind an exclusive job (a stage move): its result could wait for minutes
+            t = self._next() if self.link.connected and not self.link.exclusive else None
             if t is None:
                 self._stop.wait(0.25)
                 continue
@@ -136,10 +138,20 @@ class Poller:
             except RuntimeError:  # link closed
                 return
             ok = True
-            try:
-                fut.result(timeout=120)
-            except Exception:  # noqa: BLE001 - failed / cancelled / timed out
-                ok = False
+            deadline = time.monotonic() + 120
+            while True:
+                try:
+                    fut.result(timeout=1.0)
+                    break
+                except concurrent.futures.TimeoutError:
+                    if self.link.exclusive:  # waiting behind a stage move is not a failure
+                        deadline = time.monotonic() + 120
+                    if time.monotonic() > deadline or self._stop.is_set():
+                        ok = False
+                        break
+                except Exception:  # noqa: BLE001 - failed / cancelled
+                    ok = False
+                    break
             now = time.monotonic()
             a = self.ALPHA
             if "dt" in box:  # it ran (an explicit read of the same key may have served it instead)

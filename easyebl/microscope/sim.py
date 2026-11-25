@@ -3,7 +3,8 @@
 The vendored :class:`~easyebl.microscope.s3000.SimulatedInstrument` answers
 both protocols exactly as the S-3000 did on the bench.  Here it also gets the
 instrument's *response time* (a delay before every reply, SEM and stage
-alike – the real SEM needs 0.25–1 s), and a plausible starting state: HV on at
+alike – the real SEM needs 0.25–1 s), the late X / Y correction (the stage
+reports "stopped" about 1 µm short and closes in over a second), and a plausible starting state: HV on at
 20 kV, ×1k, WD 15 mm, the stage near the positions read on the instrument,
 ``#STAGE`` off (the HAL switches it on).
 """
@@ -29,10 +30,13 @@ class SlowSimulatedInstrument(SimulatedInstrument):
 
 
 def simulated_session(command_delay_s: float = 0.25, stage_speed_pulses_s: float = 25.6 * 2000,
-                      hv_on: bool = True, hv_kv: str = "20.0", mag: str = "1k") -> Session:
+                      hv_on: bool = True, hv_kv: str = "20.0", mag: str = "1k",
+                      settle_error_um: float = 1.0, settle_time_s: float = 1.0) -> Session:
     """A :class:`Session` on the simulator (shared port), with realistic timing and state."""
     sim = SlowSimulatedInstrument(SimOptions(command_delay=float(command_delay_s), stage_speed=stage_speed_pulses_s,
-                                             auto_delay=max(0.3, 4 * command_delay_s)))
+                                             auto_delay=max(0.3, 4 * command_delay_s),
+                                             settle_error_pulses=int(round(settle_error_um * 25.6)),
+                                             settle_time_s=float(settle_time_s)))
     sim.sem["HV_SET"] = hv_kv
     sim.sem["HV_ON"] = bool(hv_on)
     sim.sem["HV"] = hv_kv if hv_on else "OFF"
