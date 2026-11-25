@@ -2,7 +2,7 @@
 
 :class:`BackendHardware` drives the shared backend:
 
-* stage – :class:`~easyebl.microscope.stage.StageControl` (taken from hand control for a move);
+* stage – :class:`~easyebl.microscope.stage.StageControl` (X, Y, Z; every move behind the modal wait dialog);
 * magnification – the SEM (the field follows through the global field calibration);
 * beam condition – the microscope module's beam presets (never HV, never the beam itself);
 * marks – the SEM imaging window: the scan zooms onto the predicted mark (beam shift + scan
@@ -66,7 +66,10 @@ class GuiBridge(QtCore.QObject):
 
 class BackendHardware(LithoHardware):
     def __init__(self, engine, manager, bundle, bridge: GuiBridge, open_sem=None, parent_widget=None,
-                 owner: str = "litho", progress=None):
+                 owner: str = "litho", progress=None, axes=None):
+        from ..coords import S3000_AXES
+
+        self.axes = axes or S3000_AXES  # Hardware → Configure… → Microscope
         self.engine = engine
         self.manager = manager
         self.bundle = bundle
@@ -76,11 +79,29 @@ class BackendHardware(LithoHardware):
         self.progress = progress
         self.handle = manager.get_handle(owner) if manager is not None else None
         self.status = lambda text: None  # set by the window (what the run waits for)
+        self.move_dialog = None  # the "Stage moving" dialog while a programmed move runs
+        self.move_dialogs = 0  # how many were shown
 
     # ---------------------------------------------------------------- stage
     @property
     def stage(self):
         return self.bundle.stage if self.bundle is not None else None
+
+    def stage_axes(self):
+        return self.axes
+
+    def stage_z(self):
+        st = self.stage
+        z = st.positions.get("Z") if st is not None else None
+        return None if z is None else float(z)
+
+    def working_distance_mm(self):
+        sem = getattr(self.bundle, "sem", None) if self.bundle is not None else None
+        try:
+            wd = sem.working_distance_mm() if sem is not None else None
+        except Exception:  # noqa: BLE001
+            wd = None
+        return None if wd is None else float(wd)
 
     def stage_position(self):
         st = self.stage
@@ -99,14 +120,54 @@ class BackendHardware(LithoHardware):
             raise RuntimeError("the stage position is not known")
         return pos
 
-    def move_stage(self, x, y):
+    def move_stage(self, x, y, z=None):
+        """One programmed move (one-way approach in X / Y; Z too when given), behind the modal "Stage moving" dialog of
+        the microscope module: it blocks the user's interaction until the move ends and has STOP.
+        A move already in progress (e.g. the user's) is waited for first.  Abort stops the stage."""
+        from ...microscope import StageBusy
+
         st = self.stage
         if st is None:
             raise RuntimeError("no stage (microscope not connected)")
-        if st.hand_control:
-            st.engage().result(30)
-        self.status(f"stage moving to ({x:.1f}, {y:.1f}) µm")
-        st.move({"X": x, "Y": y}).result(st.move_timeout_s + 30)
+        self._wait_not_busy(st)
+        where = f"({x:.1f}, {y:.1f}" + (f", Z {z:.1f}" if z is not None else "") + ") µm"
+        self.status(f"stage moving to {where}")
+        targets = {"X": float(x), "Y": float(y)}
+        if z is not None:
+            targets["Z"] = float(z)
+        try:
+            fut = st.move(targets)
+        except StageBusy as e:
+            raise RuntimeError(f"stage busy: {e}") from e
+        self.bridge.call(lambda done: self._show_move(st, fut, f"lithography: to {where}", done), on_cancel=st.stop)
+        fut.result(st.move_timeout_s + 30)  # the final positions, or the move's error
+
+    def _wait_not_busy(self, st, timeout: float | None = None):
+        if not st.busy:
+            return
+        self.status("waiting for another stage move to end")
+        t = 0.0
+        limit = st.move_timeout_s if timeout is None else timeout
+        while st.busy:
+            if self.bridge.cancelled.is_set():
+                raise RuntimeError("aborted while another stage move was in progress")
+            if t >= limit:
+                raise RuntimeError("another stage move did not end")
+            threading.Event().wait(0.1)
+            t += 0.1
+
+    def _show_move(self, st, fut, description, done):
+        """(GUI thread) The modal wait dialog until *fut* is done; then resolves *done*."""
+        from ...microscope.movewait import StageMoveDialog
+
+        if not fut.done():
+            d = StageMoveDialog(st, fut, description, self.parent)
+            self.move_dialog = d
+            self.move_dialogs += 1
+            d.exec()
+            self.move_dialog = None
+            d.deleteLater()
+        done.set_result(True)
 
     # ---------------------------------------------------------------- column
     def magnification(self):
@@ -174,11 +235,11 @@ class BackendHardware(LithoHardware):
                     if sem is None:
                         raise RuntimeError("cannot open the SEM imaging window")
                     self._sem = sem
-                    self.engine.set_field_of_view(r.view_um, center_um=r.predicted_bcs)
+                    self.engine.set_field_of_view(r.view_um, center_um=r.predicted_xcs)
                     self.engine.run()
-                    sem.request_pick(f"{r.label} (stage {r.nominal_scs[0]:.1f}, {r.nominal_scs[1]:.1f} µm) – "
+                    sem.request_pick(f"{r.label} (CCS {r.ccs[0]:.2f}, {r.ccs[1]:.2f} µm) – "
                                      "predicted at the cross",
-                                     lambda xy: fut.done() or fut.set_result(xy), targets=[r.predicted_bcs])
+                                     lambda xy: fut.done() or fut.set_result(xy), targets=[r.predicted_xcs])
 
                 def cancel():
                     sem = getattr(self, "_sem", None)

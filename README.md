@@ -304,115 +304,121 @@ windows.  Only the simulator has been used so far; see
 ## Lithography
 
 *Open → Lithography* is the e-beam lithography module.  Its window plots the **stage
-coordinates (SCS, µm)**.  It shows:
+coordinates (SCS, µm)**, drawn the same way round as the SEM image (*View → Show as the SEM
+image*).  It shows:
 
-- every field of the schedule: its field of view (dashed), its pattern where it will be
-  written, and the selected field highlighted;
-- the selected field's **WCS** drawn as a shifted Cartesian grid with x/y axes, rotated and
-  stretched once a Global Align is known;
+- every chip: its CCS origin and x / y axes (nominal, or as measured by a Global Align);
+- every field of every Exposure: its field of view (dashed), its pattern where the chip map puts
+  it, and the selected step's fields highlighted;
 - the alignment markers (Global: magenta, Local: cyan);
 - the named stage positions, and the stage with its current field of view (green).
 
-The status bar shows the global alignment and the last field's transform.
+The status bar shows the selected chip's alignment, the beam and field calibrations for the
+column condition now, and the last field's map.
 
-* **Coordinates.**
-  - WCS is per field: (0, 0) is the field centre's stage position, and the pattern's GDS cell
-    coordinates are WCS.
-  - BCS (the deflection field) is internal: a field is written through `bcs = A·wcs + t`.
-    `A` comes from the last Global Align and is kept until the next one, a magnification
-    change included.  Without a Global Align, `A` is the field calibration's correction
-    (see below), or the identity.  `t` comes from this field's Global Align or Local XY, and is
-    0 otherwise.
-  - The **stage → beam map** `B` links stage and beam: a stage move `d` moves the sample by
-    `−B·d` in the field.  Without a field calibration it is nominal: the axes of *Stage
-    settings…* (mirroring), parallel, equal scale.
-* **Field calibration** (*Field → Field calibration settings…*, *Run field calibration now*,
-  or a *Field correction* step):
-  1. The stage goes to a fixed position with a structured feature (e.g. the Faraday cup).
-  2. A reference image is taken, then one at each of a 3 × 3 grid (or a 5-point cross) of
-     stage shifts of ±30 % of the field.
-  3. Each image's shift is measured by phase correlation (sub-pixel, upsampled DFT).
-  4. A least-squares fit gives `B`: the rotation between stage and beam axes, mirroring, and
-     the field's scale error against the global field calibration (typically ±1 %).  The
-     stage is the length reference.
+### Coordinates
 
-  The result applies to the lithography only (not imaging or EDS), and only at the
-  magnification and beam preset it was measured at.  It is used for: the fields written
-  without a Global Align (through `B·M`), the centres corrected by a Global Align, and the
-  stage view.  The status bar shows it, orange when the column condition has changed.  A fit
-  with a large residual is refused, e.g. featureless images or a stage that does not land
-  where it reports.  Validate warns for every field without a valid calibration.
-* **Stage moves.**
-  - X and Y always end travelling in + by at least the *X/Y approach* distance (default
-    50 µm; Microscope window, Jog), to clear the backlash.  A move that would end going −
-    overshoots and comes back.  This applies to every stage move, not only the schedule's.
-  - During a run, each move is checked against the freshly read position.  A step fails
-    when the stage is farther than the *position tolerance* (Stage settings…, default 1 µm).
-  - *Schedule*: new, open, save, validate, run, pause, abort, reset the global alignment.
-  - *Field*: add an Expose field, Column setting or Field correction; duplicate, delete,
-    reorder; *Move all fields…*.
-  - *Import*: a fractured GDS, or a GDS cell as a new field.
-  - *View*: zoom, the selected field's WCS grid, the side panel and messages.
-  - *Field* also: field calibration settings, run it now, forget it.
-  - *Stage*: go to the selected field, store the stage position, stage settings (axes,
-    position tolerance).
-* **Move… (right click on the plot, or Field → Move all fields…)** moves all fields as a whole,
-  markers included.  It takes one reference point to a target:
-  - reference: the first field's centre, the centre of the bounding box of all fields, or
-    marker 1 of the first field with Global Align;
-  - target: the current stage position, the clicked position, or a typed stage coordinate.
-* **Stage Positions** tab: named stage positions (calibration sample, Faraday cup …).  Add the
-  current stage position, go to one, or put a new field there.  They are saved in
+| frame | meaning |
+|---|---|
+| GDS | an Exposure's GDS file, top-level cell coordinates (µm) |
+| CCS | chip coordinates: GDS + the Exposure's offset (no rotation), axes as in the SEM image |
+| FCS | field coordinates: CCS − the field centre |
+| SCS | stage coordinates (encoder read-back) |
+| BCS | true µm of the nominal beam position along the scan axes, from the field centre |
+| XCS | scanner coordinates: deflection volts ÷ (V/µm) of the global field calibration (field = K / mag) |
+
+| step | map | from |
+|---|---|---|
+| CCS → SCS | `scs = G(ccs) = A_g·ccs + t_g` | nominal: `A_g = M` (stage mirror), `t_g` = chip origin; Global Align: 2 markers rotation + scale + shift, 3–4 affine; kept for every later Exposure on the chip |
+| field target | `s_f = G(c_f)`; `ŝ` = its read-back | |
+| FCS → BCS | `bcs = B·(A_g·fcs + G(c_f) − ŝ + δ_f)` | `B`: the field calibration's rotation (with `M`); `δ_f`: the field's Local marker (SCS) |
+| BCS → XCS | `xcs = L⁻¹·bcs·(1 − k·∣bcs∣²)`, the one-step inverse of `bcs = D(L·xcs)` | beam calibration: `L` = X / Y scale and shear, `k` pincushion |
+| XCS → volts | `V = xcs · 2V_fs / field` | the global field calibration (SEM window) |
+
+Marker picking runs the chain backwards with the same maps (the clicked XCS → BCS → SCS), so
+within a field `L` and `B` cancel between measuring and writing.  Without alignment the
+pattern is written with the beam calibration's scale / shear / distortion and the field
+calibration's rotation; with alignment the scale, shear, rotation and shift come from the
+alignment, the distortion from the beam calibration, and the field calibration places the
+later fields.
+
+The stage mirror is a hardware setting: *Hardware → Configure… → Devices → Microscope*
+(S-3000: mirror X on, Y off).
+
+### Calibrations (menu *Calibration*)
+
+Run the beam calibration first, then the field calibration, at the same condition.
+
+* **Beam calibration** (*Beam calibration settings…*, *Run beam calibration now*): the stage goes
+  to a named stage position (X, Y **and Z**) on a calibration sample with a 1 µm square grid, and
+  one image is taken over the whole field at ≤ 0.1 µm pixels (5000 × 5000 for 500 µm).  The grid's
+  two lattice frequencies are demodulated and their phases fitted for the X / Y scale, shear and
+  pincushion `k` (the grid's rotation and shift are fitted and dropped).  A window shows the
+  image, the numbers, the fit residual and a map of the beam position error over the field;
+  *Accept* keeps it, saved in `litho.json`, for its condition: **magnification and WD** (the WD
+  computed from the focus, ±0.1 mm).  The one-step inverse leaves an error of about 3·k²·r⁵
+  (≈ 40 nm at the field edge for 0.8 µm of distortion there).
+* **Field calibration** (*Field calibration settings…*, *Run field calibration now*, or a *Field
+  calibration* step): a reference image at a fixed stage position with a structured feature,
+  then one at each of a 3 × 3 grid (or 5-point cross) of stage shifts of ±30 % of the field;
+  the shifts (phase correlation, sub-pixel), converted to BCS through the beam calibration,
+  give `B`.  Its rotation is used; its scale (stage encoder against the grid) is a check.  A
+  window shows the progress and the result (rotation, scale, stretch, shear, drift, residuals,
+  a table and a plot); *Accept* uses it, *Discard* drops it (and stops a run).  Each image is
+  matched for every mirroring, so a wrong mirror setting shows as a mismatch, pointing to the
+  hardware setting.  Valid for the **magnification, beam preset and WD** it was measured at and
+  the beam calibration it went through (this window session only).
+
+### Stage
+
+- X and Y always end travelling in + by at least the *X/Y approach* distance (default 50 µm;
+  Microscope window, Jog), to clear the backlash.  Every move then waits until each moved axis
+  reads within tolerance of its setpoint (X / Y / Z 0.5 µm, R / T 0.01°).
+- Every stage move of the lithography (schedule, calibrations, *Go to*) shows the modal *Stage
+  moving* dialog (live positions, STOP); a move already in progress is waited for first, and
+  Abort stops the stage.
+- During a run, each move is checked against the freshly read position: a step fails when the
+  stage is farther than the *position tolerance* (Stage settings…, default 0.5 µm).
+
+### Tabs
+
+* **Stage Positions**: named positions X, Y, **Z** (calibration samples, Faraday cup …): add the
+  current stage, *Go to XYZ* / *Go to XY*, *Chip origin here*.  Saved in
   `%APPDATA%\easyEBL\litho.json` (`EASYEBL_LITHO_SETTINGS` overrides).
-* **Exposure Schedule** tab, with three step types:
-  - *Column setting*: a beam preset of the microscope module, or *Keep as is*; the
-    magnification (required: the field follows the global field calibration); and an optional
-    nominal current, used only for the dose readout.  A schedule always starts with one, which
-    cannot be deleted.
-  - *Field correction*: runs the field calibration (below) at the configured position, or at a
-    chosen named stage position.
-  - *Expose field*:
-    - **Field centre** (stage).  *Correct by the global alignment* moves to the centre
-      recomputed from the field of the last Global Align: its measured origin, plus the nominal
-      spacing between the centres transformed by the measured `A`.
-    - **Pattern**: a GDS file + cell (the cell is taken as centred), a dummy test pattern, or
-      none (alignment only).
-    - **Dose**: dwell per point and point step.  GDS dose factors multiply the dwell; the
-      equivalent µC/cm² is shown when the Column setting has a nominal current.
-    - **Global Align** (optional): 2–4 markers.  2 markers give rotation, scale and shift;
-      3–4 also give stretch and shear.
-    - **Local XY** (optional): one marker, shift only.
+* **Chips**: name, the nominal stage position of the CCS origin, the alignment, a note; *Add
+  chip* (at the stage), *Origin = stage*, *Move…* (a reference point – the origin, the first
+  field centre, the bounding-box centre or Global marker 1 – to the stage, a click or a typed
+  position), *Reset alignment*.
+* **Exposure Schedule**, three step types:
+  - *Column setting*: a beam preset of the microscope module (or *Keep as is*), the
+    magnification (the field follows the global field calibration), an optional nominal
+    current for the dose readout.  A schedule always starts with one.
+  - *Field calibration*: at the configured position or a named stage position.
+  - *Exposure*: a chip and a whole GDS file (top cell, layers, offset of the GDS origin in CCS).
+    Each top-level cell (the references placed by the top cell, array elements included) is one
+    field; its centre is the cell's bounding-box centre, or (checkbox) the cell's origin.
+    Dwell per point and point step (GDS dose factors multiply the dwell).  Markers are CCS
+    points: **Global Align** 2–4 markers, all inside one field's field of view – that field is
+    written first; **Local markers**, assigned automatically to the field whose field of view
+    holds them (nearest centre), at most one per field (*One per field…* puts one at the same
+    place in every field).  Wrong assignments are warnings.  Without a GDS file the step only
+    aligns.
 
-    Markers are WCS points (µm from the field centre), so they move together with their field.
-
-  *Validate* (and Run) warns about: patterns outside the field of view, markers outside the
-  field, unknown beam presets, and a field after a magnification change that has no Global
-  Align.  Schedules are JSON files (`*.ebls.json`, version 2); GDS paths are stored relative
-  to the file.
-* **Running.**  For each field:
-  1. The stage goes to the (corrected) centre.  The stage then stays put until the field is
-     exposed.
-  2. For each marker, the SEM imaging window zooms its scan onto the predicted position (beam
-     shift and scan width; the column magnification is not touched) and asks you to **click
-     the marker**.  Esc cancels, which aborts the run.
-  3. The SEM scan is stopped and the pattern is written with the vector-scan writer.
-
-  A pattern outside the field is skipped or aborts the run, as set in *Schedule settings*.
-* **Import fractured GDS…**: one Expose field per field of a GDS fractured into field-sized
-  cells (e.g. by BEAMER).  The fields are the references placed in the single top cell (array
-  elements included), or the top-level cells.
-  - The field centre is the stage position of the layout origin (entered, or the current stage)
-    plus the field's bbox centre.
-  - The pattern is the field recentred on its bbox centre.
-  - Optional Global Align markers go on the first field and a Local XY marker on every field,
-    both in WCS.
+  *Validate* (and Run) warns about: patterns outside the field of view, markers in no field or
+  two in one, Global markers not in one field, unknown chips or beam presets, missing beam or
+  field calibrations.  Schedules are JSON files (`*.ebls.json`, version 3) with the chips; GDS
+  paths are stored relative to the file.
+* **Running** an Exposure, field by field: the stage goes to the field's target; for each marker
+  the SEM imaging window zooms its scan onto the predicted position (beam shift and scan width)
+  and asks you to **click the marker** (Esc aborts); the SEM scan stops and the pattern is
+  written through the chain.  A pattern outside the field is skipped or aborts, as set in
+  *Schedule settings*.
 * **Demo files**: `python -m easyebl.litho.demo` writes them to `examples/litho/`:
-  - `multifield_demo.gds`: 3 × 3 fields of 80 µm on a 100 µm pitch.  Layer 1 is the pattern
-    (grating, dots, ring, line, label, corner marks); layer 2 has alignment crosses at
-    (±45, ±45) µm.
-  - `multifield_demo.ebls.json`: the import of that file at stage (5000, 5000) µm, with a
-    Global Align on the first field and Local XY on every field.
-  - `dummy_demo.ebls.json`: dummy patterns and an alignment-only field.
+  `multifield_demo.gds` (3 × 3 fields of 80 µm on a 100 µm pitch; layer 1 the pattern, layer 2
+  alignment crosses at (±45, ±45) µm), `multifield_demo.ebls.json` (chip at stage (5000, 5000) µm,
+  a Field calibration, one Exposure with Global Align in the first field and a Local marker in
+  every other) and `dummy_demo.ebls.json` (the GDS without alignment, then an alignment-only
+  Exposure).
 
 Not implemented yet: automatic marker finding (markers are clicked) and a measured beam
 current.  On the simulators the SEM image follows the simulated stage through a hidden

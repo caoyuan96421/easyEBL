@@ -1,14 +1,14 @@
-"""Side tabs of the litho window: Stage Positions and Exposure Schedule."""
+"""Side tabs of the litho window: Stage Positions, Chips and Exposure Schedule."""
 from __future__ import annotations
 
 import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..schedule import (KEEP_AS_IS, MAGNIFICATIONS, ColumnSetting, ExposeField, FieldCorrection, Operation,
-                        PatternSpec, dose_readout)
+from ..schedule import (KEEP_AS_IS, MAGNIFICATIONS, ORDERS, ColumnSetting, Exposure, FieldCorrection, Operation,
+                        dose_readout)
 
-__all__ = ["StagePositionsTab", "ScheduleTab", "OpEditor"]
+__all__ = ["StagePositionsTab", "ChipsTab", "ScheduleTab", "OpEditor"]
 
 STATE_COLORS = {"pending": None, "running": "#fd4", "done": "#5c5", "skipped": "#999", "failed": "#f55",
                 "aborted": "#f95"}
@@ -26,46 +26,75 @@ def _spin(value=0.0, lo=-1e9, hi=1e9, decimals=3, suffix=" µm", step=1.0) -> Qt
     return s
 
 
+def _pair(x, y, setter, decimals=3) -> QtWidgets.QWidget:
+    sx, sy = _spin(x, decimals=decimals), _spin(y, decimals=decimals)
+    w = QtWidgets.QWidget()
+    h = QtWidgets.QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.addWidget(sx)
+    h.addWidget(sy)
+    upd = lambda *_: setter((float(sx.value()), float(sy.value())))  # noqa: E731
+    sx.valueChanged.connect(upd)
+    sy.valueChanged.connect(upd)
+    w.spins = (sx, sy)
+    return w
+
+
+def _table(cols) -> QtWidgets.QTableWidget:
+    t = QtWidgets.QTableWidget(0, len(cols))
+    t.setHorizontalHeaderLabels(cols)
+    t.horizontalHeader().setStretchLastSection(True)
+    t.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+    t.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+    t.verticalHeader().setVisible(False)
+    return t
+
+
+def _selected_row(table) -> int:
+    rows = table.selectionModel().selectedRows()
+    return rows[0].row() if rows else -1
+
+
 # ====================================================================== stage positions
 class StagePositionsTab(QtWidgets.QWidget):
-    """Named SCS positions of fixed objects (calibration sample, Faraday cup …), saved at once."""
+    """Named stage positions (X, Y, Z) of fixed objects (calibration samples, Faraday cup …), saved at once."""
 
     changed = QtCore.Signal()
-    gotoRequested = QtCore.Signal(float, float)  # SCS µm
-    newFieldRequested = QtCore.Signal(float, float)  # an Expose field centred at this position (SCS)
+    gotoRequested = QtCore.Signal(float, float, object)  # SCS µm, Z (None: keep Z)
+    chipOriginRequested = QtCore.Signal(float, float)  # put a chip's CCS origin here
 
-    def __init__(self, settings, stage_position=None, parent=None):
+    def __init__(self, settings, stage_position=None, stage_z=None, parent=None):
         super().__init__(parent)
         self.settings = settings
         self.stage_position = stage_position or (lambda: None)  # () -> (x, y) | None
-        self.table = QtWidgets.QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Name", "X (µm)", "Y (µm)", "Note"])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.table.verticalHeader().setVisible(False)
+        self.stage_z = stage_z or (lambda: None)  # () -> z | None
+        self.table = _table(["Name", "X (µm)", "Y (µm)", "Z (µm)", "Note"])
         self.table.itemChanged.connect(self._edited)
         self.msg = QtWidgets.QLabel()
         self.msg.setWordWrap(True)
         b_cur = QtWidgets.QPushButton("Add current stage")
-        b_cur.setToolTip("a new position at the stage's current X / Y")
+        b_cur.setToolTip("a new position at the stage's current X, Y and Z")
         b_cur.clicked.connect(self.add_current)
         b_add = QtWidgets.QPushButton("Add…")
         b_add.clicked.connect(self.add_manual)
         self.b_del = QtWidgets.QPushButton("Delete")
         self.b_del.clicked.connect(self.delete_selected)
-        self.b_go = QtWidgets.QPushButton("Go to")
-        self.b_go.setToolTip("move the stage to the selected position")
-        self.b_go.clicked.connect(self._goto)
-        self.b_step = QtWidgets.QPushButton("New field here")
-        self.b_step.setToolTip("add an Expose field centred at the selected position to the schedule")
-        self.b_step.clicked.connect(self._new_field)
+        self.b_go = QtWidgets.QPushButton("Go to XYZ")
+        self.b_go.setToolTip("move the stage to the selected position, Z included (where stored)")
+        self.b_go.clicked.connect(lambda: self._goto(True))
+        self.b_go_xy = QtWidgets.QPushButton("Go to XY")
+        self.b_go_xy.setToolTip("move the stage to the selected X, Y; Z stays")
+        self.b_go_xy.clicked.connect(lambda: self._goto(False))
+        self.b_chip = QtWidgets.QPushButton("Chip origin here")
+        self.b_chip.setToolTip("put the CCS origin of the selected chip (Chips tab) at the selected position")
+        self.b_chip.clicked.connect(self._chip_origin)
         g = QtWidgets.QGridLayout()
         g.addWidget(b_cur, 0, 0)
         g.addWidget(b_add, 0, 1)
         g.addWidget(self.b_del, 0, 2)
         g.addWidget(self.b_go, 1, 0)
-        g.addWidget(self.b_step, 1, 1, 1, 2)
+        g.addWidget(self.b_go_xy, 1, 1)
+        g.addWidget(self.b_chip, 1, 2)
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(self.table, 1)
         lay.addLayout(g)
@@ -77,18 +106,15 @@ class StagePositionsTab(QtWidgets.QWidget):
         try:
             self.table.setRowCount(len(self.settings.stage_positions))
             for r, p in enumerate(self.settings.stage_positions):
-                for c, v in enumerate((p.name, f"{p.x:.2f}", f"{p.y:.2f}", p.note)):
+                vals = (p.name, f"{p.x:.2f}", f"{p.y:.2f}", "" if p.z is None else f"{p.z:.2f}", p.note)
+                for c, v in enumerate(vals):
                     self.table.setItem(r, c, QtWidgets.QTableWidgetItem(v))
         finally:
             self.table.blockSignals(False)
 
-    def _selected_row(self) -> int:
-        rows = self.table.selectionModel().selectedRows()
-        return rows[0].row() if rows else -1
-
-    def _selected_name(self) -> str:
-        r = self._selected_row()
-        return self.settings.stage_positions[r].name if 0 <= r < len(self.settings.stage_positions) else ""
+    def _selected(self):
+        r = _selected_row(self.table)
+        return self.settings.stage_positions[r] if 0 <= r < len(self.settings.stage_positions) else None
 
     def _save(self, text: str = "") -> None:
         try:
@@ -121,6 +147,8 @@ class StagePositionsTab(QtWidgets.QWidget):
                     p.x = v
                 else:
                     p.y = v
+            elif c == 3:
+                p.z = float(txt) if txt else None
             else:
                 p.note = txt
         except ValueError as e:
@@ -128,9 +156,9 @@ class StagePositionsTab(QtWidgets.QWidget):
             return self._error(str(e))
         self._save("saved")
 
-    def add(self, name: str, x: float, y: float) -> None:
+    def add(self, name: str, x: float, y: float, z: float | None = None) -> None:
         try:
-            self.settings.add_position(name, x, y)
+            self.settings.add_position(name, x, y, z)
         except ValueError as e:
             return self._error(str(e))
         self.refresh()
@@ -144,7 +172,7 @@ class StagePositionsTab(QtWidgets.QWidget):
         name, ok = QtWidgets.QInputDialog.getText(self, "Stage position", "Name:",
                                                   text=self.settings.unique_name())
         if ok:
-            self.add(name, *pos)
+            self.add(name, pos[0], pos[1], self.stage_z())
 
     def add_manual(self) -> None:
         d = QtWidgets.QDialog(self)
@@ -152,18 +180,23 @@ class StagePositionsTab(QtWidgets.QWidget):
         f = QtWidgets.QFormLayout(d)
         name = QtWidgets.QLineEdit(self.settings.unique_name())
         x, y = _spin(0, 0, 1e6, 2), _spin(0, 0, 1e6, 2)
+        z = _spin(0, 0, 1e6, 2)
+        zc = QtWidgets.QCheckBox("store Z")
+        zc.toggled.connect(z.setEnabled)
+        z.setEnabled(False)
         f.addRow("name", name)
         f.addRow("X", x)
         f.addRow("Y", y)
+        f.addRow(zc, z)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         bb.accepted.connect(d.accept)
         bb.rejected.connect(d.reject)
         f.addRow(bb)
         if d.exec() == QtWidgets.QDialog.Accepted:
-            self.add(name.text(), x.value(), y.value())
+            self.add(name.text(), x.value(), y.value(), z.value() if zc.isChecked() else None)
 
     def delete_selected(self) -> None:
-        r = self._selected_row()
+        r = _selected_row(self.table)
         if r < 0:
             return
         name = self.settings.stage_positions[r].name
@@ -171,17 +204,162 @@ class StagePositionsTab(QtWidgets.QWidget):
         self.refresh()
         self._save(f"deleted {name!r}")
 
-    def _new_field(self) -> None:
-        r = self._selected_row()
-        if r >= 0:
-            p = self.settings.stage_positions[r]
-            self.newFieldRequested.emit(p.x, p.y)
+    def _goto(self, with_z: bool) -> None:
+        p = self._selected()
+        if p is None:
+            return
+        if with_z and p.z is None:
+            self._error(f"{p.name!r} has no Z stored: moving X / Y only")
+        self.gotoRequested.emit(p.x, p.y, p.z if with_z else None)
 
-    def _goto(self) -> None:
-        r = self._selected_row()
-        if r >= 0:
-            p = self.settings.stage_positions[r]
-            self.gotoRequested.emit(p.x, p.y)
+    def _chip_origin(self) -> None:
+        p = self._selected()
+        if p is not None:
+            self.chipOriginRequested.emit(p.x, p.y)
+
+
+# ====================================================================== chips
+class ChipsTab(QtWidgets.QWidget):
+    """The schedule's chips: name, the nominal stage position of the CCS origin, the alignment."""
+
+    changed = QtCore.Signal()
+    resetRequested = QtCore.Signal(str)  # forget the chip's Global Align
+    moveRequested = QtCore.Signal(str)  # Move the chip… dialog
+    selectionChanged = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.schedule = None
+        self.stage_position = lambda: None
+        self.alignment = lambda name: ""  # () -> status text of a chip's CCS → SCS map
+        self.table = _table(["Name", "Origin X (µm)", "Origin Y (µm)", "Alignment", "Note"])
+        self.table.itemChanged.connect(self._edited)
+        self.table.itemSelectionChanged.connect(lambda: self.selectionChanged.emit(self.selected()))
+        self.msg = QtWidgets.QLabel()
+        self.msg.setWordWrap(True)
+        info = QtWidgets.QLabel("A chip has its own coordinates (CCS, the GDS top level of its Exposures + their "
+                                "offsets).  The origin is where CCS (0, 0) nominally is on the stage; a Global Align "
+                                "measures the real map, used by every later Exposure on the chip.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#9aa")
+        b_add = QtWidgets.QPushButton("Add chip")
+        b_add.setToolTip("a new chip with its origin at the current stage position (0, 0 if not known)")
+        b_add.clicked.connect(self.add_chip)
+        self.b_del = QtWidgets.QPushButton("Delete")
+        self.b_del.clicked.connect(self.delete_selected)
+        self.b_here = QtWidgets.QPushButton("Origin = stage")
+        self.b_here.setToolTip("put the selected chip's origin at the current stage position")
+        self.b_here.clicked.connect(self.origin_to_stage)
+        self.b_move = QtWidgets.QPushButton("Move…")
+        self.b_move.clicked.connect(lambda: self.selected() and self.moveRequested.emit(self.selected()))
+        self.b_reset = QtWidgets.QPushButton("Reset alignment")
+        self.b_reset.setToolTip("forget the selected chip's Global Align (back to the nominal origin)")
+        self.b_reset.clicked.connect(lambda: self.selected() and self.resetRequested.emit(self.selected()))
+        g = QtWidgets.QGridLayout()
+        g.addWidget(b_add, 0, 0)
+        g.addWidget(self.b_del, 0, 1)
+        g.addWidget(self.b_here, 0, 2)
+        g.addWidget(self.b_move, 1, 0)
+        g.addWidget(self.b_reset, 1, 1)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(info)
+        lay.addWidget(self.table, 1)
+        lay.addLayout(g)
+        lay.addWidget(self.msg)
+
+    def set_schedule(self, schedule) -> None:
+        self.schedule = schedule
+        self.refresh()
+
+    def refresh(self, select: str | None = None) -> None:
+        if self.schedule is None:
+            return
+        cur = select if select is not None else self.selected()
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self.schedule.chips))
+            for r, c in enumerate(self.schedule.chips):
+                vals = (c.name, f"{c.origin[0]:.3f}", f"{c.origin[1]:.3f}", self.alignment(c.name), c.note)
+                for k, v in enumerate(vals):
+                    it = QtWidgets.QTableWidgetItem(v)
+                    if k == 3:
+                        it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self.table.setItem(r, k, it)
+        finally:
+            self.table.blockSignals(False)
+        names = [c.name for c in self.schedule.chips]
+        if cur in names:
+            self.table.selectRow(names.index(cur))
+        elif names:
+            self.table.selectRow(0)
+
+    def selected(self) -> str:
+        r = _selected_row(self.table)
+        return self.schedule.chips[r].name if self.schedule is not None and 0 <= r < len(self.schedule.chips) else ""
+
+    def select(self, name: str) -> None:
+        names = [c.name for c in self.schedule.chips] if self.schedule is not None else []
+        if name in names:
+            self.table.selectRow(names.index(name))
+
+    def _error(self, text: str) -> None:
+        self.msg.setText(text)
+        self.msg.setStyleSheet("color:#f66")
+
+    def _ok(self, text: str) -> None:
+        self.msg.setText(text)
+        self.msg.setStyleSheet("")
+        self.changed.emit()
+
+    def _edited(self, item) -> None:
+        r, k = item.row(), item.column()
+        c = self.schedule.chips[r]
+        txt = item.text().strip()
+        try:
+            if k == 0:
+                self.schedule.rename_chip(c.name, txt)
+            elif k in (1, 2):
+                v = float(txt)
+                c.origin = (v, c.origin[1]) if k == 1 else (c.origin[0], v)
+            elif k == 4:
+                c.note = txt
+        except ValueError as e:
+            self.refresh()
+            return self._error(str(e))
+        self.refresh(select=c.name)
+        self._ok("")
+
+    def add_chip(self, origin=None) -> str:
+        pos = origin if origin is not None else (self.stage_position() or (0.0, 0.0))
+        c = self.schedule.add_chip(origin=pos)
+        self.refresh(select=c.name)
+        self._ok(f"added {c.name!r} at ({pos[0]:.2f}, {pos[1]:.2f}) µm")
+        return c.name
+
+    def delete_selected(self) -> None:
+        name = self.selected()
+        if not name:
+            return
+        used = [e for e in self.schedule.exposures if e.chip == name]
+        if used:
+            return self._error(f"{name!r} is used by {len(used)} Exposure(s)")
+        self.schedule.chips = [c for c in self.schedule.chips if c.name != name]
+        self.refresh()
+        self._ok(f"deleted {name!r}")
+
+    def set_origin(self, name: str, x: float, y: float) -> None:
+        c = self.schedule.chip(name)
+        if c is None:
+            return self._error("no chip selected (Chips tab)")
+        c.origin = (float(x), float(y))
+        self.refresh(select=name)
+        self._ok(f"{name}: origin at ({x:.2f}, {y:.2f}) µm")
+
+    def origin_to_stage(self) -> None:
+        pos = self.stage_position()
+        if pos is None:
+            return self._error("the stage position is not known")
+        self.set_origin(self.selected(), *pos)
 
 
 def mag_combo(value, setter=None) -> QtWidgets.QComboBox:
@@ -200,12 +378,37 @@ def mag_combo(value, setter=None) -> QtWidgets.QComboBox:
     return c
 
 
+def _layers_text(layers) -> str:
+    if layers is None:
+        return ""
+    return ", ".join(f"{x[0]}/{x[1]}" if isinstance(x, (tuple, list)) else str(x) for x in layers)
+
+
+def _parse_layers(text: str):
+    text = text.strip()
+    if not text:
+        return None
+    out = []
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "/" in part:
+            a, b = part.split("/", 1)
+            out.append((int(a), int(b)))
+        else:
+            out.append(int(part))
+    return out
+
+
 # ====================================================================== op editor
 class OpEditor(QtWidgets.QWidget):
     """Form for one operation; edits apply to the operation at once (``changed``).
 
-    The window sets the providers: ``presets()`` (beam preset names | None), ``cells(path)``
-    (cell names of a GDS file), ``current_for(op)`` (nominal current at that step | None)."""
+    The window sets the providers: ``presets()`` (beam preset names | None), ``positions()``
+    (stage position names), ``chips()`` (chip names), ``top_cells(path)``, ``current_for(op)``
+    (nominal current at that step | None), ``fields_info(op)`` (text about the Exposure's fields
+    and markers) and ``field_centres(op)`` (CCS centres of its fields)."""
 
     changed = QtCore.Signal()
     pickGdsRequested = QtCore.Signal()
@@ -214,10 +417,14 @@ class OpEditor(QtWidgets.QWidget):
         super().__init__(parent)
         self.op: Operation | None = None
         self.presets = lambda: None
-        self.positions = lambda: []  # () -> stage position names
-        self.cells = lambda path: []
+        self.positions = lambda: []
+        self.chips = lambda: []
+        self.top_cells = lambda path: []
         self.current_for = lambda op: None
+        self.fields_info = lambda op: ""
+        self.field_centres = lambda op: []
         self.readout = None
+        self.info = None
         self.lay = QtWidgets.QVBoxLayout(self)
         self.lay.setContentsMargins(4, 4, 4, 4)
         self.title = QtWidgets.QLabel("(no step selected)")
@@ -247,23 +454,14 @@ class OpEditor(QtWidgets.QWidget):
         form.addRow(label, s)
         return s
 
-    @staticmethod
-    def _pair(x, y, setter) -> QtWidgets.QWidget:
-        sx, sy = _spin(x, decimals=3), _spin(y, decimals=3)
-        w = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(w)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.addWidget(sx)
-        h.addWidget(sy)
-        upd = lambda *_: setter((float(sx.value()), float(sy.value())))  # noqa: E731
-        sx.valueChanged.connect(upd)
-        sy.valueChanged.connect(upd)
-        w.spins = (sx, sy)
-        return w
+    def refresh_info(self) -> None:
+        if self.info is not None and isinstance(self.op, Exposure):
+            self.info.setText(self.fields_info(self.op))
 
     def set_op(self, op: Operation | None) -> None:
         self.op = None
         self.readout = None
+        self.info = None
         self.msg.clear()
         self.body.setParent(None)
         self.body.deleteLater()
@@ -290,9 +488,10 @@ class OpEditor(QtWidgets.QWidget):
         en.toggled.connect(lambda on: self._set("enabled", bool(on)))
         top.addRow(en)
         if isinstance(op, FieldCorrection):
-            info = QtWidgets.QLabel("Field calibration: images at known stage shifts give the stage → beam map, valid "
-                                    "for the present magnification and beam preset (Field → Field calibration "
-                                    "settings… for how).")
+            info = QtWidgets.QLabel("Field calibration: images at known stage shifts give the stage → beam rotation, "
+                                    "valid for the present magnification, beam preset and WD (Field → Field "
+                                    "calibration settings… for how).  The images go through the beam calibration of "
+                                    "the condition.")
             info.setWordWrap(True)
             top.addRow(info)
             pos = QtWidgets.QComboBox()
@@ -307,8 +506,8 @@ class OpEditor(QtWidgets.QWidget):
             notes = QtWidgets.QLineEdit(op.notes)
             notes.editingFinished.connect(lambda: self._set("notes", notes.text()))
             top.addRow("notes", notes)
-        elif isinstance(op, ExposeField):
-            self._expose(v)
+        elif isinstance(op, Exposure):
+            self._exposure(v)
 
     # ---------------------------------------------------------------- column
     def _column(self, f) -> None:
@@ -330,77 +529,84 @@ class OpEditor(QtWidgets.QWidget):
         cs.valueChanged.connect(lambda val: self._set("current_pa", float(val) or None))
         f.addRow("nominal current", cs)
 
-    # ---------------------------------------------------------------- expose
-    def _expose(self, v) -> None:
+    # ---------------------------------------------------------------- exposure
+    def _exposure(self, v) -> None:
         op = self.op
 
-        # --- field centre
-        g = QtWidgets.QGroupBox("Field centre (stage)")
+        # --- chip and GDS
+        g = QtWidgets.QGroupBox("Pattern (GDS top level = CCS − offset; one field per top-level cell)")
         f = QtWidgets.QFormLayout(g)
-        centre = self._pair(*op.centre, lambda p: self._set("centre", p))
-        f.addRow("X, Y", centre)
-        cc = QtWidgets.QCheckBox("correct by the global alignment")
-        cc.setToolTip("move to the centre recomputed from the field of the last Global Align: its measured origin "
-                      "+ the spacing between the centres, transformed by the measured alignment")
-        cc.setChecked(op.correct_centre)
-        cc.toggled.connect(lambda on: self._set("correct_centre", bool(on)))
-        f.addRow(cc)
-        v.addWidget(g)
-
-        # --- pattern
-        g = QtWidgets.QGroupBox("Pattern (WCS: (0, 0) = field centre)")
-        f = QtWidgets.QFormLayout(g)
-        kind = QtWidgets.QComboBox()
-        for k, t in (("gds", "GDS cell"), ("dummy", "dummy test pattern"), ("none", "none (alignment only)")):
-            kind.addItem(t, k)
-        kind.setCurrentIndex(kind.findData(op.pattern.kind))
-        kind.currentIndexChanged.connect(lambda _: self._set_pattern_kind(kind.currentData()))
-        self.kind_box = kind
-        f.addRow("pattern", kind)
-        if op.pattern.kind == "gds":
-            b = QtWidgets.QPushButton(os.path.basename(op.pattern.path) if op.pattern.path else "Choose GDS file…")
-            b.setToolTip(op.pattern.path or "")
-            b.clicked.connect(self.pickGdsRequested.emit)
-            f.addRow("file", b)
-            cell = QtWidgets.QComboBox()
+        chip = QtWidgets.QComboBox()
+        for n in self.chips():
+            chip.addItem(n, n)
+        if op.chip and chip.findData(op.chip) < 0:
+            chip.addItem(f"{op.chip} (unknown)", op.chip)
+        chip.setCurrentIndex(max(0, chip.findData(op.chip)))
+        chip.currentIndexChanged.connect(lambda _: self._set("chip", chip.currentData() or ""))
+        f.addRow("chip", chip)
+        row = QtWidgets.QHBoxLayout()
+        b = QtWidgets.QPushButton(os.path.basename(op.path) if op.path else "Choose GDS file…")
+        b.setToolTip(op.path or "no file: the step aligns only")
+        b.clicked.connect(self.pickGdsRequested.emit)
+        row.addWidget(b, 1)
+        if op.path:
+            clr = QtWidgets.QToolButton(text="×", toolTip="no GDS file (alignment only)")
+            clr.clicked.connect(lambda: self._set("path", "", rebuild=True))
+            row.addWidget(clr)
+        f.addRow("file", row)
+        if op.path:
+            top = QtWidgets.QComboBox()
+            top.addItem("(the only top-level cell)", "")
             try:
-                names = self.cells(op.pattern.path) if op.pattern.path else []
+                names = self.top_cells(op.path)
             except Exception as e:  # noqa: BLE001
                 names = []
                 self.msg.setText(f"{type(e).__name__}: {e}")
-            cell.addItems(names)
-            if op.pattern.cell and cell.findText(op.pattern.cell) < 0:
-                cell.addItem(op.pattern.cell)
-            cell.setCurrentText(op.pattern.cell)
-            cell.currentTextChanged.connect(self._set_cell)
-            f.addRow("cell", cell)
-            if not op.pattern.placement.is_identity():
-                o = op.pattern.placement.offset
-                f.addRow(QtWidgets.QLabel(f"recentred by ({o[0]:+.3f}, {o[1]:+.3f}) µm (imported field)"))
-            else:
-                f.addRow(QtWidgets.QLabel("the cell is taken as centred on its origin"))
-        elif op.pattern.kind == "dummy":
-            sz = _spin(op.pattern.size_um, 0.01, 1e5)
-            sz.valueChanged.connect(lambda val: self._set_dummy(float(val)))
-            f.addRow("size", sz)
+            for n in names:
+                top.addItem(n, n)
+            if op.top and top.findData(op.top) < 0:
+                top.addItem(op.top, op.top)
+            top.setCurrentIndex(max(0, top.findData(op.top)))
+            top.currentIndexChanged.connect(lambda _: self._set("top", top.currentData() or ""))
+            f.addRow("top cell", top)
+            lay_ed = QtWidgets.QLineEdit(_layers_text(op.layers))
+            lay_ed.setPlaceholderText("all layers (e.g. 1/0, 2)")
+            lay_ed.editingFinished.connect(lambda: self._set_layers(lay_ed.text()))
+            f.addRow("layers", lay_ed)
+        f.addRow("offset (GDS origin in CCS)", _pair(*op.offset, lambda p: self._set("offset", p)))
+        co = QtWidgets.QCheckBox("field centre = the cell's origin (else its bounding-box centre)")
+        co.setChecked(op.cell_origin)
+        co.toggled.connect(lambda on: self._set("cell_origin", bool(on)))
+        f.addRow(co)
+        order = QtWidgets.QComboBox()
+        for k, t in (("file", "as in the file"), ("raster", "rows, left → right"), ("serpentine", "serpentine rows")):
+            order.addItem(t, k)
+        order.setCurrentIndex(max(0, order.findData(op.order)))
+        order.currentIndexChanged.connect(lambda _: self._set("order", order.currentData()))
+        f.addRow("field order", order)
+        self.info = QtWidgets.QLabel()
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet("color:#9aa")
+        f.addRow(self.info)
         v.addWidget(g)
 
         # --- dose
-        g = QtWidgets.QGroupBox("Dose")
-        f = QtWidgets.QFormLayout(g)
-        self.readout = QtWidgets.QLabel()
-        self.readout.setWordWrap(True)
-        self.readout.setStyleSheet("color:#9aa")
-        d = self._spin_for(f, "dwell / point", "dwell_us", lo=0.001, hi=1e6, decimals=3, suffix=" µs", step=0.1)
-        st = self._spin_for(f, "point step", "step_nm", lo=0.1, hi=1e5, decimals=2, suffix=" nm", step=1)
-        d.valueChanged.connect(self._readout)
-        st.valueChanged.connect(self._readout)
-        f.addRow(self.readout)
-        self._readout()
-        v.addWidget(g)
+        if op.path:
+            g = QtWidgets.QGroupBox("Dose")
+            f = QtWidgets.QFormLayout(g)
+            self.readout = QtWidgets.QLabel()
+            self.readout.setWordWrap(True)
+            self.readout.setStyleSheet("color:#9aa")
+            d = self._spin_for(f, "dwell / point", "dwell_us", lo=0.001, hi=1e6, decimals=3, suffix=" µs", step=0.1)
+            st = self._spin_for(f, "point step", "step_nm", lo=0.1, hi=1e5, decimals=2, suffix=" nm", step=1)
+            d.valueChanged.connect(self._readout)
+            st.valueChanged.connect(self._readout)
+            f.addRow(self.readout)
+            self._readout()
+            v.addWidget(g)
 
         # --- global align
-        g = QtWidgets.QGroupBox("Global Align (markers in WCS: µm from the field centre)")
+        g = QtWidgets.QGroupBox("Global Align (CCS markers, all in one field: written first)")
         g.setCheckable(True)
         g.setChecked(op.global_align)
         g.toggled.connect(self._toggle_global)
@@ -408,78 +614,122 @@ class OpEditor(QtWidgets.QWidget):
         if op.global_align:
             n = QtWidgets.QSpinBox()
             n.setRange(2, 4)
-            n.setValue(max(2, min(4, len(op.markers))))
+            n.setValue(max(2, min(4, len(op.global_markers))))
             n.valueChanged.connect(self._marker_count)
             f.addRow("markers", n)
-            for k, mk in enumerate(op.markers):
-                f.addRow(f"marker {k + 1}", self._pair(*mk, lambda p, k=k: self._set_marker(k, p)))
-            f.addRow(QtWidgets.QLabel("2 markers: rotation, scale, shift · 3–4: also stretch and shear"))
+            for k, mk in enumerate(op.global_markers):
+                f.addRow(f"marker {k + 1}", _pair(*mk, lambda p, k=k: self._set_marker(k, p)))
+            f.addRow(QtWidgets.QLabel("2 markers: rotation, scale, shift · 3–4: affine (scale and shear too)"))
         v.addWidget(g)
 
-        # --- local XY
-        g = QtWidgets.QGroupBox("Local XY (one marker in WCS, shift only)")
+        # --- local markers
+        g = QtWidgets.QGroupBox("Local markers (CCS, at most one per field: a shift for that field)")
         g.setCheckable(True)
-        g.setChecked(op.local_xy)
-        g.toggled.connect(lambda on: self._set("local_xy", bool(on), rebuild=True))
-        f = QtWidgets.QFormLayout(g)
-        if op.local_xy:
-            f.addRow("marker", self._pair(*op.local_marker, lambda p: self._set("local_marker", p)))
+        g.setChecked(op.local_align)
+        g.toggled.connect(lambda on: self._set("local_align", bool(on), rebuild=True))
+        lv = QtWidgets.QVBoxLayout(g)
+        if op.local_align:
+            t = _table(["X (µm)", "Y (µm)"])
+            t.setRowCount(len(op.local_markers))
+            for r, m in enumerate(op.local_markers):
+                t.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{m[0]:g}"))
+                t.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{m[1]:g}"))
+            t.setMinimumHeight(110)
+            t.itemChanged.connect(lambda it, t=t: self._local_edited(t))
+            self.local_table = t
+            lv.addWidget(t)
+            h = QtWidgets.QHBoxLayout()
+            b_add = QtWidgets.QPushButton("Add")
+            b_add.clicked.connect(lambda: self._local_add((0.0, 0.0)))
+            b_del = QtWidgets.QPushButton("Remove")
+            b_del.clicked.connect(lambda: self._local_remove(_selected_row(t)))
+            b_gen = QtWidgets.QPushButton("One per field…")
+            b_gen.setToolTip("a marker at the same place relative to every field centre (replaces the list)")
+            b_gen.clicked.connect(self._local_per_field)
+            for w in (b_add, b_del, b_gen):
+                h.addWidget(w)
+            lv.addLayout(h)
         v.addWidget(g)
-        if op.global_align or op.local_xy:
+        if op.global_align or op.local_align:
             g = QtWidgets.QFormLayout()
             self._spin_for(g, "marker view", "view_um", lo=0.01, hi=1e5)
             v.addLayout(g)
+        self.refresh_info()
 
     def _readout(self, *_):
         op = self.op
-        if isinstance(op, ExposeField) and self.readout is not None:
+        if isinstance(op, Exposure) and self.readout is not None:
             self.readout.setText(dose_readout(op.dwell_us, op.step_nm, self.current_for(op)))
 
-    def _set_pattern_kind(self, kind: str) -> None:
-        op = self.op
-        if op is None or op.pattern.kind == kind:
-            return
-        old = op.pattern
-        op.pattern = PatternSpec(kind, old.path, old.cell, old.layers, old.dose, size_um=old.size_um) \
-            if kind == "gds" else PatternSpec(kind, size_um=old.size_um)
-        self.changed.emit()
-        self._rebuild()
-        if kind == "gds" and not old.path:
-            QtCore.QTimer.singleShot(0, self.pickGdsRequested.emit)
-
-    def _set_cell(self, cell: str) -> None:
-        op = self.op
-        if op is not None and cell and cell != op.pattern.cell:
-            op.pattern = PatternSpec("gds", op.pattern.path, cell, op.pattern.layers, op.pattern.dose)
-            self.changed.emit()
-
-    def _set_dummy(self, size: float) -> None:
-        if self.op is not None:
-            self.op.pattern = PatternSpec("dummy", size_um=size)
-            self.changed.emit()
+    def _set_layers(self, text: str) -> None:
+        try:
+            self._set("layers", _parse_layers(text))
+            self.msg.clear()
+        except ValueError:
+            self.msg.setText("layers: e.g. 1/0, 2 (layer/datatype, or a layer number)")
 
     def _toggle_global(self, on: bool) -> None:
         op = self.op
         if op is None:
             return
-        if on and len(op.markers) < 2:
-            op.markers = (list(op.markers) + [(-10.0, -10.0), (10.0, 10.0)])[:2]
+        if on and len(op.global_markers) < 2:
+            op.global_markers = (list(op.global_markers) + [(-10.0, -10.0), (10.0, 10.0)])[:2]
         self._set("global_align", bool(on), rebuild=True)
 
     def _marker_count(self, n: int) -> None:
         op = self.op
-        mk = list(op.markers)
+        mk = list(op.global_markers)
         defaults = [(-10.0, -10.0), (10.0, 10.0), (-10.0, 10.0), (10.0, -10.0)]
         while len(mk) < n:
             mk.append(defaults[len(mk)])
-        op.markers = mk[:n]
+        op.global_markers = mk[:n]
         self.changed.emit()
         self._rebuild()
 
     def _set_marker(self, k: int, p) -> None:
-        mk = list(self.op.markers)
+        mk = list(self.op.global_markers)
         mk[k] = p
-        self._set("markers", mk)
+        self._set("global_markers", mk)
+
+    def _local_edited(self, t) -> None:
+        out = []
+        try:
+            for r in range(t.rowCount()):
+                out.append((float(t.item(r, 0).text()), float(t.item(r, 1).text())))
+        except (ValueError, AttributeError):
+            self.msg.setText("a local marker is (X, Y) in µm")
+            return
+        self.msg.clear()
+        self._set("local_markers", out)
+        self.refresh_info()
+
+    def _local_add(self, p) -> None:
+        self._set("local_markers", list(self.op.local_markers) + [tuple(p)], rebuild=True)
+
+    def _local_remove(self, r: int) -> None:
+        mk = list(self.op.local_markers)
+        if 0 <= r < len(mk):
+            del mk[r]
+            self._set("local_markers", mk, rebuild=True)
+
+    def set_local_per_field(self, dx: float, dy: float) -> int:
+        cs = self.field_centres(self.op)
+        self._set("local_markers", [(c[0] + dx, c[1] + dy) for c in cs], rebuild=True)
+        return len(cs)
+
+    def _local_per_field(self) -> None:
+        d = QtWidgets.QDialog(self)
+        d.setWindowTitle("A local marker per field")
+        f = QtWidgets.QFormLayout(d)
+        p = _pair(-40.0, 40.0, lambda _: None)
+        f.addRow("relative to each field centre", p)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(d.accept)
+        bb.rejected.connect(d.reject)
+        f.addRow(bb)
+        if d.exec() == QtWidgets.QDialog.Accepted:
+            self.set_local_per_field(p.spins[0].value(), p.spins[1].value())
+
 
 # ====================================================================== schedule
 class ScheduleTab(QtWidgets.QWidget):
@@ -496,7 +746,7 @@ class ScheduleTab(QtWidgets.QWidget):
         self.schedule = None
         self.plans = None
         self.states: list = []
-        self.new_field_centre = lambda: (0.0, 0.0)  # where a new Expose field goes (the stage, if known)
+        self.new_exposure = lambda: Exposure()  # what Add → Exposure adds (the window sets the chip)
         self.list = QtWidgets.QListWidget()
         self.list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.list.currentRowChanged.connect(self._select)
@@ -504,7 +754,7 @@ class ScheduleTab(QtWidgets.QWidget):
         add.setText("Add ▾")
         add.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         m = QtWidgets.QMenu(add)
-        m.addAction(ExposeField.TITLE, lambda: self.add_op(ExposeField(centre=self.new_field_centre())))
+        m.addAction(Exposure.TITLE, lambda: self.add_op(self.new_exposure()))
         m.addAction(ColumnSetting.TITLE, lambda: self.add_op(ColumnSetting(magnification=self._last_mag())))
         m.addAction(FieldCorrection.TITLE, lambda: self.add_op(FieldCorrection()))
         add.setMenu(m)
@@ -579,7 +829,7 @@ class ScheduleTab(QtWidgets.QWidget):
         sc.setWidgetResizable(True)
         sc.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         sp.addWidget(sc)
-        sp.setSizes([280, 560])
+        sp.setSizes([220, 620])
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(sp, 1)
         lay.addLayout(rb)
@@ -602,6 +852,7 @@ class ScheduleTab(QtWidgets.QWidget):
         self._update_items()
         self._show_warnings()
         self.editor._readout()
+        self.editor.refresh_info()
 
     def set_state(self, index: int, state: str, message: str = "") -> None:
         if 0 <= index < len(self.states):
@@ -637,8 +888,11 @@ class ScheduleTab(QtWidgets.QWidget):
             return
         op = self.schedule[i]
         st = self.states[i] if i < len(self.states) else "pending"
-        warns = self.plans[i].warnings if self.plans is not None and i < len(self.plans) else []
-        it.setText(f"{i + 1}. {STATE_MARK[st]}{op.title()}" + ("  ⚠" if warns else ""))
+        p = self.plans[i] if self.plans is not None and i < len(self.plans) else None
+        warns = p.warnings if p is not None else []
+        nf = f" ({len(p.fields)} fields)" if p is not None and isinstance(op, Exposure) and p.fields else ""
+        it.setText(f"{i + 1}. {STATE_MARK[st]}{op.title()}{nf}" + ("  ⚠" if warns else "")
+                   + (f"  – {message}" if message and st == "running" else ""))
         tip = "\n".join(warns)
         if message:
             tip = (tip + "\n" if tip else "") + message

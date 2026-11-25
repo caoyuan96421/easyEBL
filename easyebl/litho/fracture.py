@@ -1,4 +1,4 @@
-"""Fractured-GDS importer: one Expose field per cell.
+"""Fields of a fractured GDS file: one field per top-level cell.
 
 Large patterns are fractured beforehand (e.g. by BEAMER) into cells that each fit in the
 field of view.  The fields of a file are either
@@ -8,14 +8,8 @@ field of view.  The fields of a file are either
 * ``"cells"`` – cells used as they are (layout coordinates), by default every top cell;
 
 ``"auto"`` picks *references* for one top cell that places other cells, else *cells*.
-
-:func:`build_schedule` makes a Column setting, then one Expose field per field:
-
-* field centre (SCS) = the stage position of the layout origin + the field's bbox centre
-  (through the stage axes), corrected by the last Global Align;
-* pattern = the field, recentred on its bbox centre (WCS);
-* optional Global Align on the first field and Local XY on every field; markers are WCS
-  (µm from the field centre, in layout orientation).
+An :class:`~easyebl.litho.schedule.Exposure` writes all of them (:func:`find_fields`,
+:func:`order_fields`).
 """
 from __future__ import annotations
 
@@ -26,12 +20,10 @@ import os
 import numpy as np
 
 from ..core.transforms import AffineTransform
-from .coords import StageAxes
 from .gds import GDSDoseMapping, GDSError
-from .schedule import ColumnSetting, ExposeField, PatternLibrary, PatternSpec, Schedule
+from .schedule import PatternLibrary, PatternSpec
 
-__all__ = ["FractureField", "ImportOptions", "find_fields", "order_fields", "build_schedule",
-           "import_fractured_gds", "reference_transform"]
+__all__ = ["FractureField", "ImportOptions", "find_fields", "order_fields", "reference_transform"]
 
 
 @dataclass
@@ -61,19 +53,6 @@ class ImportOptions:
     cells: list | None = None
     layers: list | None = None
     dose: GDSDoseMapping = field(default_factory=GDSDoseMapping)
-    order: str = "file"  # file | raster (rows top → bottom, left → right) | serpentine
-    origin_scs: tuple = (0.0, 0.0)  # stage position of the layout origin (0, 0)
-    axes: StageAxes = field(default_factory=StageAxes)
-    magnification: int = 1000  # one of the SEM's permitted magnifications
-    beam_preset: str = ""  # "" keeps the beam as it is
-    current_pa: float | None = None
-    global_align: bool = False
-    global_markers: tuple = ((-40.0, -40.0), (40.0, 40.0))  # WCS of the first field
-    local_xy: bool = False
-    local_marker: tuple = (-40.0, -40.0)  # WCS of every field
-    view_um: float = 10.0
-    dwell_us: float = 1.0
-    step_nm: float = 20.0
 
 
 def reference_transform(ref) -> AffineTransform:
@@ -151,37 +130,3 @@ def order_fields(fields: list, order: str = "file") -> list:
             row.reverse()
         out.extend(row)
     return out
-
-
-def build_schedule(fields: list, options: ImportOptions | None = None, name: str = "") -> Schedule:
-    o = options or ImportOptions()
-    s = Schedule([ColumnSetting(preset=o.beam_preset, magnification=o.magnification,
-                                current_pa=o.current_pa)], name=name)
-    origin = np.asarray(o.origin_scs, float)
-
-    def scs(layout_pt):
-        return tuple(float(v) for v in o.axes.wcs_to_scs([layout_pt], origin)[0])
-
-    for i, f in enumerate(order_fields(fields, o.order)):
-        cx, cy = f.center
-        spec = PatternSpec("gds", f.path, f.cell, o.layers, o.dose,
-                           AffineTransform.translation(-cx, -cy) @ f.placement)
-        op = ExposeField(label=f.name, centre=scs((cx, cy)), correct_centre=True, pattern=spec, dwell_us=o.dwell_us,
-                         step_nm=o.step_nm, view_um=o.view_um)
-        if i == 0 and o.global_align:
-            op.global_align = True
-            op.markers = [(float(x), float(y)) for x, y in o.global_markers]
-        if o.local_xy:
-            op.local_xy = True
-            op.local_marker = (float(o.local_marker[0]), float(o.local_marker[1]))
-        s.add(op)
-    return s
-
-
-def import_fractured_gds(path: str, options: ImportOptions | None = None,
-                         library: PatternLibrary | None = None) -> Schedule:
-    o = options or ImportOptions()
-    fields = find_fields(path, o, library)
-    if not fields:
-        raise GDSError("no non-empty fields found")
-    return build_schedule(fields, o, os.path.splitext(os.path.basename(path))[0])

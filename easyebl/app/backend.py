@@ -19,9 +19,10 @@ from .config import SystemConfig
 
 __all__ = ["SystemBackend", "ComponentStatus", "COMPONENTS", "couple_sim_stage", "SIM_STAGE_TO_BEAM"]
 
-#: the simulators' hidden stage → beam map (what a field calibration should find): the beam axes
-#: turned 0.35° against the stage and the global field calibration 0.6 % off
-SIM_STAGE_TO_BEAM = ((1.006 * 0.99998134, -1.006 * 0.00610863), (1.006 * 0.00610863, 1.006 * 0.99998134))
+#: the simulators' hidden stage → beam map (what a field calibration should find): stage X against
+#: the image's x as on the S-3000, the beam axes turned 0.35° against the stage and the global field
+#: calibration 0.6 % off
+SIM_STAGE_TO_BEAM = ((-1.006 * 0.99998134, -1.006 * 0.00610863), (-1.006 * 0.00610863, 1.006 * 0.99998134))
 
 
 def couple_sim_stage(sim_backend, stage, stage_to_beam=SIM_STAGE_TO_BEAM, period_um: float = 120.0) -> None:

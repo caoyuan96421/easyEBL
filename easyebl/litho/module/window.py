@@ -1,5 +1,5 @@
-"""The Lithography window: stage view (SCS with each field's WCS), Stage Positions and Exposure
-Schedule tabs, alignment status.
+"""The Lithography window: stage view (SCS with the chips and their fields), Stage Positions, Chips
+and Exposure Schedule tabs, calibration and alignment status.
 
 Opened from the easyEBL menu (Open → Lithography).  The window works through a
 :class:`~easyebl.litho.runner.LithoHardware`: :class:`~.hardware.BackendHardware` on the
@@ -11,17 +11,20 @@ import os
 import threading
 import time
 
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..coords import FieldTransform, StageFrame
+from ..coords import stage_rotation
 from ..fieldcal import Condition
 from ..runner import LithoHardware, ScheduleRunner
-from ..schedule import (ColumnSetting, ExposeField, FieldCorrection, PatternLibrary, PatternSpec, Schedule,
-                        ScheduleError, plan)
+from ..schedule import (ColumnSetting, Exposure, FieldCorrection, PatternLibrary, Schedule, ScheduleError,
+                        assign_markers, exposure_fields, find_beamcal, plan)
 from ..settings import LithoSettings
-from .dialogs import FieldCalDialog, ImportDialog, MoveFieldsDialog, StageAxesDialog
+from .beamcal_window import BeamCalWindow
+from .dialogs import BeamCalDialog, FieldCalDialog, MoveFieldsDialog, StageAxesDialog
+from .fieldcal_window import FieldCalWindow
 from .hardware import GuiBridge
-from .tabs import ScheduleTab, StagePositionsTab
+from .tabs import ChipsTab, ScheduleTab, StagePositionsTab
 from .view import StageView
 
 __all__ = ["LithoWindow"]
@@ -49,11 +52,17 @@ class LithoWindow(QtWidgets.QMainWindow):
             self.hw.status = lambda text: self.sig.event.emit("status", {"text": text})
         if hasattr(self.hw, "progress"):
             self.hw.progress = self.sig.progress.emit
+        self.axes = self.hw.stage_axes()  # Hardware → Configure… → Microscope
         self.library = PatternLibrary()
         self.schedule = Schedule()
-        self.glob = None  # the last measured Global Align (this window session only)
+        self.chips: dict = {}  # chip name -> measured ChipTransform (this window session only)
         self.calibration = None  # the last field calibration (this window session only)
-        self.transform = FieldTransform()  # of the field exposed last
+        self.fieldcal_window: FieldCalWindow | None = None
+        self.beamcal_window: BeamCalWindow | None = None
+        self._cal_future = None  # a result waiting for Accept / Discard
+        self._beam_future = None
+        self._cal_in_schedule = False
+        self.last_map = None  # FieldMap of the field written last
         self.runner: ScheduleRunner | None = None
         self._thread: threading.Thread | None = None
         self.modified = False
@@ -67,18 +76,26 @@ class LithoWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.view)
 
         # --- side tabs
-        self.tab_positions = StagePositionsTab(self.settings, self.hw.stage_position)
+        self.tab_positions = StagePositionsTab(self.settings, self.hw.stage_position, self.hw.stage_z)
         self.tab_positions.changed.connect(self._positions_changed)
         self.tab_positions.gotoRequested.connect(self.goto_stage)
-        self.tab_positions.newFieldRequested.connect(
-            lambda x, y: self.tab_schedule.add_op(ExposeField(centre=(x, y))))
+        self.tab_positions.chipOriginRequested.connect(self._chip_origin_here)
+        self.tab_chips = ChipsTab()
+        self.tab_chips.stage_position = self.hw.stage_position
+        self.tab_chips.alignment = self._chip_status
+        self.tab_chips.changed.connect(self._chips_edited)
+        self.tab_chips.resetRequested.connect(self.reset_chip)
+        self.tab_chips.moveRequested.connect(lambda name: self.move_chip_dialog(name))
         self.tab_schedule = ScheduleTab()
-        self.tab_schedule.new_field_centre = lambda: self.hw.stage_position() or (0.0, 0.0)
+        self.tab_schedule.new_exposure = self._new_exposure
         ed = self.tab_schedule.editor
         ed.presets = self.hw.preset_names
         ed.positions = lambda: [p.name for p in self.settings.stage_positions]
-        ed.cells = self.library.cells
+        ed.chips = lambda: [c.name for c in self.schedule.chips]
+        ed.top_cells = self.library.top_cells
         ed.current_for = self._current_for
+        ed.fields_info = self._fields_info
+        ed.field_centres = self._field_centres
         ed.pickGdsRequested.connect(self.pattern_for_selected)
         self.tab_schedule.changed.connect(self._schedule_edited)
         self.tab_schedule.selectionChanged.connect(lambda i: self._replan_soon())
@@ -87,13 +104,14 @@ class LithoWindow(QtWidgets.QMainWindow):
         self.tab_schedule.abortRequested.connect(self.abort)
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self.tab_positions, "Stage Positions")
+        self.tabs.addTab(self.tab_chips, "Chips")
         self.tabs.addTab(self.tab_schedule, "Exposure Schedule")
         self.tabs.setCurrentWidget(self.tab_schedule)
         dock = QtWidgets.QDockWidget("Lithography")
         dock.setObjectName("litho-side")
         dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable)
         dock.setWidget(self.tabs)
-        dock.setMinimumWidth(440)
+        dock.setMinimumWidth(460)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
         self.side_dock = dock
 
@@ -121,11 +139,10 @@ class LithoWindow(QtWidgets.QMainWindow):
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(500)
-        self.tab_schedule.set_schedule(self.schedule)
+        self.set_schedule(self.schedule)
         self._set_running_ui(False)
+        self._orient()
         self._positions_changed()
-        self._title()
-        self.replan()
         self._tick()
         self.resize(1500, 950)
 
@@ -157,45 +174,46 @@ class LithoWindow(QtWidgets.QMainWindow):
         tab.b_pause.toggled.connect(self.a_pause.setChecked)
         self.a_abort = act(m, "Abort", self.abort)
         m.addSeparator()
-        self.a_reset = act(m, "Reset global alignment", self.reset_global)
+        self.a_reset = act(m, "Reset the alignment of all chips", self.reset_all_chips)
 
-        m = mb.addMenu("F&ield")
-        self.a_add_field = act(m, "Add Expose field", lambda: tab.add_op(ExposeField(centre=tab.new_field_centre())),
-                               "Ctrl+E")
+        m = mb.addMenu("S&tep")
+        self.a_add_exp = act(m, "Add Exposure", lambda: tab.add_op(self._new_exposure()), "Ctrl+E")
+        self.a_add_gds = act(m, "Add Exposure of a GDS file…", self.add_exposure_dialog, "Ctrl+I")
         self.a_add_column = act(m, "Add Column setting",
                                 lambda: tab.add_op(ColumnSetting(magnification=tab._last_mag())))
-        self.a_add_corr = act(m, "Add Field correction", lambda: tab.add_op(FieldCorrection()))
+        self.a_add_corr = act(m, "Add Field calibration", lambda: tab.add_op(FieldCorrection()))
         m.addSeparator()
         self.a_dup = act(m, "Duplicate", tab.duplicate, "Ctrl+D")
         self.a_del = act(m, "Delete", tab.delete)
         self.a_up = act(m, "Move up", lambda: tab.move(-1), "Ctrl+Up")
         self.a_down = act(m, "Move down", lambda: tab.move(+1), "Ctrl+Down")
         m.addSeparator()
-        self.a_move = act(m, "Move all fields…", lambda: self.move_fields_dialog(), "Ctrl+M")
+        self.a_move = act(m, "Move the chip…", lambda: self.move_chip_dialog(), "Ctrl+M")
+        self.field_actions = [self.a_add_exp, self.a_add_gds, self.a_add_column, self.a_add_corr, self.a_dup,
+                              self.a_del, self.a_up, self.a_down, self.a_move]
+
+        m = mb.addMenu("&Calibration")
+        act(m, "Beam calibration settings…", self.beamcal_dialog)
+        self.a_beamcal = act(m, "Run beam calibration now", self.run_beam_calibration, "Ctrl+B")
+        self.a_forget_beam = act(m, "Forget the beam calibration of this condition", self.forget_beamcal)
         m.addSeparator()
         act(m, "Field calibration settings…", self.fieldcal_dialog)
         self.a_calibrate = act(m, "Run field calibration now", self.run_field_calibration, "Ctrl+K")
         self.a_forget_cal = act(m, "Forget the field calibration", self.forget_calibration)
-        self.field_actions = [self.a_add_field, self.a_add_column, self.a_add_corr, self.a_dup, self.a_del, self.a_up,
-                              self.a_down, self.a_move]
-
-        m = mb.addMenu("&Import")
-        self.a_import = act(m, "Fractured GDS…", self.import_dialog, "Ctrl+I")
-        self.a_import_cell = act(m, "GDS cell as a new field…", self.import_cell_dialog)
 
         m = mb.addMenu("&View")
         act(m, "Zoom to all", self.view.zoom_all, "Ctrl+0")
-        act(m, "Zoom to the selected field", self.zoom_selected, "Ctrl+9")
+        act(m, "Zoom to the selected step", self.zoom_selected, "Ctrl+9")
         m.addSeparator()
-        self.a_grid = m.addAction("WCS grid of the selected field")
-        self.a_grid.setCheckable(True)
-        self.a_grid.setChecked(True)
-        self.a_grid.toggled.connect(self._toggle_grid)
+        self.a_as_sem = m.addAction("Show as the SEM image (flip mirrored stage axes)")
+        self.a_as_sem.setCheckable(True)
+        self.a_as_sem.setChecked(True)
+        self.a_as_sem.toggled.connect(lambda on: self._orient())
         m.addAction(self.side_dock.toggleViewAction())
         m.addAction(self.log_dock.toggleViewAction())
 
-        m = mb.addMenu("S&tage")
-        act(m, "Go to the selected field centre", self.goto_selected_field)
+        m = mb.addMenu("St&age")
+        act(m, "Go to the selected step's first field", self.goto_selected_field)
         act(m, "Add the stage position to Stage Positions…", self.tab_positions.add_current)
         m.addSeparator()
         act(m, "Stage settings…", self.edit_axes)
@@ -203,18 +221,18 @@ class LithoWindow(QtWidgets.QMainWindow):
     def _make_status(self):
         sb = self.statusBar()
         self.l_global = QtWidgets.QLabel()
-        self.l_field_tr = QtWidgets.QLabel()
+        self.l_beam = QtWidgets.QLabel()
         self.l_cal = QtWidgets.QLabel()
+        self.l_field_tr = QtWidgets.QLabel()
         self.l_field = QtWidgets.QLabel()
         self.l_stage = QtWidgets.QLabel()
         self.l_run = QtWidgets.QLabel()
         self.l_run.setStyleSheet("color:#fd4")
-        sb.addWidget(self.l_global)
-        sb.addWidget(self.l_cal)
-        sb.addWidget(self.l_field_tr)
+        for w in (self.l_global, self.l_beam, self.l_cal, self.l_field_tr):
+            sb.addWidget(w)
         for w in (self.l_run, self.l_field, self.l_stage, self.progress):
             sb.addPermanentWidget(w)
-        for w in (self.l_global, self.l_cal, self.l_field_tr, self.l_field, self.l_stage):
+        for w in (self.l_global, self.l_beam, self.l_cal, self.l_field_tr, self.l_field, self.l_stage):
             w.setContentsMargins(6, 0, 10, 0)
 
     def log(self, text: str) -> None:
@@ -232,24 +250,54 @@ class LithoWindow(QtWidgets.QMainWindow):
         except Exception:  # noqa: BLE001
             return 100_000.0
 
+    def _wd(self):
+        try:
+            return self.hw.working_distance_mm()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _selected_chip(self) -> str:
+        i = self.tab_schedule.selected()
+        if 0 <= i < len(self.schedule) and isinstance(self.schedule[i], Exposure) and self.schedule[i].chip:
+            return self.schedule[i].chip
+        return self.tab_chips.selected() or (self.schedule.chips[0].name if self.schedule.chips else "")
+
+    def _chip_status(self, name: str) -> str:
+        g = self.chips.get(name)
+        return "nominal (origin)" if g is None else g.describe(self.axes)
+
     def _update_status(self):
-        if self.glob is None:
-            self.l_global.setText("Global alignment: none (identity)")
+        name = self._selected_chip()
+        g = self.chips.get(name)
+        if not name:
+            self.l_global.setText("Chip: none")
+            self.l_global.setStyleSheet("color:#9aa")
+        elif g is None:
+            self.l_global.setText(f"Chip {name}: nominal (no Global Align)")
             self.l_global.setStyleSheet("color:#9aa")
         else:
-            self.l_global.setText(f"Global alignment: {self.glob.describe()}")
+            self.l_global.setText(f"Chip {name}: {g.describe(self.axes)}")
             self.l_global.setStyleSheet("color:#5d5")
+        cond = self.condition()
+        bc = self.beamcal()
+        if bc is None:
+            self.l_beam.setText(f"Beam calibration: none for {cond.describe()}")
+            self.l_beam.setStyleSheet("color:#fb4" if self.settings.beamcals else "color:#9aa")
+        else:
+            self.l_beam.setText(f"Beam calibration: {bc.describe()}")
+            self.l_beam.setStyleSheet("color:#5d5")
         cal = self.calibration
         if cal is None:
             self.l_cal.setText("Field calibration: none")
             self.l_cal.setStyleSheet("color:#9aa")
-        elif cal.valid_for(self.condition()):
-            self.l_cal.setText(f"Field calibration: {cal.describe(self.settings.axes)}")
+        elif cal.valid_for(cond, bc):
+            self.l_cal.setText(f"Field calibration: {cal.describe(self.axes)}")
             self.l_cal.setStyleSheet("color:#5d5")
         else:
-            self.l_cal.setText(f"Field calibration: for {cal.condition.describe()}, not {self.condition().describe()}")
+            why = cal.condition.describe() if not cal.condition.matches(cond) else "another beam calibration"
+            self.l_cal.setText(f"Field calibration: for {why}, not {cond.describe()}")
             self.l_cal.setStyleSheet("color:#fb4")
-        self.l_field_tr.setText("Last field: " + ("–" if self.transform.is_identity else self.transform.describe()))
+        self.l_field_tr.setText("Last field: " + ("–" if self.last_map is None else self.last_map.describe()))
         self.l_field.setText(f"field {self._field():.4g} µm")
 
     def _tick(self):
@@ -259,21 +307,26 @@ class LithoWindow(QtWidgets.QMainWindow):
             pos = None
         self.l_stage.setText("stage ?" if pos is None else f"stage ({pos[0]:.1f}, {pos[1]:.1f}) µm")
         self.view.set_stage(pos)
-        self.view.set_fov(pos, self._field(), self.frame().B_inv)
+        self.view.set_fov(pos, self._field(), np.linalg.inv(self.stage_to_beam()))
         self._update_status()
 
     def condition(self) -> Condition:
-        """The column condition now (magnification, the beam preset this program recalled last)."""
+        """The column condition now (magnification, the beam preset this program recalled last, WD)."""
         try:
             mag = self.hw.magnification()
         except Exception:  # noqa: BLE001
             mag = None
-        return Condition(mag, getattr(self.hw, "last_preset", None))
+        return Condition(mag, getattr(self.hw, "last_preset", None), self._wd())
 
-    def frame(self) -> StageFrame:
+    def beamcal(self, condition: Condition | None = None):
+        return find_beamcal(self.settings.beamcals, condition or self.condition())
+
+    def stage_to_beam(self) -> np.ndarray:
+        cond = self.condition()
         cal = self.calibration
-        ok = cal is not None and cal.valid_for(self.condition())
-        return StageFrame.make(self.settings.axes, cal.stage_to_beam if ok else None)
+        if cal is not None and cal.valid_for(cond, self.beamcal(cond)):
+            return stage_rotation(cal.stage_to_beam, self.axes)
+        return self.axes.matrix
 
     def _title(self):
         name = os.path.basename(self.schedule.path) if self.schedule.path else (self.schedule.name or "untitled")
@@ -289,9 +342,52 @@ class LithoWindow(QtWidgets.QMainWindow):
                 break
         return cur
 
+    def _plan_of(self, op):
+        if self.plans is None:
+            return None
+        i = next((k for k, o in enumerate(self.schedule.operations) if o is op), -1)
+        return self.plans[i] if 0 <= i < len(self.plans) else None
+
+    def _fields_info(self, op) -> str:
+        p = self._plan_of(op)
+        if p is None:
+            return ""
+        if not p.fields:
+            return "no fields"
+        try:
+            flds = exposure_fields(op, self.library)
+            asg = assign_markers(flds, op, p.field_um)
+        except Exception as e:  # noqa: BLE001
+            return f"{type(e).__name__}: {e}"
+        parts = [f"{len(flds)} field(s) of {p.field_um:.4g} µm"]
+        if op.global_align:
+            parts.append("Global Align in " + (flds[asg.global_field].name if asg.global_field is not None
+                                                else "NO field (not all markers in one field)"))
+        if op.local_align:
+            parts.append(f"{len(asg.local)} field(s) with a Local marker")
+        return " · ".join(parts)
+
+    def _field_centres(self, op) -> list:
+        try:
+            return [f.centre_ccs for f in exposure_fields(op, self.library)]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _new_exposure(self) -> Exposure:
+        name = self._selected_chip()
+        if not name:
+            name = self.tab_chips.add_chip()
+        return Exposure(chip=name)
+
     def _schedule_edited(self):
         self.modified = True
         self._title()
+        self._replan_soon()
+
+    def _chips_edited(self):
+        self.modified = True
+        self._title()
+        self.tab_schedule.refresh()
         self._replan_soon()
 
     def _replan_soon(self):
@@ -302,12 +398,16 @@ class LithoWindow(QtWidgets.QMainWindow):
             presets = self.hw.preset_names()
         except Exception:  # noqa: BLE001
             presets = None
-        self.plans = plan(self.schedule, self._field_at_1x(), self.settings.axes, presets, self.library, self.glob,
+        self.plans = plan(self.schedule, self._field_at_1x(), self.axes, presets, self.library, self.chips,
                           calibration=self.calibration, preset=getattr(self.hw, "last_preset", None),
-                          positions=self.settings.positions(), fieldcal=self.settings.fieldcal)
+                          positions=self.settings.positions(), fieldcal=self.settings.fieldcal,
+                          beamcals=self.settings.beamcals, wd_mm=self._wd())
         self.tab_schedule.set_plans(self.plans)
         sel = self.tab_schedule.selected()
-        self.view.set_schedule(self.schedule, self.library, self.plans, self.settings.axes, sel if sel >= 0 else None)
+        self.view.set_schedule(self.schedule, self.library, self.plans, self.axes, sel if sel >= 0 else None,
+                               self.chips)
+        self.tab_chips.refresh()
+        self._update_status()
         return self.plans
 
     def warnings(self) -> list:
@@ -327,8 +427,10 @@ class LithoWindow(QtWidgets.QMainWindow):
 
     def set_schedule(self, schedule: Schedule, modified: bool = False):
         self.schedule = schedule
+        self.chips = {k: v for k, v in self.chips.items() if schedule.chip(k) is not None}
         self.modified = modified
         self.view._fitted = False
+        self.tab_chips.set_schedule(schedule)
         self.tab_schedule.set_schedule(schedule)
         self._title()
         self.replan()
@@ -345,10 +447,7 @@ class LithoWindow(QtWidgets.QMainWindow):
 
     def _remember_dir(self, path: str):
         self.settings.last_dir = os.path.dirname(os.path.abspath(path))
-        try:
-            self.settings.save()
-        except OSError:
-            pass
+        self._save_settings()
 
     def new_schedule(self):
         if self._running() or not self._confirm_discard():
@@ -371,9 +470,10 @@ class LithoWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "Lithography", f"Cannot open {path}:\n{e}")
             return False
         self.library.clear()
+        self.chips = {}
         self.set_schedule(s)
         self._remember_dir(path)
-        self.log(f"opened {path} ({len(s)} steps)")
+        self.log(f"opened {path} ({len(s)} steps, {len(s.chips)} chip(s))")
         return True
 
     def save(self) -> bool:
@@ -399,110 +499,124 @@ class LithoWindow(QtWidgets.QMainWindow):
         self.log(f"saved {path}")
         return True
 
-    def import_dialog(self):
+    def add_exposure_dialog(self):
         if self._running():
             return
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import fractured GDS", self._dir(), GDS_FILTER)
-        if not p:
-            return
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Exposure of a GDS file", self._dir(), GDS_FILTER)
+        if p:
+            self.add_exposure_from_gds(p)
+
+    def add_exposure_from_gds(self, path: str) -> Exposure | None:
         try:
-            d = ImportDialog(p, self.library, self.hw.preset_names(), self.settings.axes, self.hw.stage_position,
-                             self.schedule[0].magnification, self)
+            self.library.top_cells(path)
         except Exception as e:  # noqa: BLE001
-            self.log(f"ERROR reading {p}: {e}")
-            return
-        if d.exec() != QtWidgets.QDialog.Accepted:
-            return
-        self.import_gds(p, d.options(), replace=d.replace.isChecked())
-
-    def import_gds(self, path: str, options=None, replace: bool = True) -> Schedule:
-        from ..fracture import import_fractured_gds
-
-        s = import_fractured_gds(path, options, self.library)
+            self.log(f"ERROR reading {path}: {e}")
+            return None
+        op = self._new_exposure()
+        op.path = os.path.abspath(path)
+        op.label = os.path.basename(path)
+        self.tab_schedule.add_op(op)
         self._remember_dir(path)
-        if replace:
-            self.set_schedule(s, modified=True)
-        else:
-            self.schedule.operations.extend(s.operations[1:])  # the fields; the Column setting is the present one
-            self.set_schedule(self.schedule, modified=True)
-        self.log(f"imported {len(s) - 1} field(s) from {os.path.basename(path)}")
-        return s
+        self.replan()
+        p = self._plan_of(op)
+        self.log(f"Exposure of {os.path.basename(path)} on {op.chip}: {len(p.fields) if p else 0} field(s)")
+        return op
 
     def pattern_for_selected(self):
         i = self.tab_schedule.selected()
-        if i < 0 or not isinstance(self.schedule[i], ExposeField):
+        if i < 0 or not isinstance(self.schedule[i], Exposure):
             return
         p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Pattern GDS", self._dir(), GDS_FILTER)
         if p:
             self.set_pattern_file(i, p)
 
-    def set_pattern_file(self, i: int, path: str, cell: str | None = None) -> None:
+    def set_pattern_file(self, i: int, path: str) -> None:
         try:
-            cells = self.library.cells(path)
+            self.library.top_cells(path)
         except Exception as e:  # noqa: BLE001
             self.log(f"ERROR reading {path}: {e}")
             return
         op = self.schedule[i]
-        op.pattern = PatternSpec("gds", os.path.abspath(path), cell or (cells[0] if cells else ""))
+        op.path = os.path.abspath(path)
+        op.top = ""
         self._remember_dir(path)
         self.tab_schedule.refresh(select=i)
         self._schedule_edited()
 
-    def import_cell_dialog(self):
-        if self._running():
-            return
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "GDS cell as a new field", self._dir(), GDS_FILTER)
-        if not p:
-            return
-        tab = self.tab_schedule
-        tab.add_op(ExposeField(centre=tab.new_field_centre(), label=os.path.basename(p)))
-        self.set_pattern_file(tab.selected(), p)
+    # ================================================================ chips / view
+    def _chip_fields_scs(self, name: str) -> list:
+        """(exposure, field centre SCS (nominal), half field) of every field on chip *name*."""
+        plans = self.plans or self.replan()
+        out = []
+        for i, op in enumerate(self.schedule.operations):
+            if isinstance(op, Exposure) and op.chip == name and i < len(plans):
+                for fp in plans[i].fields:
+                    out.append((op, fp.target, plans[i].field_um / 2.0))
+        return out
 
-    # ================================================================ move / view
-    def anchors(self) -> dict:
-        """Reference points for Move all fields (stage µm; None where there is none)."""
-        fields = self.schedule.fields
-        first = fields[0].centre if fields else None
+    def anchors(self, name: str) -> dict:
+        """Reference points for Move the chip (stage µm, through the chip's present map; None where none)."""
+        chip = self.schedule.chip(name)
+        if chip is None:
+            return {}
+        g = self.chips.get(name) or chip.nominal(self.axes)
+        o = tuple(float(v) for v in g.to_scs(np.zeros(2)))
+        flds = self._chip_fields_scs(name)
+        first = tuple(flds[0][1]) if flds else None
         box = None
-        if fields:
-            plans = self.plans or self.replan()
-            squares = []
-            for i, op in enumerate(self.schedule.operations):
-                if isinstance(op, ExposeField):
-                    h = plans[i].field_um / 2.0 if i < len(plans) else 0.0
-                    squares.append((op.centre[0] - h, op.centre[1] - h, op.centre[0] + h, op.centre[1] + h))
-            b = list(zip(*squares))
-            box = ((min(b[0]) + max(b[2])) / 2.0, (min(b[1]) + max(b[3])) / 2.0)
-        g = next((o for o in fields if o.global_align and o.markers), None)
-        mark = tuple(float(v) for v in g.nominal_scs([g.markers[0]], self.settings.axes)[0]) if g else None
-        return {"first": ("the first field centre", first),
-                "bbox": ("the centre of the bounding box of all fields", box),
-                "marker": ("marker 1 of the first field with Global Align", mark)}
+        if flds:
+            xs = [f[1][0] for f in flds]
+            ys = [f[1][1] for f in flds]
+            h = max(f[2] for f in flds)
+            box = ((min(xs) - h + max(xs) + h) / 2.0, (min(ys) - h + max(ys) + h) / 2.0)
+        e = next((op for op in self.schedule.exposures if op.chip == name and op.global_align and op.global_markers),
+                 None)
+        mark = tuple(float(v) for v in g.to_scs(np.asarray(e.global_markers[0], float))) if e else None
+        return {"origin": ("the chip origin (CCS 0, 0)", o),
+                "first": ("the first field centre", first),
+                "bbox": ("the centre of the bounding box of the chip's fields", box),
+                "marker": ("Global Align marker 1", mark)}
 
-    def move_fields_dialog(self, click=None) -> bool:
+    def move_chip_dialog(self, name: str | None = None, click=None) -> bool:
         if self._running():
             return False
-        if not self.schedule.fields:
-            self.log("no fields to move")
+        name = name or self._selected_chip()
+        if not name or self.schedule.chip(name) is None:
+            self.log("no chip to move (Chips tab)")
             return False
-        d = MoveFieldsDialog(self.anchors(), self.hw.stage_position(), click, self)
+        d = MoveFieldsDialog(self.anchors(name), self.hw.stage_position(), click, self)
+        d.setWindowTitle(f"Move chip {name}")
         self._move_dialog = d
         if d.exec() != QtWidgets.QDialog.Accepted or d.value() is None:
             return False
-        self.move_fields(*d.value())
+        self.move_chip(name, *d.value())
         return True
 
-    def move_fields(self, dx: float, dy: float) -> None:
-        n = self.schedule.shift_fields(dx, dy)
-        self.log(f"moved {n} field(s) by ({dx:+.3f}, {dy:+.3f}) µm")
-        self.tab_schedule.refresh()
-        self._schedule_edited()
+    def move_chip(self, name: str, dx: float, dy: float) -> None:
+        self.schedule.shift_chip(name, dx, dy)
+        g = self.chips.get(name)
+        if g is not None:  # a measured map moves along
+            g.offset = g.offset + np.array([dx, dy], float)
+        self.log(f"moved chip {name} by ({dx:+.3f}, {dy:+.3f}) µm")
+        self.tab_chips.refresh(select=name)
+        self.modified = True
+        self._title()
+        self.replan()
+
+    def _chip_origin_here(self, x: float, y: float):
+        name = self._selected_chip()
+        if not name:
+            name = self.tab_chips.add_chip(origin=(x, y))
+        else:
+            self.tab_chips.set_origin(name, x, y)
+            self.chips.pop(name, None)
+        self.log(f"chip {name}: origin at ({x:.2f}, {y:.2f}) µm")
 
     def _context_menu(self, x: float, y: float, screen_pos):
         m = QtWidgets.QMenu(self)
-        a = m.addAction("Move…")
-        a.triggered.connect(lambda: self.move_fields_dialog(click=(x, y)))
-        a.setEnabled(not self._running() and bool(self.schedule.fields))
+        a = m.addAction("Move the chip…")
+        a.triggered.connect(lambda: self.move_chip_dialog(click=(x, y)))
+        a.setEnabled(not self._running() and bool(self.schedule.chips))
         m.addSeparator()
         m.addAction("Zoom to all").triggered.connect(self.view.zoom_all)
         self._last_menu = m
@@ -511,14 +625,14 @@ class LithoWindow(QtWidgets.QMainWindow):
     def zoom_selected(self):
         i = self.tab_schedule.selected()
         plans = self.plans or self.replan()
-        if 0 <= i < len(plans) and plans[i].target is not None:
-            x, y = plans[i].target
+        if 0 <= i < len(plans) and plans[i].fields:
+            t = np.array([f.target for f in plans[i].fields], float)
             h = plans[i].field_um * 0.6
-            self.view.getPlotItem().getViewBox().setRange(xRange=(x - h, x + h), yRange=(y - h, y + h))
+            self.view.getPlotItem().getViewBox().setRange(xRange=(t[:, 0].min() - h, t[:, 0].max() + h),
+                                                          yRange=(t[:, 1].min() - h, t[:, 1].max() + h))
 
-    def _toggle_grid(self, on: bool):
-        self.view.show_wcs_grid = bool(on)
-        self.replan()
+    def _orient(self):
+        self.view.set_orientation(self.axes, self.a_as_sem.isChecked())
 
     def goto_selected_field(self):
         i = self.tab_schedule.selected()
@@ -528,20 +642,19 @@ class LithoWindow(QtWidgets.QMainWindow):
 
     def _set_running_ui(self, on: bool):
         self.tab_schedule.set_running(on)
-        for a in [self.a_new, self.a_open, self.a_import, self.a_import_cell, self.a_reset, self.a_run,
-                  self.a_run_from, self.a_calibrate, self.a_forget_cal] + self.field_actions:
+        self.tab_chips.setEnabled(not on)
+        for a in [self.a_new, self.a_open, self.a_reset, self.a_run, self.a_run_from, self.a_calibrate,
+                  self.a_forget_cal, self.a_beamcal, self.a_forget_beam] + self.field_actions:
             a.setEnabled(not on)
         self.a_pause.setEnabled(on)
         self.a_abort.setEnabled(on)
 
     # ================================================================ alignment
     def edit_axes(self):
-        d = StageAxesDialog(self.settings.axes, self, self.settings.stage_tolerance_um)
+        d = StageAxesDialog(self.axes, self, self.settings.stage_tolerance_um)
         if d.exec() == QtWidgets.QDialog.Accepted:
-            self.settings.axes = d.value()
             self.settings.stage_tolerance_um = d.tolerance()
             self._save_settings()
-            self._replan_soon()
 
     def _save_settings(self):
         try:
@@ -549,9 +662,24 @@ class LithoWindow(QtWidgets.QMainWindow):
         except OSError as e:
             self.log(f"litho settings not saved: {e}")
 
+    def reset_chip(self, name: str):
+        if self._running():
+            return
+        if self.chips.pop(name, None) is not None:
+            self.log(f"chip {name}: alignment reset (nominal origin)")
+        self._replan_soon()
+
+    def reset_all_chips(self):
+        if self._running():
+            return
+        self.chips = {}
+        self.last_map = None
+        self.log("alignment of all chips reset (nominal origins)")
+        self._replan_soon()
+
     # ================================================================ field calibration
     def fieldcal_dialog(self):
-        last = self.calibration.describe(self.settings.axes) if self.calibration is not None else None
+        last = self.calibration.describe(self.axes) if self.calibration is not None else None
         d = FieldCalDialog(self.settings.fieldcal, self.settings.positions(), self.hw.stage_position, last, self)
         self._fieldcal_dialog = d
         if d.exec() == QtWidgets.QDialog.Accepted:
@@ -559,51 +687,134 @@ class LithoWindow(QtWidgets.QMainWindow):
             self._save_settings()
             self._replan_soon()
 
-    def run_field_calibration(self) -> bool:
+    def _start_standalone(self, target, label: str) -> bool:
         if self._running():
             return False
         self.bridge.cancelled.clear()
+        self._cal_in_schedule = False
         self.runner = self._make_runner()
         self._set_running_ui(True)
-        self.l_run.setText("field calibration")
-        self._thread = threading.Thread(target=self.runner.run_calibration, name="litho-fieldcal", daemon=True)
+        self.l_run.setText(label)
+        self._thread = threading.Thread(target=getattr(self.runner, target), name=f"litho-{target}", daemon=True)
         self._thread.start()
         return True
+
+    def run_field_calibration(self) -> bool:
+        return self._start_standalone("run_calibration", "field calibration")
 
     def forget_calibration(self):
         if self._running():
             return
         self.calibration = None
-        self.log("field calibration forgotten (nominal stage ↔ beam map)")
+        self.log("field calibration forgotten (nominal stage ↔ beam rotation)")
+        self._update_status()
+        self._replan_soon()
+
+    # ================================================================ beam calibration
+    def beamcal_dialog(self):
+        bc = self.beamcal()
+        d = BeamCalDialog(self.settings.beamcal, self.settings.positions(), bc.describe() if bc else None, self)
+        self._beamcal_dialog = d
+        if d.exec() == QtWidgets.QDialog.Accepted:
+            self.settings.beamcal = d.value()
+            self._save_settings()
+
+    def run_beam_calibration(self) -> bool:
+        return self._start_standalone("run_beam_calibration", "beam calibration")
+
+    def forget_beamcal(self):
+        if self._running():
+            return
+        cond = self.condition()
+        if self.settings.forget_beamcal(cond):
+            self._save_settings()
+            self.log(f"beam calibration for {cond.describe()} forgotten")
         self._update_status()
         self._replan_soon()
 
     def _make_runner(self) -> ScheduleRunner:
-        return ScheduleRunner(self.schedule, self.hw, self.settings.axes, self.library, self.glob,
+        return ScheduleRunner(self.schedule, self.hw, self.axes, self.library, self.chips,
                               on_event=lambda kind, data: self.sig.event.emit(kind, data),
                               calibration=self.calibration, fieldcal=self.settings.fieldcal,
                               positions=self.settings.positions(),
-                              stage_tolerance_um=self.settings.stage_tolerance_um)
+                              stage_tolerance_um=self.settings.stage_tolerance_um,
+                              review=self._review_calibration, beamcals=self.settings.beamcals,
+                              beamcal_config=self.settings.beamcal, review_beam=self._review_beamcal)
 
-    def reset_global(self):
-        if self._running():
-            return
-        self.glob = None
-        self.transform = FieldTransform()
-        self.log("global alignment reset (identity)")
-        self._update_status()
-        self._replan_soon()
+    # ---------------------------------------------------------------- calibration windows
+    def _calwin(self) -> FieldCalWindow:
+        if self.fieldcal_window is None:
+            w = FieldCalWindow(self)
+            w.decided.connect(self._cal_decided)
+            w.abortRequested.connect(self.abort)
+            self.fieldcal_window = w
+        return self.fieldcal_window
+
+    def _beamwin(self) -> BeamCalWindow:
+        if self.beamcal_window is None:
+            w = BeamCalWindow(self)
+            w.decided.connect(self._beam_decided)
+            w.abortRequested.connect(self.abort)
+            self.beamcal_window = w
+        return self.beamcal_window
+
+    def _review_calibration(self, res) -> bool:
+        """(runner thread) Show *res* in the calibration window and wait for Accept / Discard."""
+        def show(fut):
+            w = self._calwin()
+            w.show_result(res, self.axes, ask=True)
+            if res.problem is not None:
+                fut.set_result(False)
+            else:
+                self._cal_future = fut
+
+        return bool(self.bridge.call(show, on_cancel=self._cal_cancelled))
+
+    def _review_beamcal(self, res) -> bool:
+        def show(fut):
+            w = self._beamwin()
+            w.show_result(res, ask=True)
+            if getattr(res, "problem", None) is not None:
+                fut.set_result(False)
+            else:
+                self._beam_future = fut
+
+        return bool(self.bridge.call(show, on_cancel=self._beam_cancelled))
+
+    def _cal_decided(self, ok: bool):
+        fut, self._cal_future = self._cal_future, None
+        if fut is not None and not fut.done():
+            fut.set_result(bool(ok))
+
+    def _beam_decided(self, ok: bool):
+        fut, self._beam_future = self._beam_future, None
+        if fut is not None and not fut.done():
+            fut.set_result(bool(ok))
+
+    def _cal_cancelled(self):
+        self._cal_future = None
+        if self.fieldcal_window is not None:
+            self.fieldcal_window.cancel()
+
+    def _beam_cancelled(self):
+        self._beam_future = None
+        if self.beamcal_window is not None:
+            self.beamcal_window.cancel()
 
     # ================================================================ stage
-    def goto_stage(self, x: float, y: float):
+    def goto_stage(self, x: float, y: float, z=None):
         if self._running():
             return
-        self.log(f"stage → ({x:.2f}, {y:.2f}) µm")
+        where = f"({x:.2f}, {y:.2f}" + (f", Z {z:.2f}" if z is not None else "") + ") µm"
+        self.log(f"stage → {where}")
 
         def job():
             try:
-                self.hw.move_stage(x, y)
-                self.sig.event.emit("log", {"text": f"stage at ({x:.2f}, {y:.2f}) µm"})
+                if z is None:
+                    self.hw.move_stage(x, y)
+                else:
+                    self.hw.move_stage(x, y, z)
+                self.sig.event.emit("log", {"text": f"stage at {where}"})
             except Exception as e:  # noqa: BLE001
                 self.sig.event.emit("log", {"text": f"ERROR stage move: {type(e).__name__}: {e}"})
 
@@ -623,6 +834,7 @@ class LithoWindow(QtWidgets.QMainWindow):
                     != QtWidgets.QMessageBox.Yes:
                 return False
         self.bridge.cancelled.clear()
+        self._cal_in_schedule = True
         self.tab_schedule.reset_states()
         self.runner = self._make_runner()
         self._set_running_ui(True)
@@ -641,6 +853,7 @@ class LithoWindow(QtWidgets.QMainWindow):
     def abort(self):
         if self.runner is not None:
             self.log("abort requested")
+            self.bridge.cancelled.set()  # releases a wait for the user (e.g. Accept / Discard)
             self.runner.abort()
 
     def wait(self, timeout: float = 10.0) -> bool:
@@ -662,19 +875,54 @@ class LithoWindow(QtWidgets.QMainWindow):
             self.tab_schedule.set_state(data["index"], data["state"], data.get("message", ""))
             if data["state"] == "running":
                 self.tab_schedule.select(data["index"])
+        elif kind == "field":
+            msg = f"field {data['k'] + 1}/{data['n']} {data['name']}: {data['state']}"
+            self.tab_schedule.set_state(data["index"], "running", msg)
+            self.l_run.setText(msg)
+            if data.get("map") is not None:
+                self.last_map = data["map"]
         elif kind == "alignment":
-            self.glob = data["glob"]
-            self.transform = data["transform"]
+            self.chips[data["chip"]] = data["transform"]
             self._update_status()
             self._replan_soon()
+        elif kind == "calibration_start":
+            w = self._calwin()
+            w.start(data["n"], data["position"], data["condition"], data["field_um"], self.axes,
+                    in_schedule=self._cal_in_schedule)
+            w.show()
+            w.raise_()
+        elif kind == "calibration_image":
+            if self.fieldcal_window is not None:
+                self.fieldcal_window.add_image(data["k"], data["n"], data["shift"], data["image"], data["reference"])
         elif kind == "calibration":
             self.calibration = data["result"]
-            self.log(f"field calibration: {self.calibration.describe(self.settings.axes)}")
+            self.log(f"field calibration: {self.calibration.describe(self.axes)}")
+            self._update_status()
+            self._replan_soon()
+        elif kind == "beamcal_start":
+            w = self._beamwin()
+            w.start(data["position"], data["condition"], data["field_um"], data["pixels"])
+            w.show()
+            w.raise_()
+        elif kind == "beamcal_image":
+            if self.beamcal_window is not None:
+                self.beamcal_window.set_image(data["image"], data["pixel_um"])
+        elif kind == "beamcal":
+            self.settings.set_beamcal(data["result"])
+            self._save_settings()
+            self.log(f"beam calibration: {data['result'].describe()} (saved for {data['result'].condition.describe()})")
             self._update_status()
             self._replan_soon()
         elif kind == "exposed":
             self.progress.setValue(1000)
         elif kind == "finished":
+            for w in (self.fieldcal_window, self.beamcal_window):
+                if w is None:
+                    continue
+                if w.isVisible() and w.result is None and data["state"] != "done":
+                    w.failed(data.get("message", data["state"]))
+                else:
+                    w.cancel()
             self._set_running_ui(False)
             self.l_run.setText(data["state"])
             self.runner = None

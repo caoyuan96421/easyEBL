@@ -1,11 +1,10 @@
-"""The stage view: a zoomable, pannable plot in SCS (stage µm) with each field's WCS overlaid.
+"""The stage view: a zoomable, pannable plot in SCS (stage µm) with the chips and their fields.
 
-* every Expose field: its field of view (dashed square at the stage target), its pattern where
-  it will be written (through the field's transform), a cross at its WCS origin; a corrected
-  target is joined to the nominal centre by a thin line;
-* the selected field: highlighted, with its WCS drawn as a Cartesian grid and x / y axes
-  (shifted to the field centre; rotated / stretched once a Global Align is known);
-* Global Align markers (magenta ×), Local XY markers (cyan ×);
+* every field of every Exposure: its field of view (dashed square at the stage target, through
+  the stage → beam rotation), its pattern where the chip map puts it, a cross at its centre;
+* the selected step's fields: highlighted;
+* chips: their CCS origin and x / y axes (through the chip map: nominal, or measured by a Global
+  Align); Global Align markers (magenta ×), Local markers (cyan ×);
 * named stage positions, the stage (white ○) and its current field of view (green).
 """
 from __future__ import annotations
@@ -16,9 +15,9 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore
 
-from ..coords import FieldTransform, StageAxes
+from ..coords import StageAxes
 from ..geometry import Dot, Polygon
-from ..schedule import ExposeField
+from ..schedule import Exposure, exposure_fields
 
 __all__ = ["StageView", "outline_arrays", "nice_step"]
 
@@ -101,7 +100,6 @@ class StageView(pg.PlotWidget):
         self.getPlotItem().getViewBox().setDefaultPadding(0.05)
         self.getPlotItem().getViewBox().setMenuEnabled(False)  # our own context menu (Move…)
         self.getPlotItem().ctrlMenu = None
-        self.show_wcs_grid = True
 
         def item(color, width=1.0, style=None):
             pen = pg.mkPen(color, width=width, style=style) if style is not None else pg.mkPen(color, width=width)
@@ -110,105 +108,115 @@ class StageView(pg.PlotWidget):
             return it
 
         self._plan_fov = item(C_PLAN_FOV, 1, QtCore.Qt.DashLine)
-        self._links = item((150, 150, 170, 140), 1)
-        self._wcs_grid = item(C_WCS, 1)
+        self._links = item(C_WCS, 1.5)  # the chips' CCS axes
         self._patterns = item(C_PATTERN, 1)
         self._warn = item(C_WARN, 1.2)
         self._selected = item(C_SELECTED, 2.2)
-        self._wcs_axes = item(C_SELECTED, 2)
         self._fov = item(C_FOV, 2)
         self._origins = pg.ScatterPlotItem(symbol="+", size=9, pen=pg.mkPen(C_PLAN_FOV[:3], width=1), brush=None)
         self._global = pg.ScatterPlotItem(symbol="x", size=12, pen=pg.mkPen(C_GLOBAL, width=2), brush=None)
         self._local = pg.ScatterPlotItem(symbol="x", size=12, pen=pg.mkPen(C_LOCAL, width=2), brush=None)
         self._positions = pg.ScatterPlotItem(symbol="s", size=10, pen=pg.mkPen(C_POS), brush=pg.mkBrush(C_POS))
         self._stage = pg.ScatterPlotItem(symbol="o", size=16, pen=pg.mkPen((255, 255, 255), width=2), brush=None)
-        for it in (self._origins, self._global, self._local, self._positions, self._stage):
+        self._chips = pg.ScatterPlotItem(symbol="o", size=10, pen=pg.mkPen(C_SELECTED, width=2), brush=None)
+        self._chip_labels: list = []
+        for it in (self._origins, self._global, self._local, self._positions, self._stage, self._chips):
             self.addItem(it)
         self._labels: list = []
-        self._axis_labels = [pg.TextItem("x", color=C_SELECTED, anchor=(0, 0.5)),
-                             pg.TextItem("y", color=C_SELECTED, anchor=(0.5, 1))]
         self._fov_label = pg.TextItem("FoV", color=C_FOV, anchor=(0, 1))
-        for t in (*self._axis_labels, self._fov_label):
-            self.addItem(t)
+        self.addItem(self._fov_label)
         self._boxes: list = []  # (index, x0, y0, x1, y1) for click hit-testing
         self.scene().sigMouseClicked.connect(self._clicked)
         self._fitted = False
+        self.flipped = (False, False)
+
+    def set_orientation(self, axes: StageAxes, as_sem: bool = True) -> None:
+        """*as_sem*: flip the mirrored stage axes so the plot looks like the SEM image (CCS x right,
+        y up); the axis numbers stay stage coordinates (they then run right to left / top down)."""
+        fx, fy = (bool(as_sem and axes.mirror_x), bool(as_sem and axes.mirror_y))
+        if (fx, fy) == self.flipped:
+            return
+        vb = self.getPlotItem().getViewBox()
+        vb.invertX(fx)
+        vb.invertY(fy)
+        self.flipped = (fx, fy)
+        self.setLabel("bottom", "stage X (SCS)" + ("  ← increasing" if fx else ""), "µm")
+        self.setLabel("left", "stage Y (SCS)" + ("  ↓ increasing" if fy else ""), "µm")
 
     # ---------------------------------------------------------------- schedule
-    def set_schedule(self, schedule, library, plans, axes: StageAxes, selected: int | None = None) -> None:
-        normal, warned, sel, fovs, links, origins, glob, loc = [], [], [], [], [], [], [], []
+    def set_schedule(self, schedule, library, plans, axes: StageAxes, selected: int | None = None,
+                     chips: dict | None = None) -> None:
+        """*chips*: {chip name: measured ChipTransform} (else nominal)."""
+        normal, warned, sel, fovs, origins, glob, loc, axes_lines = [], [], [], [], [], [], [], []
         boxes = []
-        sel_frame = None
+        chip_pts = []
+        for c in schedule.chips:
+            g = (chips or {}).get(c.name) or c.nominal(axes)
+            o, x, y = g.to_scs(np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]))
+            span = 50.0
+            axes_lines.append(np.array([o, o + (x - o) * span]))
+            axes_lines.append(np.array([o, o + (y - o) * span]))
+            chip_pts.append((c.name, o, g.measured))
         for i, op in enumerate(schedule.operations):
             p = plans[i] if plans is not None and i < len(plans) else None
-            if not isinstance(op, ExposeField) or p is None or p.target is None:
+            if not isinstance(op, Exposure) or p is None or not p.fields or p.chip is None:
                 continue
-            tgt = np.asarray(p.target, float)
-            tr = p.transform or FieldTransform()
+            g = p.chip
             half = p.field_um / 2.0
-            m = p.frame.B_inv if p.frame is not None else axes.matrix  # BCS → stage (B⁻¹)
-            fovs.append(_beam_square(tgt, half, m))
-            boxes.append((i, tgt[0] - half, tgt[1] - half, tgt[0] + half, tgt[1] + half))
-            org = tgt + m @ tr.shift
-            origins.append(org)
-            if np.hypot(*(tgt - np.asarray(op.centre))) > 1e-6:
-                links.append(np.array([op.centre, tgt]))
-            for wcs, dst in [(mk, glob) for mk in op.active_markers] + ([(op.local_marker, loc)] if op.local_xy else []):
-                dst.append(tgt + m @ tr.to_bcs(wcs))  # markers are WCS: drawn with their field
+            binv = np.linalg.inv(p.stage_to_beam) if p.stage_to_beam is not None else axes.matrix
+            for m in (op.global_markers if op.global_align else []):
+                glob.append(g.to_scs(np.asarray(m, float)))
+            for m in (op.local_markers if op.local_align else []):
+                loc.append(g.to_scs(np.asarray(m, float)))
             try:
-                pat = library.get(op.pattern)
+                defs = exposure_fields(op, library)
             except Exception:  # noqa: BLE001 - a warning in the list
-                pat = []
-            shapes = [tgt + (tr.to_bcs(s) @ m.T) for s in _shapes(pat)]
-            (sel if i == selected else warned if p.warnings else normal).extend(shapes)
-            if i == selected:
-                sel_frame = (tgt, tr, half, m)
+                defs = []
+            for fp in p.fields:
+                tgt = np.asarray(fp.target, float)
+                fovs.append(_beam_square(tgt, half, binv))
+                boxes.append((i, tgt[0] - half, tgt[1] - half, tgt[0] + half, tgt[1] + half))
+                origins.append(tgt)
+                if op.alignment_only or fp.index >= len(defs):
+                    continue
+                try:
+                    pat = library.get(defs[fp.index].spec(op))
+                except Exception:  # noqa: BLE001
+                    pat = []
+                c = np.asarray(fp.centre_ccs, float)
+                shapes = [g.to_scs(s_ + c) for s_ in _shapes(pat)]
+                (sel if i == selected else warned if fp.warnings else normal).extend(shapes)
         self._patterns.setData(*outline_arrays(normal))
         self._warn.setData(*outline_arrays(warned))
         self._selected.setData(*outline_arrays(sel))
         self._plan_fov.setData(*outline_arrays(fovs))
-        self._links.setData(*outline_arrays(links))
+        self._links.setData(*outline_arrays(axes_lines))
         for it, pts in ((self._origins, origins), (self._global, glob), (self._local, loc)):
             if pts:
                 it.setData(pos=np.asarray(pts, float).reshape(-1, 2))
             else:
                 it.clear()
-        self._draw_wcs(sel_frame)
+        self._draw_chips(chip_pts)
         self._boxes = boxes
         if not self._fitted and boxes:
             self._fitted = True
             self.zoom_all()
 
-    def _draw_wcs(self, frame) -> None:
-        """The selected field's WCS: grid and axes, as written (through its transform)."""
-        if frame is None or not self.show_wcs_grid:
-            self._wcs_grid.setData([], [])
-            self._wcs_axes.setData([], [])
-            for t in self._axis_labels:
-                t.setVisible(False)
-            return
-        tgt, tr, half, m = frame
-        step = nice_step(half / 4.0)
-        n = int(half // step)
-        ticks = np.arange(-n, n + 1) * step
-        lines = []
-        for v in ticks:
-            lines.append(np.array([[v, -n * step], [v, n * step]]))
-            lines.append(np.array([[-n * step, v], [n * step, v]]))
-
-        def to_scs(w):
-            return tgt + tr.to_bcs(w) @ m.T
-
-        self._wcs_grid.setData(*outline_arrays([to_scs(l) for l in lines]))
-        ax_len = n * step if n else half
-        o, x, y = to_scs(np.array([[0.0, 0.0], [ax_len, 0.0], [0.0, ax_len]]))
-        self._wcs_axes.setData(*outline_arrays([np.array([o, x]), np.array([o, y])]))
-        self._axis_labels[0].setText(f"x WCS ({step:g} µm grid)")
-        self._axis_labels[0].setPos(*x)
-        self._axis_labels[1].setText("y WCS")
-        self._axis_labels[1].setPos(*y)
-        for t in self._axis_labels:
-            t.setVisible(True)
+    def _draw_chips(self, chips) -> None:
+        for t in self._chip_labels:
+            self.removeItem(t)
+        self._chip_labels = []
+        pts = []
+        for name, o, measured in chips:
+            pts.append(o)
+            t = pg.TextItem(f"{name} (CCS{' aligned' if measured else ''})", color=C_SELECTED, anchor=(0, 0))
+            t.setPos(*o)
+            self.addItem(t)
+            self._chip_labels.append(t)
+        if pts:
+            self._chips.setData(pos=np.asarray(pts, float).reshape(-1, 2))
+        else:
+            self._chips.clear()
 
     # ---------------------------------------------------------------- live state
     def set_fov(self, stage, field_um: float, binv=None) -> None:
@@ -245,7 +253,7 @@ class StageView(pg.PlotWidget):
 
     def zoom_all(self) -> None:
         items = [i for i in (self._plan_fov, self._patterns, self._warn, self._selected, self._fov, self._positions,
-                             self._global, self._local, self._stage)
+                             self._global, self._local, self._stage, self._chips)
                  if i.boundingRect().isValid() and not i.boundingRect().isNull()]
         self.getPlotItem().getViewBox().autoRange(items=items or None)
 

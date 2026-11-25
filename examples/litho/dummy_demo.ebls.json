@@ -1,6 +1,6 @@
 {
  "format": "easyebl-schedule",
- "version": 2,
+ "version": 3,
  "name": "dummy demo",
  "settings": {
   "fill_direction": "x",
@@ -9,6 +9,16 @@
   "on_out_of_field": "ask"
  },
  "vector_settings": {},
+ "chips": [
+  {
+   "name": "Demo chip",
+   "origin": [
+    5000.0,
+    5000.0
+   ],
+   "note": ""
+  }
+ ],
  "operations": [
   {
    "type": "column",
@@ -26,69 +36,64 @@
    "notes": ""
   },
   {
-   "type": "expose",
-   "label": "dummy 1",
+   "type": "exposure",
+   "label": "no alignment",
    "enabled": true,
-   "centre": [
-    5000.0,
-    5000.0
+   "chip": "Demo chip",
+   "path": "multifield_demo.gds",
+   "top": "",
+   "layers": [
+    [
+     1,
+     0
+    ]
    ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "dummy",
-    "size_um": 40.0
+   "dose": {
+    "mode": "auto",
+    "property_attr": null,
+    "table": {},
+    "default": 1.0,
+    "value_scale": 1.0
    },
-   "dwell_us": 1.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": false,
-   "local_marker": [
+   "offset": [
     0.0,
     0.0
    ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "dummy 2",
-   "enabled": true,
-   "centre": [
-    5100.0,
-    5000.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "dummy",
-    "size_um": 60.0
-   },
+   "cell_origin": false,
+   "order": "file",
    "dwell_us": 0.5,
    "step_nm": 20.0,
    "global_align": false,
-   "markers": [],
-   "local_xy": false,
-   "local_marker": [
-    0.0,
-    0.0
-   ],
+   "global_markers": [],
+   "local_align": false,
+   "local_markers": [],
    "view_um": 10.0
   },
   {
-   "type": "expose",
+   "type": "exposure",
    "label": "align only",
    "enabled": true,
-   "centre": [
-    5200.0,
-    5000.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "none"
+   "chip": "Demo chip",
+   "path": "",
+   "top": "",
+   "layers": null,
+   "dose": {
+    "mode": "auto",
+    "property_attr": null,
+    "table": {},
+    "default": 1.0,
+    "value_scale": 1.0
    },
+   "offset": [
+    0.0,
+    0.0
+   ],
+   "cell_origin": false,
+   "order": "file",
    "dwell_us": 1.0,
    "step_nm": 20.0,
    "global_align": true,
-   "markers": [
+   "global_markers": [
     [
      -45.0,
      -45.0
@@ -98,11 +103,8 @@
      45.0
     ]
    ],
-   "local_xy": false,
-   "local_marker": [
-    0.0,
-    0.0
-   ],
+   "local_align": false,
+   "local_markers": [],
    "view_um": 10.0
   }
  ]

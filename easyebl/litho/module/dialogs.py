@@ -1,35 +1,27 @@
-"""Dialogs of the litho window: stage axes, fractured-GDS import, moving all fields."""
+"""Dialogs of the litho window: stage settings, moving a chip, field / beam calibration settings."""
 from __future__ import annotations
-
-import os
 
 from PySide6 import QtWidgets
 
+from ..beamcal import BeamCalConfig
 from ..coords import StageAxes
 from ..fieldcal import FieldCalConfig
-from ..fracture import ImportOptions, build_schedule, find_fields
-from ..gds import GDSDoseMapping, gds_info
-from .tabs import _spin, mag_combo
+from .tabs import _spin
 
-__all__ = ["StageAxesDialog", "ImportDialog", "MoveFieldsDialog", "FieldCalDialog"]
+__all__ = ["StageAxesDialog", "MoveFieldsDialog", "FieldCalDialog", "BeamCalDialog"]
 
 
 class StageAxesDialog(QtWidgets.QDialog):
-    """Stage settings of the litho module: the stage axes against the beam axes (the nominal
-    stage → beam map, used where no field calibration applies) and the position tolerance."""
+    """Stage settings of the litho module: the position tolerance.  The stage axes (mirror) are shown
+    only: they are a hardware setting (Hardware → Configure… → Microscope)."""
 
-    def __init__(self, axes: StageAxes, parent=None, tolerance_um: float = 1.0):
+    def __init__(self, axes: StageAxes, parent=None, tolerance_um: float = 0.5):
         super().__init__(parent)
         self.setWindowTitle("Stage settings")
-        self.mx = QtWidgets.QCheckBox("mirror X: moving the stage to +X moves the image of the sample to +x")
-        self.my = QtWidgets.QCheckBox("mirror Y: moving the stage to +Y moves the image of the sample to +y")
-        self.mx.setChecked(axes.mirror_x)
-        self.my.setChecked(axes.mirror_y)
+        self.axes = axes
         text = QtWidgets.QLabel(
-            "Normally moving the stage to +X brings sample features further in +X into view, so the image of the "
-            "sample moves to −x.  Tick an axis where the SEM image moves the other way.  Field centres, markers and "
-            "the GDS importer use this.  Where no field calibration applies, stage and beam axes are taken as "
-            "parallel with equal scale; a field calibration measures them.")
+            f"Stage axes: {axes.describe()}.\nThey are set in the easyEBL menu: Hardware → Configure… → "
+            "Devices → Microscope (mirror X: moving the stage to +X moves the image of the sample to +x).")
         text.setWordWrap(True)
         self.tol = _spin(tolerance_um, 0.01, 1000, 2, " µm", 0.1)
         self.tol.setToolTip("a schedule step fails when the stage reads back farther than this from its target")
@@ -39,177 +31,20 @@ class StageAxesDialog(QtWidgets.QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay = QtWidgets.QVBoxLayout(self)
-        for w in (text, self.mx, self.my):
-            lay.addWidget(w)
+        lay.addWidget(text)
         lay.addLayout(tf)
         lay.addWidget(bb)
-        self.resize(520, 260)
+        self.resize(520, 200)
 
     def value(self) -> StageAxes:
-        return StageAxes(self.mx.isChecked(), self.my.isChecked())
+        return self.axes
 
     def tolerance(self) -> float:
         return float(self.tol.value())
 
 
-class ImportDialog(QtWidgets.QDialog):
-    """Fractured GDS → schedule (see :mod:`easyebl.litho.fracture`)."""
-
-    def __init__(self, path: str, library, presets=None, axes: StageAxes | None = None, stage_position=None,
-                 magnification: int = 1000, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Import fractured GDS – {os.path.basename(path)}")
-        self.path = path
-        self.library = library
-        self.axes = axes or StageAxes()
-        self.stage_position = stage_position or (lambda: None)
-        self.fields: list = []
-        info = gds_info(path)
-        self.source = QtWidgets.QComboBox()
-        for k, t in (("auto", "auto"), ("references", "references in the top cell"), ("cells", "top-level cells")):
-            self.source.addItem(t, k)
-        self.top = QtWidgets.QComboBox()
-        self.top.addItems(info["top"])
-        self.order = QtWidgets.QComboBox()
-        for k, t in (("file", "as in the file"), ("raster", "rows, left → right"), ("serpentine", "serpentine")):
-            self.order.addItem(t, k)
-        pairs = ", ".join(f"{l}/{d}" for l, d in info["layers"][:8]) + ("…" if len(info["layers"]) > 8 else "")
-        self.layers = QtWidgets.QLineEdit()
-        self.layers.setPlaceholderText(f"all ({pairs})")
-        self.dose_mode = QtWidgets.QComboBox()
-        self.dose_mode.addItems(["auto", "property", "datatype", "layer", "none"])
-        self.dose_table = QtWidgets.QLineEdit()
-        self.dose_table.setPlaceholderText("e.g. 0:1.0, 1:1.25 (datatype: dwell factor)")
-        self.ox, self.oy = _spin(0, decimals=2), _spin(0, decimals=2)
-        b_cur = QtWidgets.QPushButton("Use current stage position")
-        b_cur.clicked.connect(self._use_stage)
-        self.mag = mag_combo(magnification)
-        self.preset = QtWidgets.QComboBox()
-        self.preset.addItem("Keep as is", "")
-        for n in presets or []:
-            self.preset.addItem(n, n)
-        self.current = _spin(0, 0, 1e6, 2, " pA", 10)
-        self.current.setSpecialValueText("unknown")
-        self.glob = QtWidgets.QCheckBox("Global Align at the first field")
-        self.m1x, self.m1y, self.m2x, self.m2y = _spin(-40), _spin(-40), _spin(40), _spin(40)
-        self.loc = QtWidgets.QCheckBox("Local XY at every field")
-        self.lx, self.ly = _spin(-40), _spin(-40)
-        self.view = _spin(10, 0.01, 1e5)
-        self.dwell = _spin(1, 0.001, 1e6, 3, " µs", 0.1)
-        self.step = _spin(20, 0.1, 1e5, 2, " nm", 1)
-        self.info = QtWidgets.QLabel()
-        self.info.setWordWrap(True)
-        b_scan = QtWidgets.QPushButton("Find fields")
-        b_scan.clicked.connect(self.scan)
-
-        def pair(a, b):
-            w = QtWidgets.QWidget()
-            h = QtWidgets.QHBoxLayout(w)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.addWidget(a)
-            h.addWidget(b)
-            return w
-
-        f = QtWidgets.QFormLayout()
-        f.addRow("fields", self.source)
-        f.addRow("top cell", self.top)
-        f.addRow("order", self.order)
-        f.addRow("layers", self.layers)
-        f.addRow("dose source", self.dose_mode)
-        f.addRow("dose table", self.dose_table)
-        f.addRow("layout origin at stage", pair(self.ox, self.oy))
-        f.addRow(b_cur)
-        f.addRow("magnification", self.mag)
-        f.addRow("beam", self.preset)
-        f.addRow("nominal current", self.current)
-        f.addRow(self.glob)
-        f.addRow("marker 1 (WCS)", pair(self.m1x, self.m1y))
-        f.addRow("marker 2 (WCS)", pair(self.m2x, self.m2y))
-        f.addRow(self.loc)
-        f.addRow("local marker (WCS)", pair(self.lx, self.ly))
-        f.addRow("marker view", self.view)
-        f.addRow("dwell / point", self.dwell)
-        f.addRow("point step", self.step)
-        f.addRow(b_scan)
-        f.addRow(self.info)
-        self.replace = QtWidgets.QCheckBox("replace the current schedule (else append the fields)")
-        self.replace.setChecked(True)
-        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Import")
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        w = QtWidgets.QWidget()
-        w.setLayout(f)
-        sc = QtWidgets.QScrollArea()
-        sc.setWidget(w)
-        sc.setWidgetResizable(True)
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.addWidget(sc, 1)
-        lay.addWidget(self.replace)
-        lay.addWidget(bb)
-        self.resize(540, 800)
-        self.scan()
-
-    def _use_stage(self):
-        pos = self.stage_position()
-        if pos is None:
-            self.info.setText("<span style='color:#f66'>the stage position is not known</span>")
-            return
-        self.ox.setValue(pos[0])
-        self.oy.setValue(pos[1])
-
-    def options(self) -> ImportOptions:
-        layers = None
-        txt = self.layers.text().strip()
-        if txt:
-            layers = []
-            for part in txt.replace(";", ",").split(","):
-                part = part.strip()
-                if "/" in part:
-                    a, b = part.split("/")
-                    layers.append((int(a), int(b)))
-                elif part:
-                    layers.append(int(part))
-        table = {}
-        for part in self.dose_table.text().split(","):
-            if ":" in part:
-                k, v = part.split(":")
-                table[int(k)] = float(v)
-        return ImportOptions(
-            source=self.source.currentData(), top=self.top.currentText() or None, layers=layers,
-            dose=GDSDoseMapping(self.dose_mode.currentText(), None, table), order=self.order.currentData(),
-            origin_scs=(self.ox.value(), self.oy.value()), axes=self.axes, magnification=self.mag.currentData(),
-            beam_preset=self.preset.currentData(), current_pa=self.current.value() or None,
-            global_align=self.glob.isChecked(),
-            global_markers=((self.m1x.value(), self.m1y.value()), (self.m2x.value(), self.m2y.value())),
-            local_xy=self.loc.isChecked(), local_marker=(self.lx.value(), self.ly.value()), view_um=self.view.value(),
-            dwell_us=self.dwell.value(), step_nm=self.step.value())
-
-    def scan(self) -> list:
-        try:
-            self.fields = find_fields(self.path, self.options(), self.library)
-        except Exception as e:  # noqa: BLE001 - shown
-            self.fields = []
-            self.info.setText(f"<span style='color:#f66'>{type(e).__name__}: {e}</span>")
-            return []
-        if not self.fields:
-            self.info.setText("<span style='color:#f66'>no non-empty fields</span>")
-            return []
-        w = max(max(f.size) for f in self.fields)
-        self.info.setText(f"{len(self.fields)} field(s), {sum(f.n_elements for f in self.fields)} elements; "
-                          f"largest field {w:.2f} µm")
-        return self.fields
-
-    def schedule(self):
-        if not self.fields:
-            self.scan()
-        if not self.fields:
-            raise ValueError("no fields to import")
-        return build_schedule(self.fields, self.options(), os.path.splitext(os.path.basename(self.path))[0])
-
-
 class MoveFieldsDialog(QtWidgets.QDialog):
-    """Move all fields as a whole: a reference point of the schedule → a target stage position.
+    """Move a chip (its nominal CCS origin, with all its fields): a reference point → a target stage position.
 
     *anchors*: {key: (label, (x, y) | None)} – e.g. the first field's centre, the centre of the
     bbox of all fields, marker 1 of the first field with Global Align (None: not available).
@@ -217,7 +52,7 @@ class MoveFieldsDialog(QtWidgets.QDialog):
 
     def __init__(self, anchors: dict, stage=None, click=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Move all fields")
+        self.setWindowTitle("Move the chip")
         self.anchors = anchors
         self.targets = {"stage": ("current stage position", stage), "click": ("the clicked position", click),
                         "abs": ("stage coordinate", None)}
@@ -302,7 +137,7 @@ class MoveFieldsDialog(QtWidgets.QDialog):
         self.ax.setEnabled(self.to_buttons["abs"].isChecked())
         self.ay.setEnabled(self.to_buttons["abs"].isChecked())
         v = self.value()
-        self.shift.setText("every field moves by " + (f"({v[0]:+.3f}, {v[1]:+.3f}) µm" if v else "–"))
+        self.shift.setText("the chip origin moves by " + (f"({v[0]:+.3f}, {v[1]:+.3f}) µm" if v else "–"))
         if hasattr(self, "bb"):
             self.bb.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(v is not None)
 
@@ -318,8 +153,8 @@ class FieldCalDialog(QtWidgets.QDialog):
         intro = QtWidgets.QLabel(
             "At a fixed stage position with a feature that has structure (a Faraday cup, a calibration sample), "
             "images are taken at known stage shifts; their shifts give the stage → beam map: the rotation between "
-            "stage and beam and the scale error of the field.  It is valid for the magnification and beam preset "
-            "it was measured at.")
+            "stage and beam (the images go through the beam calibration of the condition: run that first).  It is "
+            "valid for the magnification, beam preset and WD it was measured at.")
         intro.setWordWrap(True)
         self.pos = QtWidgets.QComboBox()
         self.pos.addItem("the coordinates below", "")
@@ -392,3 +227,61 @@ class FieldCalDialog(QtWidgets.QDialog):
                               image_fraction=self.width.value() / 100.0, image_px=int(self.px.currentData()),
                               frames=int(self.frames.value()), settle_s=self.settle.value(),
                               max_residual_px=self.maxres.value())
+
+
+class BeamCalDialog(QtWidgets.QDialog):
+    """Beam calibration settings: the named stage position of the grid sample (X, Y, Z) and the image."""
+
+    def __init__(self, config: BeamCalConfig, positions: dict, last=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Beam calibration")
+        intro = QtWidgets.QLabel(
+            "One image of a calibration sample with a square grid (1 µm pitch) over the whole field of view, at "
+            "≤ 0.1 µm pixels (5000 × 5000 for a 500 µm field).  The fit gives the beam's X / Y scale, shear "
+            "and pincushion distortion (the grid's rotation and shift are left out).  Valid for the magnification and "
+            "WD it was measured at; run it before the field calibration.")
+        intro.setWordWrap(True)
+        self.pos = QtWidgets.QComboBox()
+        for n, p in positions.items():
+            z = p[2] if len(p) > 2 else None
+            self.pos.addItem(f"{n}  ({p[0]:.1f}, {p[1]:.1f}" + (f", Z {z:.1f})" if z is not None else ", Z not stored)"), n)
+        if config.position and self.pos.findData(config.position) < 0:
+            self.pos.addItem(f"{config.position} (unknown)", config.position)
+        if config.position:
+            self.pos.setCurrentIndex(max(0, self.pos.findData(config.position)))
+        self.px = QtWidgets.QSpinBox()
+        self.px.setRange(200, 20000)
+        self.px.setSingleStep(500)
+        self.px.setValue(int(config.pixels))
+        self.px.setSuffix(" px across")
+        self.pitch = _spin(config.pitch_um, 0.05, 100, 3, " µm", 0.1)
+        self.frames = QtWidgets.QSpinBox()
+        self.frames.setRange(1, 64)
+        self.frames.setValue(config.frames)
+        self.maxrms = _spin(config.max_rms_um * 1e3, 1, 5000, 0, " nm", 10)
+        f = QtWidgets.QFormLayout()
+        f.addRow("grid sample at", self.pos)
+        f.addRow("image", self.px)
+        f.addRow("grid pitch", self.pitch)
+        f.addRow("frames averaged", self.frames)
+        f.addRow("refuse a fit worse than", self.maxrms)
+        self.last = QtWidgets.QLabel("for the condition now: " + (last if last else "none"))
+        self.last.setWordWrap(True)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(intro)
+        if not positions:
+            w = QtWidgets.QLabel("No stage positions yet: add the grid sample's position in the Stage Positions tab.")
+            w.setStyleSheet("color:#fb4")
+            w.setWordWrap(True)
+            lay.addWidget(w)
+        lay.addLayout(f)
+        lay.addWidget(self.last)
+        lay.addWidget(bb)
+        self.resize(560, 420)
+
+    def value(self) -> BeamCalConfig:
+        return BeamCalConfig(pitch_um=self.pitch.value(), pixels=int(self.px.value()), frames=int(self.frames.value()),
+                             max_rms_um=self.maxrms.value() * 1e-3, position=self.pos.currentData() or "")

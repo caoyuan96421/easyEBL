@@ -70,6 +70,10 @@ class MicroscopeSection:
 
     port: str = "sim"  # "COM4" …, "sim" (simulator) or "none"
     baudrate: int = 9600  # the S-3000 uses 9600 8N1
+    #: stage axes against the SEM image (the lithography's stage → beam map): moving the stage to +X
+    #: moves the image of the sample to +x (S-3000: X yes, Y no)
+    stage_mirror_x: bool = True
+    stage_mirror_y: bool = False
 
 
 @dataclass

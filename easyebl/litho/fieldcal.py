@@ -11,10 +11,12 @@ sample …) the procedure
 4. fits ``B`` (and a constant drift) by least squares; the residuals tell how well the
    images matched.
 
-The stage is the length reference (encoders): ``B`` holds the rotation between stage and
-beam axes, the mirror of the stage axes and the beam's scale error against the global
-field calibration (typically ±1 %).  The result is valid for the column condition it
-was measured at (magnification and beam preset).
+The image shifts are converted to BCS (true µm) through the beam calibration of the condition
+(its linear part), so ``B`` holds the rotation between stage and beam axes and the mirror of the
+stage axes; its scale (stage encoder against the calibration grid) is a cross-check only – the
+exposure uses the rotation (:func:`~easyebl.litho.coords.stage_rotation`).  The result is valid
+for the column condition it was measured at (magnification, beam preset, WD) and the beam
+calibration it was measured through.
 """
 from __future__ import annotations
 
@@ -32,19 +34,50 @@ __all__ = ["FieldCalConfig", "FieldCalResult", "Condition", "phase_correlation",
 
 
 class FieldCalError(RuntimeError):
-    pass
+    """A calibration that failed; *result* holds what was measured when the fit was refused."""
+
+    def __init__(self, message: str, result: "FieldCalResult | None" = None):
+        super().__init__(message)
+        self.result = result
+
+
+#: two working distances closer than this are the same condition (mm)
+WD_TOLERANCE_MM = 0.1
 
 
 @dataclass(frozen=True)
 class Condition:
-    """The column condition a calibration belongs to (preset None: not known / kept as it was)."""
+    """The column condition a calibration belongs to (preset None: not known / kept as it was;
+    wd_mm: the working distance computed from the focus, None: not known)."""
 
     magnification: float | None
     preset: str | None = None
+    wd_mm: float | None = None
 
     def describe(self) -> str:
         m = f"×{self.magnification:g}" if self.magnification else "×?"
+        if self.wd_mm is not None:
+            m += f", WD {self.wd_mm:.2f} mm"
         return m + (f", beam {self.preset!r}" if self.preset else "")
+
+    def same_wd(self, other: "Condition", tol_mm: float = WD_TOLERANCE_MM) -> bool:
+        if self.wd_mm is None or other.wd_mm is None:
+            return self.wd_mm is None and other.wd_mm is None
+        return abs(float(self.wd_mm) - float(other.wd_mm)) <= tol_mm + 1e-9
+
+    def matches(self, other: "Condition", preset: bool = True) -> bool:
+        """Same magnification and WD (±:data:`WD_TOLERANCE_MM`), and preset unless *preset* is False."""
+        if other is None or self.magnification != other.magnification or not self.same_wd(other):
+            return False
+        return not preset or self.preset == other.preset
+
+    def to_dict(self) -> dict:
+        return {"magnification": self.magnification, "preset": self.preset, "wd_mm": self.wd_mm}
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "Condition":
+        d = d or {}
+        return cls(d.get("magnification"), d.get("preset"), d.get("wd_mm"))
 
 
 @dataclass
@@ -81,12 +114,61 @@ class FieldCalResult:
     n_images: int
     timestamp: float = field(default_factory=time.time)
     shifts: list = field(default_factory=list)  # [(Δs, measured image shift)] for display
+    predicted: list = field(default_factory=list)  # nominal image shift of each image (stage axes)
+    quality: list = field(default_factory=list)  # phase-correlation peak of each image (0…1)
+    drift: tuple = (0.0, 0.0)  # constant image shift of the fit (µm)
+    pixel_um: float = 0.0
+    problem: str | None = None  # why the fit was refused (None: usable)
+    beamcal_id: str | None = None  # the beam calibration the images went through (None: none)
 
     def __post_init__(self):
         self.stage_to_beam = np.asarray(self.stage_to_beam, float).reshape(2, 2)
 
-    def valid_for(self, condition: Condition) -> bool:
-        return self.condition == condition
+    def residuals(self) -> np.ndarray:
+        """Measured − fitted image shift of each image (N, 2) µm."""
+        if not self.shifts:
+            return np.zeros((0, 2))
+        s = np.array([a for a, _ in self.shifts], float)
+        m = np.array([b for _, b in self.shifts], float)
+        return m - (-(s @ self.stage_to_beam.T) + np.asarray(self.drift, float))
+
+    def mirror_mismatch(self, axes: StageAxes) -> bool:
+        """The images move against what the stage axes say (``B·M`` mirrored)."""
+        return bool(np.linalg.det(self.correction(axes)) < 0)
+
+    def suggested_axes(self) -> StageAxes:
+        """The stage axes the measured map matches (the sign of each axis)."""
+        b = self.stage_to_beam
+        return StageAxes(mirror_x=bool(b[0, 0] < 0), mirror_y=bool(b[1, 1] < 0))
+
+    def diagnostics(self, axes: StageAxes | None = None) -> dict:
+        """Numbers for the result window: of ``B·M`` (the correction against the stage axes).  When
+        the images move against the stage axes, the numbers are against the axes the measurement
+        says (``axes_used``) – against the wrong ones they would be a 180° rotation and a mirror."""
+        axes = axes or StageAxes()
+        mismatch = self.mirror_mismatch(axes)
+        used = self.suggested_axes() if mismatch else axes
+        c = self.correction(used)
+        p = linear_params(c)
+        res = self.residuals()
+        px = self.pixel_um or 1.0
+        return {
+            "rotation_mrad": p["rotation_mrad"], "rotation_deg": math.degrees(p["rotation_mrad"] * 1e-3),
+            "scale": p["scale"], "scale_x": float(np.hypot(*c[:, 0])), "scale_y": float(np.hypot(*c[:, 1])),
+            "stretch": p["stretch"], "shear_mrad": p["shear"] * 1e3,
+            "mirror_mismatch": mismatch, "suggested_axes": self.suggested_axes(), "axes_used": used,
+            "drift_um": tuple(map(float, self.drift)),
+            "rms_um": self.residual_um, "rms_px": self.residual_um / px,
+            "max_residual_um": float(np.max(np.hypot(res[:, 0], res[:, 1]))) if len(res) else 0.0,
+            "weakest_match": float(min(self.quality)) if self.quality else float("nan"),
+            "matrix": c,
+        }
+
+    def valid_for(self, condition: Condition, beamcal=None) -> bool:
+        """Measured at *condition* (magnification, preset, WD) through the beam calibration
+        *beamcal* that applies now (None: none)."""
+        bid = getattr(beamcal, "id", None) if beamcal is not None else None
+        return self.condition.matches(condition) and self.beamcal_id == bid
 
     def correction(self, axes: StageAxes) -> np.ndarray:
         """``B·M``: how true WCS µm along the stage axes appear in BCS (identity when nominal)."""
@@ -94,11 +176,12 @@ class FieldCalResult:
 
     def describe(self, axes: StageAxes | None = None) -> str:
         p = linear_params(self.correction(axes or StageAxes()))
-        mirror = np.linalg.det(self.correction(axes or StageAxes())) < 0
+        mirror = self.mirror_mismatch(axes or StageAxes())
         s = (f"rot {p['rotation_mrad']:+.2f} mrad, scale {p['scale']:.4f}"
              + (f", stretch {p['stretch'] * 1e3:+.1f}‰" if abs(p["stretch"]) > 5e-4 else "")
              + (" (MIRRORED: check the stage axes)" if mirror else ""))
-        return s + f" @ {self.condition.describe()}, rms {self.residual_um * 1e3:.0f} nm"
+        s += f" @ {self.condition.describe()}, rms {self.residual_um * 1e3:.0f} nm"
+        return s + ("" if self.beamcal_id else " (no beam calibration)")
 
 
 def shift_pattern(pattern: str, d: float) -> np.ndarray:
@@ -191,10 +274,16 @@ def fit_stage_to_beam(stage_shifts, image_shifts) -> tuple[np.ndarray, np.ndarra
 # ====================================================================== procedure
 def measure_field_calibration(hw, config: FieldCalConfig, position, condition: Condition,
                               log: Callable[[str], None] | None = None, check: Callable[[], None] | None = None,
-                              axes: StageAxes | None = None) -> FieldCalResult:
+                              axes: StageAxes | None = None, on_image: Callable | None = None,
+                              beamcal=None) -> FieldCalResult:
     """Run the calibration on *hw* (a :class:`~easyebl.litho.runner.LithoHardware` with
-    ``capture_image``) at stage *position* (SCS).  *check()* raises to abort between images.
-    The stage is back at *position* afterwards."""
+    ``capture_image``) at stage *position* (SCS).  *check()* raises to abort between images;
+    ``on_image(k, n, shift, image, reference)`` after each image.  The stage is back at *position*
+    afterwards.  A refused fit raises :class:`FieldCalError` with the result attached.
+
+    Each image is matched for the stage axes as set and for the other mirrorings too (the best
+    match wins), so a wrong mirror setting shows in the result instead of spoiling it.  The image
+    shifts (XCS) are converted to BCS through *beamcal* (its linear part; None: XCS = BCS)."""
     log = log or (lambda text: None)
     check = check or (lambda: None)
     field_um = float(hw.field_um())
@@ -219,6 +308,8 @@ def measure_field_calibration(hw, config: FieldCalConfig, position, condition: C
             img, px = hw.capture_image(width, config.image_px, config.frames)
             pixel = px
             images.append(np.asarray(img, float))
+            if on_image is not None:
+                on_image(k, len(shifts), (float(ds[0]), float(ds[1])), images[-1], images[0])
             log(f"field calibration image {k + 1}/{len(shifts)}: stage shift ({ds[0]:+.2f}, {ds[1]:+.2f}) µm")
     finally:
         try:
@@ -226,21 +317,45 @@ def measure_field_calibration(hw, config: FieldCalConfig, position, condition: C
         except Exception:  # noqa: BLE001 - the measurement error (if any) is the one to report
             pass
     ref = images[0]
-    meas, quality = [], []
+    meas, quality, predicted = [], [], []
     nominal = axes.matrix if axes is not None else np.eye(2)
+    mirrors = [nominal] + [np.diag(d) for d in ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
+                           if not np.allclose(np.diag(d), nominal)]
     for img, ds in zip(images, shifts):
-        e = -nominal @ ds  # the expected image shift (BCS µm) for the nominal stage → beam map
-        dc, dr, q = phase_correlation(ref, img, guess=(e[0] / pixel[0], -e[1] / pixel[1]))
+        predicted.append(tuple(map(float, -nominal @ ds)))  # the nominal image shift (µm)
+        best = None
+        for m in mirrors:
+            e = -m @ ds
+            try:
+                dc, dr, q = phase_correlation(ref, img, guess=(e[0] / pixel[0], -e[1] / pixel[1]))
+            except FieldCalError:
+                continue
+            if best is None or q > best[2] + 1e-9:
+                best = (dc, dr, q)
+            if not ds.any():
+                break  # the reference itself
+        if best is None:
+            raise FieldCalError("the images hardly overlap (stage shift too large for the image)")
+        dc, dr, q = best
         meas.append((dc * pixel[0], -dr * pixel[1]))  # rows run down, y up
         quality.append(q)
     meas = np.array(meas)
+    if beamcal is not None:
+        meas = np.atleast_2d(beamcal.linear_to_bcs(meas))
     b, drift, res = fit_stage_to_beam(shifts, meas)
     rms = float(np.sqrt(np.mean(np.sum(res ** 2, axis=1))))
-    if rms > config.max_residual_px * max(pixel):
-        raise FieldCalError(f"the images do not match well (fit rms {rms * 1e3:.0f} nm = {rms / max(pixel):.1f} px; "
-                            "is there a feature with structure in the field?)")
     out = FieldCalResult(b, condition, field_um, (float(pos[0]), float(pos[1])), rms, len(shifts),
-                         shifts=[(tuple(s), tuple(m)) for s, m in zip(shifts, meas)])
-    log(f"field calibration: {out.describe()} (drift {drift[0] * 1e3:+.0f}, {drift[1] * 1e3:+.0f} nm, "
+                         shifts=[(tuple(map(float, s)), tuple(map(float, m))) for s, m in zip(shifts, meas)],
+                         predicted=predicted, quality=quality, drift=(float(drift[0]), float(drift[1])),
+                         pixel_um=float(max(pixel)), beamcal_id=getattr(beamcal, "id", None))
+    if rms > config.max_residual_px * max(pixel):
+        out.problem = (f"the images do not match well (fit rms {rms * 1e3:.0f} nm = {rms / max(pixel):.1f} px; "
+                       "is there a feature with structure in the field?)")
+        raise FieldCalError(out.problem, out)
+    log(f"field calibration: {out.describe(axes)} (drift {drift[0] * 1e3:+.0f}, {drift[1] * 1e3:+.0f} nm, "
         f"weakest match {min(quality):.2f})")
+    if axes is not None and out.mirror_mismatch(axes):
+        sug = out.suggested_axes()
+        log("field calibration: the images move against the stage axes setting; it should be mirror X "
+            f"{'on' if sug.mirror_x else 'off'}, mirror Y {'on' if sug.mirror_y else 'off'} (Hardware → Configure… → Microscope)")
     return out

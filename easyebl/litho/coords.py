@@ -1,34 +1,30 @@
-"""Coordinate systems of the lithography module: SCS, WCS (per field) and BCS.
+"""Coordinate systems of the lithography module and the maps between them.
 
-* **SCS** – stage coordinates (µm): what the litho window plots.  Field centres and
-  alignment markers are entered in SCS (typically: centre a feature, take the stage position).
-* **WCS** – working coordinates of one field (µm): (0, 0) is the field centre, the
-  pattern's GDS cell coordinates are WCS.  A sample point at stage position ``p`` has
-  ``wcs = M · (p − centre)``: WCS has true (stage) µm and the stage axes, ``M``
-  (:class:`StageAxes`) mirroring stage axes that run against the beam axes.
-* **BCS** – beam coordinates (µm, the deflection field, origin at its centre); internal.
+==========  =====================================================================================
+GDS         coordinates of an Exposure's GDS file (top-level cell, µm)
+CCS         chip coordinates (µm): ``ccs = gds + o`` (*o*: the Exposure's offset, no rotation).
+            The axes are the layout's (as seen in the SEM image).
+FCS         field coordinates: ``fcs = ccs − c_f`` (*c_f*: the field centre, a cell of the GDS)
+SCS         stage coordinates (µm, the encoder read-back)
+BCS         true µm of the nominal beam position along the scan axes, from the field centre
+XCS         scanner coordinates: deflection volts ÷ (V/µm) of the global field calibration
+==========  =====================================================================================
 
-The stage → beam map ``B`` (:class:`StageFrame`): a stage displacement ``d`` moves a
-feature of the sample by ``−B·d`` in BCS.  Nominally ``B = M`` (beam and stage parallel,
-equal scale); the **field calibration** measures it (rotation between stage and beam,
-the beam's scale error).  A field without Global Align is written through
-``A = B·M`` (true µm along the stage axes).
+The chain, for a point of field *f* with the stage read back at ``ŝ``::
 
-With the stage at the field's target, a field is written through :class:`FieldTransform`::
+    scs = G(ccs) = A_g·ccs + t_g                       (ChipTransform; Global Align)
+    s_f = G(c_f)                                       (stage target of the field)
+    bcs = B·(A_g·fcs + G(c_f) − ŝ + δ_f)               (FieldMap; δ_f: Local marker, SCS)
+    xcs = L⁻¹·bcs·(1 − k·|bcs|²)                       (beam calibration, one-step inverse)
 
-    bcs = A · wcs + t
-
-``A`` comes from the last **Global Align** (rotation, scale, stretch; kept until the next
-one), ``t`` is measured by the Global Align / **Local XY** of this field (0 otherwise).
-
-:class:`GlobalAlignment` keeps where the last Global Align was measured, so a later
-field's centre can be corrected: the stage goes to
-
-    origin_ref + M · A · M · (centre − centre_ref)
-
-where ``origin_ref = target_ref + M · t_ref`` is the measured WCS origin of the reference
-field in SCS – the nominal spacing between the field centres, transformed by the measured
-global alignment.
+* ``G`` – nominal ``A_g = M`` (the stage axes' mirror, :class:`StageAxes`), ``t_g`` = the chip
+  origin on the stage; a Global Align fits it (2 markers: rotation, scale, shift on top of
+  ``M``; 3–4: full affine).  It stays for every later Exposure of the chip.
+* ``B`` – SCS → BCS: the rotation of the field calibration (:func:`stage_rotation`) with the
+  mirror ``M``; nominal ``B = M``.  Its scale / shear are not written with (they come from the
+  beam calibration, or from the alignment).
+* Marker picking runs the chain backwards with the same maps (clicked xcs → bcs → scs), so
+  within a field ``L`` and ``B`` cancel between measuring and writing.
 """
 from __future__ import annotations
 
@@ -40,7 +36,8 @@ import numpy as np
 from ..alignment.fitting import fit_transform
 from ..core.transforms import AffineTransform
 
-__all__ = ["StageAxes", "StageFrame", "FieldTransform", "GlobalAlignment", "fit_global", "fit_local", "FieldCheck", "check_field"]
+__all__ = ["StageAxes", "S3000_AXES", "ChipTransform", "fit_chip", "stage_rotation", "FieldMap", "FieldCheck",
+           "check_field", "linear_params", "describe_linear"]
 
 
 def _pt(p) -> np.ndarray:
@@ -52,7 +49,8 @@ def _pt(p) -> np.ndarray:
 
 @dataclass(frozen=True)
 class StageAxes:
-    """Stage axes against the beam axes: ``mirror_x`` – stage +X moves the sample image along −x."""
+    """Stage axes against the beam axes: ``mirror_x`` – stage +X moves the sample image along −x.
+    Set in Hardware → Configure… (Microscope)."""
 
     mirror_x: bool = False
     mirror_y: bool = False
@@ -61,91 +59,24 @@ class StageAxes:
     def matrix(self) -> np.ndarray:
         return np.diag([-1.0 if self.mirror_x else 1.0, -1.0 if self.mirror_y else 1.0])
 
-    def scs_to_wcs(self, scs, centre) -> np.ndarray:
-        """Nominal WCS of stage points (a field centred at *centre*)."""
-        return (np.atleast_2d(np.asarray(scs, float)) - _pt(centre)) @ self.matrix.T
-
-    def wcs_to_scs(self, wcs, centre) -> np.ndarray:
-        return np.atleast_2d(np.asarray(wcs, float)) @ self.matrix.T + _pt(centre)
-
     def to_dict(self) -> dict:
         return {"mirror_x": self.mirror_x, "mirror_y": self.mirror_y}
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "StageAxes":
-        d = d or {}
+        if not d:
+            return S3000_AXES
         return cls(bool(d.get("mirror_x", False)), bool(d.get("mirror_y", False)))
 
-
-@dataclass(frozen=True)
-class StageFrame:
-    """Stage axes plus the stage → beam map ``B`` (None: nominal ``B = M``)."""
-
-    axes: StageAxes = StageAxes()
-    stage_to_beam: tuple | None = None  # 2×2 as nested tuples (hashable), from the field calibration
-
-    @classmethod
-    def make(cls, axes: StageAxes | None = None, stage_to_beam=None) -> "StageFrame":
-        b = None if stage_to_beam is None else tuple(map(tuple, np.asarray(stage_to_beam, float).reshape(2, 2)))
-        return cls(axes or StageAxes(), b)
-
-    @property
-    def calibrated(self) -> bool:
-        return self.stage_to_beam is not None
-
-    @property
-    def B(self) -> np.ndarray:
-        return self.axes.matrix if self.stage_to_beam is None else np.array(self.stage_to_beam, float)
-
-    @property
-    def B_inv(self) -> np.ndarray:
-        return np.linalg.inv(self.B)
-
-    def nominal_transform(self) -> "FieldTransform":
-        """WCS → BCS of a field without Global Align: ``A = B·M``."""
-        return FieldTransform(self.B @ self.axes.matrix, (0.0, 0.0))
-
-    def beam_to_stage(self, v) -> np.ndarray:
-        """Stage displacement of BCS vectors (rows)."""
-        return np.atleast_2d(np.asarray(v, float)) @ self.B_inv.T
-
-
-@dataclass
-class FieldTransform:
-    """``bcs = A · wcs + t`` for one field (see module docstring)."""
-
-    linear: np.ndarray = field(default_factory=lambda: np.eye(2))
-    shift: np.ndarray = field(default_factory=lambda: np.zeros(2))
-
-    def __post_init__(self):
-        self.linear = np.asarray(self.linear, float).reshape(2, 2)
-        self.shift = _pt(self.shift)
-
-    def copy(self) -> "FieldTransform":
-        return FieldTransform(self.linear.copy(), self.shift.copy())
-
-    @property
-    def wcs_to_bcs(self) -> AffineTransform:
-        return AffineTransform.from_linear(self.linear, self.shift)
-
-    def to_bcs(self, wcs) -> np.ndarray:
-        return self.wcs_to_bcs.apply(wcs)
-
-    def to_wcs(self, bcs) -> np.ndarray:
-        return self.wcs_to_bcs.inverse().apply(bcs)
-
-    @property
-    def is_identity(self) -> bool:
-        return self.wcs_to_bcs.is_identity(1e-12)
-
-    def params(self) -> dict:
-        return linear_params(self.linear) | {"shift_um": (float(self.shift[0]), float(self.shift[1]))}
-
     def describe(self) -> str:
-        p = self.params()
-        return describe_linear(self.linear) + f", shift ({p['shift_um'][0]:+.3f}, {p['shift_um'][1]:+.3f}) µm"
+        return f"mirror X {'on' if self.mirror_x else 'off'}, mirror Y {'on' if self.mirror_y else 'off'}"
 
 
+#: the Hitachi S-3000: stage X runs against the SEM image's x (X → −x), Y along y
+S3000_AXES = StageAxes(mirror_x=True, mirror_y=False)
+
+
+# ====================================================================== helpers
 def linear_params(a) -> dict:
     """Rotation (mrad), mean scale, stretch (sy/sx − 1) and shear of a 2×2 matrix."""
     d = AffineTransform.from_linear(np.asarray(a, float)).decompose()
@@ -161,85 +92,159 @@ def describe_linear(a) -> str:
     return s
 
 
-@dataclass
-class GlobalAlignment:
-    """The last Global Align: its ``A`` and where it was measured (see module docstring)."""
+def stage_rotation(stage_to_beam, axes: StageAxes) -> np.ndarray:
+    """The rotation part of a measured stage → beam map *B*, with the mirror of *axes*: ``R·M``
+    (``R`` from the polar decomposition of ``B·M``; scale and shear dropped)."""
+    m = axes.matrix
+    c = np.asarray(stage_to_beam, float).reshape(2, 2) @ m
+    u, _, vt = np.linalg.svd(c)
+    r = u @ vt
+    if np.linalg.det(r) < 0:  # mirrored against the axes setting: keep the nearest rotation
+        u[:, -1] *= -1
+        r = u @ vt
+    return r @ m
 
-    linear: np.ndarray
-    ref_centre: np.ndarray  # nominal centre of the reference field (SCS)
-    ref_target: np.ndarray  # where the stage was for it (SCS)
-    ref_shift: np.ndarray  # t measured there (BCS)
-    magnification: float | None = None
+
+# ====================================================================== CCS → SCS
+@dataclass
+class ChipTransform:
+    """``scs = A·ccs + t`` – where the chip's coordinates are on the stage."""
+
+    linear: np.ndarray = field(default_factory=lambda: np.eye(2))
+    offset: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    measured: bool = False  # from a Global Align (else nominal: the chip origin and the stage axes)
+    rms_um: float | None = None  # Global Align residual (3–4 markers)
     step: int | None = None  # schedule step that measured it
 
     def __post_init__(self):
         self.linear = np.asarray(self.linear, float).reshape(2, 2)
-        self.ref_centre, self.ref_target, self.ref_shift = _pt(self.ref_centre), _pt(self.ref_target), \
-            _pt(self.ref_shift)
-
-    def copy(self) -> "GlobalAlignment":
-        return GlobalAlignment(self.linear.copy(), self.ref_centre.copy(), self.ref_target.copy(),
-                               self.ref_shift.copy(), self.magnification, self.step)
-
-    def ref_origin(self, frame) -> np.ndarray:
-        """Measured SCS position of the reference field's WCS origin (*frame*: StageFrame or StageAxes)."""
-        frame = _frame(frame)
-        return self.ref_target + frame.B_inv @ self.ref_shift
-
-    def corrected_centre(self, centre, frame) -> np.ndarray:
-        """Stage target for a field nominally centred at *centre* (SCS): the reference origin + the
-        nominal spacing (WCS) through the measured A, back to stage µm through ``B⁻¹``."""
-        frame = _frame(frame)
-        return self.ref_origin(frame) + frame.B_inv @ self.linear @ frame.axes.matrix @ (_pt(centre) - self.ref_centre)
-
-    def describe(self) -> str:
-        where = f" (step {self.step + 1})" if self.step is not None else ""
-        return describe_linear(self.linear) + where
-
-    def to_dict(self) -> dict:
-        return {"linear": self.linear.tolist(), "ref_centre": self.ref_centre.tolist(),
-                "ref_target": self.ref_target.tolist(), "ref_shift": self.ref_shift.tolist(),
-                "magnification": self.magnification, "step": self.step}
+        self.offset = _pt(self.offset)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "GlobalAlignment":
-        return cls(d["linear"], d["ref_centre"], d["ref_target"], d["ref_shift"], d.get("magnification"),
-                   d.get("step"))
+    def nominal(cls, origin, axes: StageAxes) -> "ChipTransform":
+        return cls(axes.matrix.copy(), _pt(origin))
+
+    def copy(self) -> "ChipTransform":
+        return ChipTransform(self.linear.copy(), self.offset.copy(), self.measured, self.rms_um, self.step)
+
+    def to_scs(self, ccs) -> np.ndarray:
+        p = np.asarray(ccs, float)
+        out = np.atleast_2d(p) @ self.linear.T + self.offset
+        return out[0] if p.ndim == 1 else out
+
+    def to_ccs(self, scs) -> np.ndarray:
+        p = np.asarray(scs, float)
+        out = (np.atleast_2d(p) - self.offset) @ np.linalg.inv(self.linear).T
+        return out[0] if p.ndim == 1 else out
+
+    def correction(self, axes: StageAxes) -> np.ndarray:
+        """``A·M``: rotation / scale / shear of the chip on the stage beyond the stage axes."""
+        return self.linear @ axes.matrix
+
+    def describe(self, axes: StageAxes) -> str:
+        o = self.offset
+        s = describe_linear(self.correction(axes)) + f", origin ({o[0]:.2f}, {o[1]:.2f}) µm"
+        if self.rms_um is not None:
+            s += f", rms {self.rms_um * 1e3:.0f} nm"
+        return s if self.measured else "nominal: " + s
+
+    def to_dict(self) -> dict:
+        return {"linear": self.linear.tolist(), "offset": self.offset.tolist(), "measured": self.measured,
+                "rms_um": self.rms_um, "step": self.step}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ChipTransform":
+        return cls(d["linear"], d["offset"], bool(d.get("measured", True)), d.get("rms_um"), d.get("step"))
 
 
-def _frame(f) -> StageFrame:
-    return f if isinstance(f, StageFrame) else StageFrame(f if f is not None else StageAxes())
-
-
-def fit_global(wcs_points, bcs_points) -> tuple[FieldTransform, np.ndarray]:
-    """Global Align: 2 markers – rotation, uniform scale, shift; 3–4 – full affine (stretch, shear).
-    Returns (transform, residuals µm)."""
-    w = np.atleast_2d(np.asarray(wcs_points, float))
-    b = np.atleast_2d(np.asarray(bcs_points, float))
-    if not 2 <= len(w) <= 4 or len(w) != len(b):
+def fit_chip(ccs_points, scs_points, axes: StageAxes) -> tuple[ChipTransform, np.ndarray]:
+    """Global Align: 2 markers – rotation, uniform scale and shift on top of the stage axes;
+    3–4 – full affine (scale and shear too).  Returns (transform, residuals µm (N, 2))."""
+    c = np.atleast_2d(np.asarray(ccs_points, float))
+    s = np.atleast_2d(np.asarray(scs_points, float))
+    if not 2 <= len(c) <= 4 or len(c) != len(s):
         raise ValueError("Global Align needs 2 to 4 markers")
-    d = np.hypot(*(w[:, None, :] - w[None, :, :]).transpose(2, 0, 1))
-    if np.any(d[np.triu_indices(len(w), 1)] < 1e-9):
+    d = np.hypot(*(c[:, None, :] - c[None, :, :]).transpose(2, 0, 1))
+    if np.any(d[np.triu_indices(len(c), 1)] < 1e-9):
         raise ValueError("the Global Align markers must be distinct")
-    fit = fit_transform(w, b, "similarity" if len(w) == 2 else "affine")
-    return FieldTransform(fit.transform.linear, fit.transform.offset), fit.residuals
+    m = axes.matrix
+    if len(c) == 2:
+        fit = fit_transform(c @ m.T, s, "similarity")  # scs = S·(M·ccs) + t
+        lin = fit.transform.linear @ m
+    else:
+        fit = fit_transform(c, s, "affine")
+        lin = fit.transform.linear
+    t = ChipTransform(lin, fit.transform.offset, measured=True)
+    res = s - t.to_scs(c)
+    if len(c) > 2:
+        t.rms_um = float(np.sqrt(np.mean(np.sum(res ** 2, axis=1))))
+    return t, res
 
 
-def fit_local(wcs_point, bcs_point, previous: FieldTransform) -> FieldTransform:
-    """Local XY: the shift only; A carries over."""
-    return FieldTransform(previous.linear.copy(), _pt(bcs_point) - previous.linear @ _pt(wcs_point))
+# ====================================================================== FCS → XCS
+@dataclass
+class FieldMap:
+    """One field written with the stage at its read-back: ``bcs = linear·fcs + shift``, then the
+    beam calibration (BCS → XCS).  :meth:`apply` is FCS → XCS (what the writer and the field check
+    use); ``linear = B·A_g``, ``shift = B·(G(c_f) − ŝ + δ_f)``."""
+
+    linear: np.ndarray = field(default_factory=lambda: np.eye(2))
+    shift: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    beamcal: object = None  # BeamCalibration (None: XCS = BCS)
+
+    def __post_init__(self):
+        self.linear = np.asarray(self.linear, float).reshape(2, 2)
+        self.shift = _pt(self.shift)
+
+    @classmethod
+    def make(cls, chip: ChipTransform, centre_ccs, stage, b: np.ndarray, delta=(0.0, 0.0),
+             beamcal=None) -> "FieldMap":
+        b = np.asarray(b, float)
+        c = chip.to_scs(_pt(centre_ccs))
+        return cls(b @ chip.linear, b @ (c - _pt(stage) + _pt(delta)), beamcal)
+
+    def copy(self) -> "FieldMap":
+        return FieldMap(self.linear.copy(), self.shift.copy(), self.beamcal)
+
+    def to_bcs(self, fcs) -> np.ndarray:
+        p = np.asarray(fcs, float)
+        out = np.atleast_2d(p) @ self.linear.T + self.shift
+        return out[0] if p.ndim == 1 else out
+
+    def bcs_to_fcs(self, bcs) -> np.ndarray:
+        p = np.asarray(bcs, float)
+        out = (np.atleast_2d(p) - self.shift) @ np.linalg.inv(self.linear).T
+        return out[0] if p.ndim == 1 else out
+
+    def bcs_to_xcs(self, bcs) -> np.ndarray:
+        return np.asarray(bcs, float) if self.beamcal is None else self.beamcal.to_xcs(bcs)
+
+    def xcs_to_bcs(self, xcs) -> np.ndarray:
+        return np.asarray(xcs, float) if self.beamcal is None else self.beamcal.to_bcs(xcs)
+
+    def apply(self, fcs) -> np.ndarray:
+        """FCS → XCS."""
+        return self.bcs_to_xcs(self.to_bcs(fcs))
+
+    def is_identity(self, tol: float = 1e-12) -> bool:
+        return (np.allclose(self.linear, np.eye(2), atol=tol) and np.allclose(self.shift, 0.0, atol=tol)
+                and (self.beamcal is None or self.beamcal.is_identity))
+
+    def describe(self) -> str:
+        s = describe_linear(self.linear) + f", shift ({self.shift[0]:+.3f}, {self.shift[1]:+.3f}) µm"
+        return s + (", beam calibrated" if self.beamcal is not None and not self.beamcal.is_identity else "")
 
 
 # ====================================================================== field check
 @dataclass
 class FieldCheck:
-    """How much of a pattern lands outside the deflection field (BCS)."""
+    """How much of a pattern lands outside the deflection field (XCS)."""
 
     n_points: int
     n_outside: int
     max_abs_um: float
     half_field_um: float
-    bbox_bcs: tuple | None
+    bbox_xcs: tuple | None
 
     @property
     def ok(self) -> bool:
@@ -252,14 +257,14 @@ class FieldCheck:
                 f"the field is ±{self.half_field_um:.2f} µm")
 
 
-def check_field(pattern, transform: AffineTransform, field_um: float) -> FieldCheck:
-    """Map every vertex (the field is a convex square, so vertices suffice) through
-    *transform* (WCS → BCS) and count those outside ``±field_um / 2``."""
+def check_field(pattern, transform, field_um: float) -> FieldCheck:
+    """Map every vertex (the field is a convex square, so vertices suffice) through *transform*
+    (anything with ``apply``: FCS → XCS) and count those outside ``±field_um / 2``."""
     pts = [np.atleast_2d(e.points) for e in pattern]
     half = float(field_um) / 2.0
     if not pts:
         return FieldCheck(0, 0, 0.0, half, None)
-    b = transform.apply(np.vstack(pts))
+    b = np.atleast_2d(transform.apply(np.vstack(pts)))
     a = np.abs(b)
     out = np.any(a > half * (1 + 1e-9), axis=1)
     mn, mx = b.min(0), b.max(0)

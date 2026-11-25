@@ -226,6 +226,14 @@ class HardwareDialog(QtWidgets.QDialog):
         self.mic_baud.setToolTip("the S-3000 uses 9600 baud, 8N1")
         f.addRow("Port", row)
         f.addRow("Baud rate", self.mic_baud)
+        self.mic_mx = QtWidgets.QCheckBox("Mirror X: moving the stage to +X moves the SEM image of the sample to +x")
+        self.mic_my = QtWidgets.QCheckBox("Mirror Y: moving the stage to +Y moves the SEM image of the sample to +y")
+        self.mic_mx.setChecked(m.stage_mirror_x)
+        self.mic_my.setChecked(m.stage_mirror_y)
+        for w in (self.mic_mx, self.mic_my):
+            w.setToolTip("stage axes against the SEM image, used by the lithography (S-3000: mirror X on, Y off)")
+        f.addRow("Stage axes", self.mic_mx)
+        f.addRow("", self.mic_my)
         dlay.addWidget(g)
         dlay.addStretch(1)
         self._fill_ports(m.port)
@@ -387,7 +395,8 @@ class HardwareDialog(QtWidgets.QDialog):
                       invert_x=self.daq_inv_x.isChecked(),
                       invert_y=self.daq_inv_y.isChecked(), swap_xy=self.daq_swap.isChecked())
         eds = replace(b.eds, mca=self.eds_mca.currentData(), external_control=self.eds_external.isChecked())
-        mic = replace(b.microscope, port=self.port(), baudrate=int(self.mic_baud.currentData()))
+        mic = replace(b.microscope, port=self.port(), baudrate=int(self.mic_baud.currentData()),
+                      stage_mirror_x=self.mic_mx.isChecked(), stage_mirror_y=self.mic_my.isChecked())
         out = SystemConfig(daq, eds, mic, b.monitor, self.wiring_value())
         out.path = b.path
         return out
@@ -399,6 +408,8 @@ class HardwareDialog(QtWidgets.QDialog):
         self.wiring._set_range(c.daq.ai_range_v)
         self.eds_mca.setCurrentIndex(max(0, self.eds_mca.findData(c.eds.mca)))
         self._fill_ports(c.microscope.port)
+        self.mic_mx.setChecked(c.microscope.stage_mirror_x)
+        self.mic_my.setChecked(c.microscope.stage_mirror_y)
 
 
 # ==================================================================== menu window
@@ -787,8 +798,11 @@ class EasyEBLApp(QtCore.QObject):
             from ..litho.module.hardware import BackendHardware
 
             def hardware(win):
+                from ..litho.coords import StageAxes
+
+                mc = b.config.microscope
                 return BackendHardware(b.engine, b.manager, b.microscope, win.bridge, open_sem=lambda: self.open("sem"),
-                                       parent_widget=win)
+                                       parent_widget=win, axes=StageAxes(mc.stage_mirror_x, mc.stage_mirror_y))
 
             w = LithoWindow(hardware)
             w.resize(1500, 950)

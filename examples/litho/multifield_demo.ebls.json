@@ -1,6 +1,6 @@
 {
  "format": "easyebl-schedule",
- "version": 2,
+ "version": 3,
  "name": "multifield demo",
  "settings": {
   "fill_direction": "x",
@@ -9,6 +9,16 @@
   "on_out_of_field": "ask"
  },
  "vector_settings": {},
+ "chips": [
+  {
+   "name": "Demo chip",
+   "origin": [
+    5000.0,
+    5000.0
+   ],
+   "note": ""
+  }
+ ],
  "operations": [
   {
    "type": "column",
@@ -26,36 +36,35 @@
    "notes": ""
   },
   {
-   "type": "expose",
-   "label": "FIELD_R1C1 #1",
+   "type": "exposure",
+   "label": "",
    "enabled": true,
-   "centre": [
-    5000.0,
-    5000.0
+   "chip": "Demo chip",
+   "path": "multifield_demo.gds",
+   "top": "",
+   "layers": [
+    [
+     1,
+     0
+    ]
    ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R1C1",
-    "layers": [
-     [
-      1,
-      0
-     ]
-    ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
+   "dose": {
+    "mode": "auto",
+    "property_attr": null,
+    "table": {},
+    "default": 1.0,
+    "value_scale": 1.0
    },
+   "offset": [
+    0.0,
+    0.0
+   ],
+   "cell_origin": false,
+   "order": "raster",
    "dwell_us": 2.0,
    "step_nm": 20.0,
    "global_align": true,
-   "markers": [
+   "global_markers": [
     [
      -45.0,
      -45.0
@@ -65,314 +74,44 @@
      45.0
     ]
    ],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
-   ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "FIELD_R1C2 #2",
-   "enabled": true,
-   "centre": [
-    5100.0,
-    5000.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R1C2",
-    "layers": [
-     [
-      1,
-      0
-     ]
+   "local_align": true,
+   "local_markers": [
+    [
+     -45.0,
+     45.0
     ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
-   },
-   "dwell_us": 2.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
-   ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "FIELD_R1C3 #3",
-   "enabled": true,
-   "centre": [
-    5200.0,
-    5000.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R1C3",
-    "layers": [
-     [
-      1,
-      0
-     ]
+    [
+     55.0,
+     45.0
     ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
-   },
-   "dwell_us": 2.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
-   ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "FIELD_R2C1 #4",
-   "enabled": true,
-   "centre": [
-    5000.0,
-    4900.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R2C1",
-    "layers": [
-     [
-      1,
-      0
-     ]
+    [
+     155.0,
+     45.0
     ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
-   },
-   "dwell_us": 2.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
-   ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "FIELD_R2C2 #5",
-   "enabled": true,
-   "centre": [
-    5100.0,
-    4900.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R2C2",
-    "layers": [
-     [
-      1,
-      0
-     ]
+    [
+     -45.0,
+     -55.0
     ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
-   },
-   "dwell_us": 2.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
-   ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "FIELD_R2C3 #6",
-   "enabled": true,
-   "centre": [
-    5200.0,
-    4900.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R2C3",
-    "layers": [
-     [
-      1,
-      0
-     ]
+    [
+     55.0,
+     -55.0
     ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
-   },
-   "dwell_us": 2.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
-   ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "FIELD_R3C1 #7",
-   "enabled": true,
-   "centre": [
-    5000.0,
-    4800.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R3C1",
-    "layers": [
-     [
-      1,
-      0
-     ]
+    [
+     155.0,
+     -55.0
     ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
-   },
-   "dwell_us": 2.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
-   ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "FIELD_R3C2 #8",
-   "enabled": true,
-   "centre": [
-    5100.0,
-    4800.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R3C2",
-    "layers": [
-     [
-      1,
-      0
-     ]
+    [
+     -45.0,
+     -155.0
     ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
-   },
-   "dwell_us": 2.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
-   ],
-   "view_um": 10.0
-  },
-  {
-   "type": "expose",
-   "label": "FIELD_R3C3 #9",
-   "enabled": true,
-   "centre": [
-    5200.0,
-    4800.0
-   ],
-   "correct_centre": true,
-   "pattern": {
-    "kind": "gds",
-    "path": "multifield_demo.gds",
-    "cell": "FIELD_R3C3",
-    "layers": [
-     [
-      1,
-      0
-     ]
+    [
+     55.0,
+     -155.0
     ],
-    "dose": {
-     "mode": "auto",
-     "property_attr": null,
-     "table": {},
-     "default": 1.0,
-     "value_scale": 1.0
-    }
-   },
-   "dwell_us": 2.0,
-   "step_nm": 20.0,
-   "global_align": false,
-   "markers": [],
-   "local_xy": true,
-   "local_marker": [
-    -45.0,
-    45.0
+    [
+     155.0,
+     -155.0
+    ]
    ],
    "view_um": 10.0
   }
