@@ -13,12 +13,13 @@ import time
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..coords import FieldTransform
+from ..coords import FieldTransform, StageFrame
+from ..fieldcal import Condition
 from ..runner import LithoHardware, ScheduleRunner
 from ..schedule import (ColumnSetting, ExposeField, FieldCorrection, PatternLibrary, PatternSpec, Schedule,
                         ScheduleError, plan)
 from ..settings import LithoSettings
-from .dialogs import ImportDialog, MoveFieldsDialog, StageAxesDialog
+from .dialogs import FieldCalDialog, ImportDialog, MoveFieldsDialog, StageAxesDialog
 from .hardware import GuiBridge
 from .tabs import ScheduleTab, StagePositionsTab
 from .view import StageView
@@ -51,6 +52,7 @@ class LithoWindow(QtWidgets.QMainWindow):
         self.library = PatternLibrary()
         self.schedule = Schedule()
         self.glob = None  # the last measured Global Align (this window session only)
+        self.calibration = None  # the last field calibration (this window session only)
         self.transform = FieldTransform()  # of the field exposed last
         self.runner: ScheduleRunner | None = None
         self._thread: threading.Thread | None = None
@@ -74,6 +76,7 @@ class LithoWindow(QtWidgets.QMainWindow):
         self.tab_schedule.new_field_centre = lambda: self.hw.stage_position() or (0.0, 0.0)
         ed = self.tab_schedule.editor
         ed.presets = self.hw.preset_names
+        ed.positions = lambda: [p.name for p in self.settings.stage_positions]
         ed.cells = self.library.cells
         ed.current_for = self._current_for
         ed.pickGdsRequested.connect(self.pattern_for_selected)
@@ -169,6 +172,10 @@ class LithoWindow(QtWidgets.QMainWindow):
         self.a_down = act(m, "Move down", lambda: tab.move(+1), "Ctrl+Down")
         m.addSeparator()
         self.a_move = act(m, "Move all fields…", lambda: self.move_fields_dialog(), "Ctrl+M")
+        m.addSeparator()
+        act(m, "Field calibration settings…", self.fieldcal_dialog)
+        self.a_calibrate = act(m, "Run field calibration now", self.run_field_calibration, "Ctrl+K")
+        self.a_forget_cal = act(m, "Forget the field calibration", self.forget_calibration)
         self.field_actions = [self.a_add_field, self.a_add_column, self.a_add_corr, self.a_dup, self.a_del, self.a_up,
                               self.a_down, self.a_move]
 
@@ -191,21 +198,23 @@ class LithoWindow(QtWidgets.QMainWindow):
         act(m, "Go to the selected field centre", self.goto_selected_field)
         act(m, "Add the stage position to Stage Positions…", self.tab_positions.add_current)
         m.addSeparator()
-        act(m, "Stage axes…", self.edit_axes)
+        act(m, "Stage settings…", self.edit_axes)
 
     def _make_status(self):
         sb = self.statusBar()
         self.l_global = QtWidgets.QLabel()
         self.l_field_tr = QtWidgets.QLabel()
+        self.l_cal = QtWidgets.QLabel()
         self.l_field = QtWidgets.QLabel()
         self.l_stage = QtWidgets.QLabel()
         self.l_run = QtWidgets.QLabel()
         self.l_run.setStyleSheet("color:#fd4")
         sb.addWidget(self.l_global)
+        sb.addWidget(self.l_cal)
         sb.addWidget(self.l_field_tr)
         for w in (self.l_run, self.l_field, self.l_stage, self.progress):
             sb.addPermanentWidget(w)
-        for w in (self.l_global, self.l_field_tr, self.l_field, self.l_stage):
+        for w in (self.l_global, self.l_cal, self.l_field_tr, self.l_field, self.l_stage):
             w.setContentsMargins(6, 0, 10, 0)
 
     def log(self, text: str) -> None:
@@ -230,6 +239,16 @@ class LithoWindow(QtWidgets.QMainWindow):
         else:
             self.l_global.setText(f"Global alignment: {self.glob.describe()}")
             self.l_global.setStyleSheet("color:#5d5")
+        cal = self.calibration
+        if cal is None:
+            self.l_cal.setText("Field calibration: none")
+            self.l_cal.setStyleSheet("color:#9aa")
+        elif cal.valid_for(self.condition()):
+            self.l_cal.setText(f"Field calibration: {cal.describe(self.settings.axes)}")
+            self.l_cal.setStyleSheet("color:#5d5")
+        else:
+            self.l_cal.setText(f"Field calibration: for {cal.condition.describe()}, not {self.condition().describe()}")
+            self.l_cal.setStyleSheet("color:#fb4")
         self.l_field_tr.setText("Last field: " + ("–" if self.transform.is_identity else self.transform.describe()))
         self.l_field.setText(f"field {self._field():.4g} µm")
 
@@ -240,8 +259,21 @@ class LithoWindow(QtWidgets.QMainWindow):
             pos = None
         self.l_stage.setText("stage ?" if pos is None else f"stage ({pos[0]:.1f}, {pos[1]:.1f}) µm")
         self.view.set_stage(pos)
-        self.view.set_fov(pos, self._field())
+        self.view.set_fov(pos, self._field(), self.frame().B_inv)
         self._update_status()
+
+    def condition(self) -> Condition:
+        """The column condition now (magnification, the beam preset this program recalled last)."""
+        try:
+            mag = self.hw.magnification()
+        except Exception:  # noqa: BLE001
+            mag = None
+        return Condition(mag, getattr(self.hw, "last_preset", None))
+
+    def frame(self) -> StageFrame:
+        cal = self.calibration
+        ok = cal is not None and cal.valid_for(self.condition())
+        return StageFrame.make(self.settings.axes, cal.stage_to_beam if ok else None)
 
     def _title(self):
         name = os.path.basename(self.schedule.path) if self.schedule.path else (self.schedule.name or "untitled")
@@ -270,7 +302,9 @@ class LithoWindow(QtWidgets.QMainWindow):
             presets = self.hw.preset_names()
         except Exception:  # noqa: BLE001
             presets = None
-        self.plans = plan(self.schedule, self._field_at_1x(), self.settings.axes, presets, self.library, self.glob)
+        self.plans = plan(self.schedule, self._field_at_1x(), self.settings.axes, presets, self.library, self.glob,
+                          calibration=self.calibration, preset=getattr(self.hw, "last_preset", None),
+                          positions=self.settings.positions(), fieldcal=self.settings.fieldcal)
         self.tab_schedule.set_plans(self.plans)
         sel = self.tab_schedule.selected()
         self.view.set_schedule(self.schedule, self.library, self.plans, self.settings.axes, sel if sel >= 0 else None)
@@ -495,21 +529,61 @@ class LithoWindow(QtWidgets.QMainWindow):
     def _set_running_ui(self, on: bool):
         self.tab_schedule.set_running(on)
         for a in [self.a_new, self.a_open, self.a_import, self.a_import_cell, self.a_reset, self.a_run,
-                  self.a_run_from] + self.field_actions:
+                  self.a_run_from, self.a_calibrate, self.a_forget_cal] + self.field_actions:
             a.setEnabled(not on)
         self.a_pause.setEnabled(on)
         self.a_abort.setEnabled(on)
 
     # ================================================================ alignment
     def edit_axes(self):
-        d = StageAxesDialog(self.settings.axes, self)
+        d = StageAxesDialog(self.settings.axes, self, self.settings.stage_tolerance_um)
         if d.exec() == QtWidgets.QDialog.Accepted:
             self.settings.axes = d.value()
-            try:
-                self.settings.save()
-            except OSError as e:
-                self.log(f"stage axes not saved: {e}")
+            self.settings.stage_tolerance_um = d.tolerance()
+            self._save_settings()
             self._replan_soon()
+
+    def _save_settings(self):
+        try:
+            self.settings.save()
+        except OSError as e:
+            self.log(f"litho settings not saved: {e}")
+
+    # ================================================================ field calibration
+    def fieldcal_dialog(self):
+        last = self.calibration.describe(self.settings.axes) if self.calibration is not None else None
+        d = FieldCalDialog(self.settings.fieldcal, self.settings.positions(), self.hw.stage_position, last, self)
+        self._fieldcal_dialog = d
+        if d.exec() == QtWidgets.QDialog.Accepted:
+            self.settings.fieldcal = d.value()
+            self._save_settings()
+            self._replan_soon()
+
+    def run_field_calibration(self) -> bool:
+        if self._running():
+            return False
+        self.bridge.cancelled.clear()
+        self.runner = self._make_runner()
+        self._set_running_ui(True)
+        self.l_run.setText("field calibration")
+        self._thread = threading.Thread(target=self.runner.run_calibration, name="litho-fieldcal", daemon=True)
+        self._thread.start()
+        return True
+
+    def forget_calibration(self):
+        if self._running():
+            return
+        self.calibration = None
+        self.log("field calibration forgotten (nominal stage ↔ beam map)")
+        self._update_status()
+        self._replan_soon()
+
+    def _make_runner(self) -> ScheduleRunner:
+        return ScheduleRunner(self.schedule, self.hw, self.settings.axes, self.library, self.glob,
+                              on_event=lambda kind, data: self.sig.event.emit(kind, data),
+                              calibration=self.calibration, fieldcal=self.settings.fieldcal,
+                              positions=self.settings.positions(),
+                              stage_tolerance_um=self.settings.stage_tolerance_um)
 
     def reset_global(self):
         if self._running():
@@ -550,8 +624,7 @@ class LithoWindow(QtWidgets.QMainWindow):
                 return False
         self.bridge.cancelled.clear()
         self.tab_schedule.reset_states()
-        self.runner = ScheduleRunner(self.schedule, self.hw, self.settings.axes, self.library, self.glob,
-                                     on_event=lambda kind, data: self.sig.event.emit(kind, data))
+        self.runner = self._make_runner()
         self._set_running_ui(True)
         self.progress.setValue(0)
         self.l_run.setText("running")
@@ -592,6 +665,11 @@ class LithoWindow(QtWidgets.QMainWindow):
         elif kind == "alignment":
             self.glob = data["glob"]
             self.transform = data["transform"]
+            self._update_status()
+            self._replan_soon()
+        elif kind == "calibration":
+            self.calibration = data["result"]
+            self.log(f"field calibration: {self.calibration.describe(self.settings.axes)}")
             self._update_status()
             self._replan_soon()
         elif kind == "exposed":

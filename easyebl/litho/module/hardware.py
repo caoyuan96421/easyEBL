@@ -109,6 +109,20 @@ class BackendHardware(LithoHardware):
         st.move({"X": x, "Y": y}).result(st.move_timeout_s + 30)
 
     # ---------------------------------------------------------------- column
+    def magnification(self):
+        if self.bundle is None:
+            return None
+        return self.bundle.sem.magnification() or getattr(self.bundle.field_scale, "magnification", None)
+
+    def capture_image(self, width_um, px, frames=1):
+        """A centred photo scan of *width_um* (scan rotation 0) with the imaging engine."""
+        self.status(f"field calibration: imaging {width_um:.3g} µm")
+        f = self.engine.capture(frames=int(frames), nx=int(px), ny=int(px), width_um=float(width_um),
+                                center_um=(0.0, 0.0), rotation_rad=0.0)
+        frame = f.result(max(60.0, 4 * frames * self.engine.frame_time_s()))
+        self.engine.stop()
+        return frame.image, tuple(frame.config.pixel_size_um)
+
     def field_um(self):
         return float(self.engine.calibration.field_size_um)
 
@@ -144,6 +158,7 @@ class BackendHardware(LithoHardware):
             raise KeyError(f"no beam preset named {name!r} (Microscope → Beam presets…)")
         self.status(f"recalling beam preset {name!r}")
         self.bundle.sem.apply_preset({k: p[k] for k in PRESET_KEYS}).result(60)
+        self.last_preset = name
 
     # ---------------------------------------------------------------- interactive
     def measure_marks(self, requests):

@@ -3,11 +3,16 @@
 * **SCS** – stage coordinates (µm): what the litho window plots.  Field centres and
   alignment markers are entered in SCS (typically: centre a feature, take the stage position).
 * **WCS** – working coordinates of one field (µm): (0, 0) is the field centre, the
-  pattern's GDS cell coordinates are WCS.  Nominally a sample point at stage position
-  ``p`` has ``wcs = M · (p − centre)``; ``M`` (:class:`StageAxes`) mirrors stage axes that
-  run against the beam axes (until field correction SCS ↔ BCS exists, they are otherwise
-  taken as parallel with equal scale).
+  pattern's GDS cell coordinates are WCS.  A sample point at stage position ``p`` has
+  ``wcs = M · (p − centre)``: WCS has true (stage) µm and the stage axes, ``M``
+  (:class:`StageAxes`) mirroring stage axes that run against the beam axes.
 * **BCS** – beam coordinates (µm, the deflection field, origin at its centre); internal.
+
+The stage → beam map ``B`` (:class:`StageFrame`): a stage displacement ``d`` moves a
+feature of the sample by ``−B·d`` in BCS.  Nominally ``B = M`` (beam and stage parallel,
+equal scale); the **field calibration** measures it (rotation between stage and beam,
+the beam's scale error).  A field without Global Align is written through
+``A = B·M`` (true µm along the stage axes).
 
 With the stage at the field's target, a field is written through :class:`FieldTransform`::
 
@@ -35,7 +40,7 @@ import numpy as np
 from ..alignment.fitting import fit_transform
 from ..core.transforms import AffineTransform
 
-__all__ = ["StageAxes", "FieldTransform", "GlobalAlignment", "fit_global", "fit_local", "FieldCheck", "check_field"]
+__all__ = ["StageAxes", "StageFrame", "FieldTransform", "GlobalAlignment", "fit_global", "fit_local", "FieldCheck", "check_field"]
 
 
 def _pt(p) -> np.ndarray:
@@ -70,6 +75,39 @@ class StageAxes:
     def from_dict(cls, d: dict | None) -> "StageAxes":
         d = d or {}
         return cls(bool(d.get("mirror_x", False)), bool(d.get("mirror_y", False)))
+
+
+@dataclass(frozen=True)
+class StageFrame:
+    """Stage axes plus the stage → beam map ``B`` (None: nominal ``B = M``)."""
+
+    axes: StageAxes = StageAxes()
+    stage_to_beam: tuple | None = None  # 2×2 as nested tuples (hashable), from the field calibration
+
+    @classmethod
+    def make(cls, axes: StageAxes | None = None, stage_to_beam=None) -> "StageFrame":
+        b = None if stage_to_beam is None else tuple(map(tuple, np.asarray(stage_to_beam, float).reshape(2, 2)))
+        return cls(axes or StageAxes(), b)
+
+    @property
+    def calibrated(self) -> bool:
+        return self.stage_to_beam is not None
+
+    @property
+    def B(self) -> np.ndarray:
+        return self.axes.matrix if self.stage_to_beam is None else np.array(self.stage_to_beam, float)
+
+    @property
+    def B_inv(self) -> np.ndarray:
+        return np.linalg.inv(self.B)
+
+    def nominal_transform(self) -> "FieldTransform":
+        """WCS → BCS of a field without Global Align: ``A = B·M``."""
+        return FieldTransform(self.B @ self.axes.matrix, (0.0, 0.0))
+
+    def beam_to_stage(self, v) -> np.ndarray:
+        """Stage displacement of BCS vectors (rows)."""
+        return np.atleast_2d(np.asarray(v, float)) @ self.B_inv.T
 
 
 @dataclass
@@ -143,14 +181,16 @@ class GlobalAlignment:
         return GlobalAlignment(self.linear.copy(), self.ref_centre.copy(), self.ref_target.copy(),
                                self.ref_shift.copy(), self.magnification, self.step)
 
-    def ref_origin(self, axes: StageAxes) -> np.ndarray:
-        """Measured SCS position of the reference field's WCS origin."""
-        return self.ref_target + axes.matrix @ self.ref_shift
+    def ref_origin(self, frame) -> np.ndarray:
+        """Measured SCS position of the reference field's WCS origin (*frame*: StageFrame or StageAxes)."""
+        frame = _frame(frame)
+        return self.ref_target + frame.B_inv @ self.ref_shift
 
-    def corrected_centre(self, centre, axes: StageAxes) -> np.ndarray:
-        """Stage target for a field nominally centred at *centre* (SCS)."""
-        m = axes.matrix
-        return self.ref_origin(axes) + m @ self.linear @ m @ (_pt(centre) - self.ref_centre)
+    def corrected_centre(self, centre, frame) -> np.ndarray:
+        """Stage target for a field nominally centred at *centre* (SCS): the reference origin + the
+        nominal spacing (WCS) through the measured A, back to stage µm through ``B⁻¹``."""
+        frame = _frame(frame)
+        return self.ref_origin(frame) + frame.B_inv @ self.linear @ frame.axes.matrix @ (_pt(centre) - self.ref_centre)
 
     def describe(self) -> str:
         where = f" (step {self.step + 1})" if self.step is not None else ""
@@ -165,6 +205,10 @@ class GlobalAlignment:
     def from_dict(cls, d: dict) -> "GlobalAlignment":
         return cls(d["linear"], d["ref_centre"], d["ref_target"], d["ref_shift"], d.get("magnification"),
                    d.get("step"))
+
+
+def _frame(f) -> StageFrame:
+    return f if isinstance(f, StageFrame) else StageFrame(f if f is not None else StageAxes())
 
 
 def fit_global(wcs_points, bcs_points) -> tuple[FieldTransform, np.ndarray]:

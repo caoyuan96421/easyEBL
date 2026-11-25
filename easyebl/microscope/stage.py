@@ -15,6 +15,10 @@ T 3528 /°).
   motors of a controller, so the partner axis is re-targeted at its own
   position (``hold_partners``).  A move returns a Future that resolves when
   every axis has reported completion (or raises :class:`MotionError`).
+* **One-way approach (X / Y)** – against backlash every X / Y move ends travelling
+  in + for at least :attr:`StageControl.backlash_um` (default 50 µm): a move that
+  would end going − (or + by less) first goes to *target − backlash* (not below 0),
+  then to the target.  Z, R and T move directly; ``approach=False`` skips it.
 * **Stop** never waits in the queue: S0 goes out at once (also while a long
   SEM transaction holds the port) and queued moves are cancelled.
 * ``#STAGE ON`` (the SEM relays stage lines only then) is sent automatically
@@ -44,6 +48,9 @@ __all__ = ["StageControl", "AXES", "POLL_LEVELS"]
 
 #: background-read priority levels per controller (easyebl.microscope.poll); T comes with Z
 POLL_LEVELS = {"stage X/Y": 3, "stage Z/T": 3, "stage R": 4}
+#: X / Y always end a move travelling in + by at least this much (backlash clearing)
+DEFAULT_BACKLASH_UM = 50.0
+APPROACH_AXES = ("X", "Y")
 
 AXES = ("X", "Y", "Z", "R", "T")
 _CONTROLLER = {"X": 0, "Y": 0, "R": 1, "Z": 2, "T": 2}
@@ -82,9 +89,11 @@ class StageControl:
 
 
     def __init__(self, link: MicroscopeLink, polling: bool = True, move_timeout_s: float = 600.0,
-                 hand_control: bool = True):
+                 hand_control: bool = True, backlash_um: float = DEFAULT_BACKLASH_UM):
         self.link = link
         link.stage = self
+        #: one-way approach distance for X and Y (µm; 0: off), see the module docstring
+        self.backlash_um = float(backlash_um)
         self.move_timeout_s = float(move_timeout_s)
         self.positions: dict = {a: None for a in AXES}  # physical (µm / deg)
         self.pulses: dict = {a: None for a in AXES}
@@ -233,10 +242,35 @@ class StageControl:
                        for u in ctrls)
 
     # ------------------------------------------------------------------ motion
-    def move(self, targets: dict, relative: bool = False) -> concurrent.futures.Future:
+    def approach_plan(self, targets: dict, current: dict) -> list[dict]:
+        """The legs of a move to absolute *targets* from *current* positions: ``[targets]`` or
+        ``[pre, targets]`` where *pre* puts X / Y at ``target − backlash`` (clamped at 0) for those
+        whose final travel would not be at least ``+backlash``."""
+        b = self.backlash_um
+        pre = {}
+        for a in APPROACH_AXES:
+            if a not in targets or b <= 0:
+                continue
+            cur = current.get(a)
+            t = float(targets[a])
+            if cur is None or t - float(cur) < b - 1e-6:
+                p = max(0.0, t - b)
+                if cur is None or abs(p - float(cur)) > 1e-6:
+                    pre[a] = p
+        return [pre, dict(targets)] if pre else [dict(targets)]
+
+    def move(self, targets: dict, relative: bool = False, approach: bool = True) -> concurrent.futures.Future:
         """Move to *targets* {axis: value} in µm (X/Y/Z) or degrees (R/T); ``relative`` adds
-        them to the current positions.  The Future resolves with the final positions when
-        every axis has stopped normally, else raises :class:`MotionError`."""
+        them to the current positions.  X / Y end with the one-way approach (module docstring)
+        unless *approach* is False.  The Future resolves with the final positions when every
+        axis has stopped normally, else raises :class:`MotionError`."""
+        tg = self._check_targets(targets, relative)
+        if approach and self.backlash_um > 0 and any(a in APPROACH_AXES for a in tg):
+            return self._move_approach(tg, relative)
+        return self._move_once(tg, relative)
+
+    @staticmethod
+    def _check_targets(targets: dict, relative: bool) -> dict:
         tg = {}
         for a, v in targets.items():
             a = a.upper()
@@ -250,6 +284,52 @@ class StageControl:
             raise ValueError("no targets")
         if relative and all(v == 0 for v in tg.values()):
             raise ValueError("relative move of zero")
+        return tg
+
+    def _move_approach(self, targets: dict, relative: bool) -> concurrent.futures.Future:
+        """Read the start positions, then the legs of :meth:`approach_plan` one after the other."""
+        if self._hand:
+            raise RuntimeError("the stage is under hand control (SEM PC): engage() it first")
+        tg = {a.upper(): float(v) for a, v in targets.items()}
+        outer: concurrent.futures.Future = concurrent.futures.Future()
+        outer._axes = tuple(a for a in AXES if _CONTROLLER[a] in {_CONTROLLER[t] for t in tg})
+        gen = self._stop_gen
+        with self._lock:
+            self._moves.append(outer)
+
+        def run():
+            try:
+                need = [a for a in tg if a in APPROACH_AXES or relative]
+                if need:
+                    self.refresh(need, priority=STAGE_CMD).result(60)
+                cur = {a: self.positions.get(a) for a in need}
+                absolute = {a: (cur[a] + v if relative else v) for a, v in tg.items()}
+                if relative and any(cur.get(a) is None for a in tg):
+                    raise RuntimeError("relative move: the start position is not known")
+                result = None
+                for leg in self.approach_plan(absolute, cur):
+                    if self._stop_gen != gen or outer.cancelled():
+                        raise concurrent.futures.CancelledError("stopped")
+                    f = self._move_once(leg)
+                    outer._leg = f
+                    result = f.result(self.move_timeout_s + 60)
+                if not outer.done():
+                    outer.set_result(result)
+            except BaseException as e:  # noqa: BLE001 - handed to the caller
+                if not outer.done():
+                    if isinstance(e, concurrent.futures.CancelledError):
+                        outer.cancel()
+                    else:
+                        outer.set_exception(e)
+            finally:
+                self._forget(outer)
+
+        threading.Thread(target=run, name="easyebl-stage-approach", daemon=True).start()
+        return outer
+
+    def _move_once(self, targets: dict, relative: bool = False) -> concurrent.futures.Future:
+        """One motion to *targets* (no one-way approach)."""
+        tg = self._check_targets(targets, relative)
         if self._hand:
             raise RuntimeError("the stage is under hand control (SEM PC): engage() it first")
         outer: concurrent.futures.Future = concurrent.futures.Future()

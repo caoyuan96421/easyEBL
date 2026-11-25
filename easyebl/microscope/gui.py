@@ -375,6 +375,10 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.jog_deg = _dspin(0.01, 90, 2, self.settings.jog_step_deg, 0.5, " °")
         self.jog_um.valueChanged.connect(lambda v_: setattr(self.settings, "jog_step_um", v_))
         self.jog_deg.valueChanged.connect(lambda v_: setattr(self.settings, "jog_step_deg", v_))
+        self.backlash = _dspin(0, 1000, 1, self.settings.stage_backlash_um, 10, " µm")
+        self.backlash.setToolTip("X / Y always end a move travelling in + by at least this much "
+                                 "(backlash clearing: a move ending in − overshoots and comes back); 0: off")
+        self.backlash.valueChanged.connect(self._backlash_changed)
 
         def jb(text, axis, sign, tip):
             b = QtWidgets.QToolButton(text=text)
@@ -397,6 +401,8 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         f.addWidget(QtWidgets.QLabel("Step"), 3, 0)
         f.addWidget(self.jog_um, 3, 1, 1, 3)
         f.addWidget(self.jog_deg, 3, 4, 1, 3)
+        f.addWidget(QtWidgets.QLabel("X/Y approach"), 4, 0)
+        f.addWidget(self.backlash, 4, 1, 1, 3)
         lay.addWidget(self.g_jog)
         note = QtWidgets.QLabel("Moves wait in line behind SEM settings; STOP never waits.  The stage has no "
                                 "homing or collision model – watch the chamber camera when moving Z, R or T.")
@@ -450,6 +456,14 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
     def apply_hv(self):
         v = round(self.hv_set.value(), 2 if self.hv_set.value() < 10 else 1)
         self._call(self.sem.set_hv, f"{v:.2f}" if v < 10 else f"{v:.1f}", what="HV setpoint")
+
+    def _backlash_changed(self, v):
+        self.settings.stage_backlash_um = float(v)
+        self.stage.backlash_um = float(v)
+        try:
+            self.settings.save()
+        except OSError:
+            pass
 
     def _stage_poll_changed(self, v):
         self.stage.set_polling(v)

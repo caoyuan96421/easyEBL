@@ -320,16 +320,42 @@ The status bar shows the global alignment and the last field's transform.
     coordinates are WCS.
   - BCS (the deflection field) is internal: a field is written through `bcs = A·wcs + t`.
     `A` comes from the last Global Align and is kept until the next one, a magnification
-    change included.  `t` comes from this field's Global Align or Local XY, and is 0 otherwise.
-  - *Stage axes…* sets whether a stage axis runs against the beam axis.  Apart from that, stage
-    and beam axes are taken as parallel until field correction exists.
-* **Menus.**
+    change included.  Without a Global Align, `A` is the field calibration's correction
+    (see below), or the identity.  `t` comes from this field's Global Align or Local XY, and is
+    0 otherwise.
+  - The **stage → beam map** `B` links stage and beam: a stage move `d` moves the sample by
+    `−B·d` in the field.  Without a field calibration it is nominal: the axes of *Stage
+    settings…* (mirroring), parallel, equal scale.
+* **Field calibration** (*Field → Field calibration settings…*, *Run field calibration now*,
+  or a *Field correction* step):
+  1. The stage goes to a fixed position with a structured feature (e.g. the Faraday cup).
+  2. A reference image is taken, then one at each of a 3 × 3 grid (or a 5-point cross) of
+     stage shifts of ±30 % of the field.
+  3. Each image's shift is measured by phase correlation (sub-pixel, upsampled DFT).
+  4. A least-squares fit gives `B`: the rotation between stage and beam axes, mirroring, and
+     the field's scale error against the global field calibration (typically ±1 %).  The
+     stage is the length reference.
+
+  The result applies to the lithography only (not imaging or EDS), and only at the
+  magnification and beam preset it was measured at.  It is used for: the fields written
+  without a Global Align (through `B·M`), the centres corrected by a Global Align, and the
+  stage view.  The status bar shows it, orange when the column condition has changed.  A fit
+  with a large residual is refused, e.g. featureless images or a stage that does not land
+  where it reports.  Validate warns for every field without a valid calibration.
+* **Stage moves.**
+  - X and Y always end travelling in + by at least the *X/Y approach* distance (default
+    50 µm; Microscope window, Jog), to clear the backlash.  A move that would end going −
+    overshoots and comes back.  This applies to every stage move, not only the schedule's.
+  - During a run, each move is checked against the freshly read position.  A step fails
+    when the stage is farther than the *position tolerance* (Stage settings…, default 1 µm).
   - *Schedule*: new, open, save, validate, run, pause, abort, reset the global alignment.
   - *Field*: add an Expose field, Column setting or Field correction; duplicate, delete,
     reorder; *Move all fields…*.
   - *Import*: a fractured GDS, or a GDS cell as a new field.
   - *View*: zoom, the selected field's WCS grid, the side panel and messages.
-  - *Stage*: go to the selected field, store the stage position, stage axes.
+  - *Field* also: field calibration settings, run it now, forget it.
+  - *Stage*: go to the selected field, store the stage position, stage settings (axes,
+    position tolerance).
 * **Move… (right click on the plot, or Field → Move all fields…)** moves all fields as a whole,
   markers included.  It takes one reference point to a target:
   - reference: the first field's centre, the centre of the bounding box of all fields, or
@@ -343,7 +369,8 @@ The status bar shows the global alignment and the last field's transform.
     magnification (required: the field follows the global field calibration); and an optional
     nominal current, used only for the dose readout.  A schedule always starts with one, which
     cannot be deleted.
-  - *Field correction*: not implemented yet (skipped).
+  - *Field correction*: runs the field calibration (below) at the configured position, or at a
+    chosen named stage position.
   - *Expose field*:
     - **Field centre** (stage).  *Correct by the global alignment* moves to the centre
       recomputed from the field of the last Global Align: its measured origin, plus the nominal
@@ -387,8 +414,9 @@ The status bar shows the global alignment and the last field's transform.
     Global Align on the first field and Local XY on every field.
   - `dummy_demo.ebls.json`: dummy patterns and an alignment-only field.
 
-Not implemented yet: field correction (SCS ↔ BCS), automatic marker finding (markers are
-clicked), and a measured beam current.
+Not implemented yet: automatic marker finding (markers are clicked) and a measured beam
+current.  On the simulators the SEM image follows the simulated stage through a hidden
+stage → beam map (0.35° and +0.6 %), so a field calibration has something to find.
 
 ## Lithography and debug tools
 

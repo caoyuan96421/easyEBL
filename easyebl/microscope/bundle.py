@@ -99,4 +99,5 @@ def open_bundle(port: str | None, baudrate: int = 9600, settings: MicroscopeSett
                                        stage_polling=settings.stage_polling, **kw)
     if not link.simulated:
         settings.port = port
+    stage.backlash_um = float(settings.stage_backlash_um)
     return MicroscopeBundle(link, sem, stage, settings)

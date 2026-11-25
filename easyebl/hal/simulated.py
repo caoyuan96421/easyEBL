@@ -206,6 +206,11 @@ class SimParams:
     ai_minus_float_v: float = -11.0
     ai_minus_float_tau_s: float = 0.7
     seed: int | None = 0
+    # the sample under a moving stage: ``stage_offset()`` → (x, y) µm added to the beam position
+    # when the sample is looked up (None: the sample does not move); with ``sample_period_um`` > 0
+    # the sample repeats with that period, so it is there at any stage position
+    stage_offset: Callable | None = None
+    sample_period_um: float = 0.0
 
 
 # --------------------------------------------------------------------- backend
@@ -352,7 +357,7 @@ class SimulatedBackend(DAQBackend):
         with self._lock:
             x, y, blank = self.static_xyb
             pos = self.volts_to_true_um(np.array([[x, y]]))[0]
-        sig = 0.0 if blank else float(self.sample.intensity(np.array([pos[0]]), np.array([pos[1]]))[0]) * p.video_gain_v
+        sig = 0.0 if blank else float(self._sample_at(np.array([pos[0]]), np.array([pos[1]]))[0]) * p.video_gain_v
         out = np.empty((len(channels), n))
         for i, ch in enumerate(channels):
             if ch not in self.config.ai_channels:
@@ -412,7 +417,7 @@ class SimulatedBackend(DAQBackend):
         # video
         if n_ai == 0:
             return np.zeros((0, n))
-        sig = self.sample.intensity(pos[:, 0], pos[:, 1]) * p.video_gain_v
+        sig = self._sample_at(pos[:, 0], pos[:, 1]) * p.video_gain_v
         sig = np.where(blank_eff, 0.0, sig)
         if p.video_tau_s > 0:
             a = 1.0 - np.exp(-dt / p.video_tau_s)
@@ -432,6 +437,21 @@ class SimulatedBackend(DAQBackend):
         out = out + self._float_offset(n, rate)[None, :]
         lim = self.config.ai_range_v if ai_range_v is None else ai_range_v
         return np.clip(out, -lim, lim)
+
+    def _sample_at(self, x, y):
+        """Sample intensity under beam positions (µm), with the stage offset / periodic sample."""
+        p = self.params
+        if p.stage_offset is not None:
+            try:
+                ox, oy = p.stage_offset()
+            except Exception:  # noqa: BLE001 - a broken coupling must not stop the stream
+                ox, oy = 0.0, 0.0
+            x, y = x + ox, y + oy
+        if p.sample_period_um > 0:
+            h = p.sample_period_um / 2.0
+            x = (x + h) % p.sample_period_um - h
+            y = (y + h) % p.sample_period_um - h
+        return self.sample.intensity(x, y)
 
     def _float_offset(self, n: int, rate: float) -> np.ndarray:
         """Offset of a floating AI− (DIFF mode only); zero when wired correctly."""

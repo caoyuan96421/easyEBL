@@ -70,6 +70,14 @@ def nice_step(span: float) -> float:
     return 10 * e
 
 
+def _beam_square(centre, half, binv=None) -> np.ndarray:
+    """The deflection field (a square in BCS) on the stage: *centre* + B⁻¹·square."""
+    sq = _square((0.0, 0.0), half)
+    if binv is not None:
+        sq = sq @ np.asarray(binv, float).T
+    return sq + np.asarray(centre, float)
+
+
 def _square(centre, half) -> np.ndarray:
     cx, cy = centre
     return np.array([[cx - half, cy - half], [cx + half, cy - half], [cx + half, cy + half], [cx - half, cy + half],
@@ -128,7 +136,6 @@ class StageView(pg.PlotWidget):
 
     # ---------------------------------------------------------------- schedule
     def set_schedule(self, schedule, library, plans, axes: StageAxes, selected: int | None = None) -> None:
-        m = axes.matrix
         normal, warned, sel, fovs, links, origins, glob, loc = [], [], [], [], [], [], [], []
         boxes = []
         sel_frame = None
@@ -139,7 +146,8 @@ class StageView(pg.PlotWidget):
             tgt = np.asarray(p.target, float)
             tr = p.transform or FieldTransform()
             half = p.field_um / 2.0
-            fovs.append(_square(tgt, half))
+            m = p.frame.B_inv if p.frame is not None else axes.matrix  # BCS → stage (B⁻¹)
+            fovs.append(_beam_square(tgt, half, m))
             boxes.append((i, tgt[0] - half, tgt[1] - half, tgt[0] + half, tgt[1] + half))
             org = tgt + m @ tr.shift
             origins.append(org)
@@ -154,7 +162,7 @@ class StageView(pg.PlotWidget):
             shapes = [tgt + (tr.to_bcs(s) @ m.T) for s in _shapes(pat)]
             (sel if i == selected else warned if p.warnings else normal).extend(shapes)
             if i == selected:
-                sel_frame = (tgt, tr, half)
+                sel_frame = (tgt, tr, half, m)
         self._patterns.setData(*outline_arrays(normal))
         self._warn.setData(*outline_arrays(warned))
         self._selected.setData(*outline_arrays(sel))
@@ -165,13 +173,13 @@ class StageView(pg.PlotWidget):
                 it.setData(pos=np.asarray(pts, float).reshape(-1, 2))
             else:
                 it.clear()
-        self._draw_wcs(sel_frame, m)
+        self._draw_wcs(sel_frame)
         self._boxes = boxes
         if not self._fitted and boxes:
             self._fitted = True
             self.zoom_all()
 
-    def _draw_wcs(self, frame, m) -> None:
+    def _draw_wcs(self, frame) -> None:
         """The selected field's WCS: grid and axes, as written (through its transform)."""
         if frame is None or not self.show_wcs_grid:
             self._wcs_grid.setData([], [])
@@ -179,7 +187,7 @@ class StageView(pg.PlotWidget):
             for t in self._axis_labels:
                 t.setVisible(False)
             return
-        tgt, tr, half = frame
+        tgt, tr, half, m = frame
         step = nice_step(half / 4.0)
         n = int(half // step)
         ticks = np.arange(-n, n + 1) * step
@@ -203,12 +211,12 @@ class StageView(pg.PlotWidget):
             t.setVisible(True)
 
     # ---------------------------------------------------------------- live state
-    def set_fov(self, stage, field_um: float) -> None:
+    def set_fov(self, stage, field_um: float, binv=None) -> None:
         if stage is None:
             self._fov.setData([], [])
             self._fov_label.setVisible(False)
             return
-        sq = _square(stage, field_um / 2.0)
+        sq = _beam_square(stage, field_um / 2.0, binv)
         self._fov.setData(sq[:, 0], sq[:, 1])
         self._fov_label.setVisible(True)
         self._fov_label.setPos(sq[3, 0], sq[3, 1])

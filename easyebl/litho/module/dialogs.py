@@ -6,19 +6,21 @@ import os
 from PySide6 import QtWidgets
 
 from ..coords import StageAxes
+from ..fieldcal import FieldCalConfig
 from ..fracture import ImportOptions, build_schedule, find_fields
 from ..gds import GDSDoseMapping, gds_info
 from .tabs import _spin, mag_combo
 
-__all__ = ["StageAxesDialog", "ImportDialog", "MoveFieldsDialog"]
+__all__ = ["StageAxesDialog", "ImportDialog", "MoveFieldsDialog", "FieldCalDialog"]
 
 
 class StageAxesDialog(QtWidgets.QDialog):
-    """Stage axes against the beam axes (until field correction SCS ↔ BCS exists)."""
+    """Stage settings of the litho module: the stage axes against the beam axes (the nominal
+    stage → beam map, used where no field calibration applies) and the position tolerance."""
 
-    def __init__(self, axes: StageAxes, parent=None):
+    def __init__(self, axes: StageAxes, parent=None, tolerance_um: float = 1.0):
         super().__init__(parent)
-        self.setWindowTitle("Stage axes")
+        self.setWindowTitle("Stage settings")
         self.mx = QtWidgets.QCheckBox("mirror X: moving the stage to +X moves the image of the sample to +x")
         self.my = QtWidgets.QCheckBox("mirror Y: moving the stage to +Y moves the image of the sample to +y")
         self.mx.setChecked(axes.mirror_x)
@@ -26,19 +28,28 @@ class StageAxesDialog(QtWidgets.QDialog):
         text = QtWidgets.QLabel(
             "Normally moving the stage to +X brings sample features further in +X into view, so the image of the "
             "sample moves to −x.  Tick an axis where the SEM image moves the other way.  Field centres, markers and "
-            "the GDS importer use this; otherwise the stage and beam axes are taken as parallel with equal scale "
-            "(field correction is not implemented yet).")
+            "the GDS importer use this.  Where no field calibration applies, stage and beam axes are taken as "
+            "parallel with equal scale; a field calibration measures them.")
         text.setWordWrap(True)
+        self.tol = _spin(tolerance_um, 0.01, 1000, 2, " µm", 0.1)
+        self.tol.setToolTip("a schedule step fails when the stage reads back farther than this from its target")
+        tf = QtWidgets.QFormLayout()
+        tf.addRow("position tolerance", self.tol)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay = QtWidgets.QVBoxLayout(self)
-        for w in (text, self.mx, self.my, bb):
+        for w in (text, self.mx, self.my):
             lay.addWidget(w)
-        self.resize(520, 220)
+        lay.addLayout(tf)
+        lay.addWidget(bb)
+        self.resize(520, 260)
 
     def value(self) -> StageAxes:
         return StageAxes(self.mx.isChecked(), self.my.isChecked())
+
+    def tolerance(self) -> float:
+        return float(self.tol.value())
 
 
 class ImportDialog(QtWidgets.QDialog):
@@ -294,3 +305,90 @@ class MoveFieldsDialog(QtWidgets.QDialog):
         self.shift.setText("every field moves by " + (f"({v[0]:+.3f}, {v[1]:+.3f}) µm" if v else "–"))
         if hasattr(self, "bb"):
             self.bb.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(v is not None)
+
+
+
+class FieldCalDialog(QtWidgets.QDialog):
+    """Field calibration settings: where (a named stage position or coordinates) and how."""
+
+    def __init__(self, config: FieldCalConfig, positions: dict, stage_position=None, last=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Field calibration")
+        self.stage_position = stage_position or (lambda: None)
+        intro = QtWidgets.QLabel(
+            "At a fixed stage position with a feature that has structure (a Faraday cup, a calibration sample), "
+            "images are taken at known stage shifts; their shifts give the stage → beam map: the rotation between "
+            "stage and beam and the scale error of the field.  It is valid for the magnification and beam preset "
+            "it was measured at.")
+        intro.setWordWrap(True)
+        self.pos = QtWidgets.QComboBox()
+        self.pos.addItem("the coordinates below", "")
+        for n in positions:
+            self.pos.addItem(n, n)
+        if config.position and self.pos.findData(config.position) < 0:
+            self.pos.addItem(f"{config.position} (unknown)", config.position)
+        self.pos.setCurrentIndex(max(0, self.pos.findData(config.position)))
+        self.x, self.y = _spin(config.x, 0, 1e6, 2), _spin(config.y, 0, 1e6, 2)
+        b_cur = QtWidgets.QPushButton("Use current stage position")
+        b_cur.clicked.connect(self._use_stage)
+        self.pattern = QtWidgets.QComboBox()
+        self.pattern.addItem("3 × 3 grid (9 images)", "grid")
+        self.pattern.addItem("cross (5 images)", "cross")
+        self.pattern.setCurrentIndex(max(0, self.pattern.findData(config.pattern)))
+        self.step = _spin(config.step_fraction * 100, 1, 45, 1, " % of the field", 5)
+        self.width = _spin(config.image_fraction * 100, 10, 100, 0, " % of the field", 5)
+        self.px = QtWidgets.QComboBox()
+        for n in (128, 256, 512, 1024):
+            self.px.addItem(f"{n} × {n}", n)
+        self.px.setCurrentIndex(max(0, self.px.findData(config.image_px)))
+        self.frames = QtWidgets.QSpinBox()
+        self.frames.setRange(1, 64)
+        self.frames.setValue(config.frames)
+        self.settle = _spin(config.settle_s, 0, 60, 2, " s", 0.1)
+        self.maxres = _spin(config.max_residual_px, 0.1, 50, 1, " px", 0.5)
+        f = QtWidgets.QFormLayout()
+        f.addRow("position", self.pos)
+        h = QtWidgets.QHBoxLayout()
+        h.addWidget(self.x)
+        h.addWidget(self.y)
+        f.addRow("X, Y", h)
+        f.addRow(b_cur)
+        f.addRow("stage shifts", self.pattern)
+        f.addRow("shift", self.step)
+        f.addRow("image width", self.width)
+        f.addRow("image", self.px)
+        f.addRow("frames averaged", self.frames)
+        f.addRow("settle after a move", self.settle)
+        f.addRow("refuse a fit worse than", self.maxres)
+        self.last = QtWidgets.QLabel("last calibration: " + (last if last else "none"))
+        self.last.setWordWrap(True)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(intro)
+        lay.addLayout(f)
+        lay.addWidget(self.last)
+        lay.addWidget(bb)
+        self.pos.currentIndexChanged.connect(self._sync)
+        self._sync()
+        self.resize(520, 560)
+
+    def _sync(self, *_):
+        on = not self.pos.currentData()
+        self.x.setEnabled(on)
+        self.y.setEnabled(on)
+
+    def _use_stage(self):
+        pos = self.stage_position()
+        if pos is not None:
+            self.pos.setCurrentIndex(0)
+            self.x.setValue(pos[0])
+            self.y.setValue(pos[1])
+
+    def value(self) -> FieldCalConfig:
+        return FieldCalConfig(position=self.pos.currentData() or "", x=self.x.value(), y=self.y.value(),
+                              pattern=self.pattern.currentData(), step_fraction=self.step.value() / 100.0,
+                              image_fraction=self.width.value() / 100.0, image_px=int(self.px.currentData()),
+                              frames=int(self.frames.value()), settle_s=self.settle.value(),
+                              max_residual_px=self.maxres.value())

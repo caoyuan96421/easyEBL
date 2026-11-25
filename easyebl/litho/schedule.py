@@ -3,7 +3,8 @@
 * **Column setting** (``column``) – beam preset of the microscope module (or keep as is),
   magnification (sets the field from the global field calibration), optional nominal beam
   current (for the dose readout).  Every schedule starts with one; more may follow.
-* **Field correction** (``field_correction``) – placeholder, skipped.
+* **Field correction** (``field_correction``) – the field calibration (stage → beam map) at a
+  fixed stage position; valid until the magnification or the beam preset changes.
 * **Expose field** (``expose``) – the field centre (SCS), optionally corrected by the last
   Global Align; the pattern (GDS cell centred in its cell, a dummy test pattern, or none);
   dwell per point and point step; optional Global Align (2–4 markers) and Local XY (1 marker).
@@ -24,7 +25,7 @@ import numpy as np
 from ..core.transforms import AffineTransform
 from ..microscope.s3000.commands import ALLOWED_MAGNIFICATIONS
 from . import dose as dosemod
-from .coords import FieldTransform, GlobalAlignment, StageAxes, check_field
+from .coords import FieldTransform, GlobalAlignment, StageAxes, StageFrame, check_field
 from .gds import GDSDoseMapping, load_library, pattern_from_cell
 from .geometry import Dot, Pattern, Polygon, Polyline, rectangle
 
@@ -250,12 +251,16 @@ class ColumnSetting(Operation):
 
 @dataclass
 class FieldCorrection(Operation):
+    """Field calibration (stage → beam map) at a fixed stage position, valid for the column
+    condition it is measured at (see :mod:`easyebl.litho.fieldcal`)."""
+
     TYPE: ClassVar[str] = "field_correction"
     TITLE: ClassVar[str] = "Field correction"
+    position: str = ""  # a named stage position; "": the one in the field calibration settings
     notes: str = ""
 
     def summary(self) -> str:
-        return "not implemented yet (skipped)"
+        return f"calibrate at {self.position!r}" if self.position else "calibrate (configured position)"
 
 
 @dataclass
@@ -438,28 +443,39 @@ class StepPlan:
     transform: FieldTransform | None = None  # WCS → BCS (assuming the alignments reproduce the guess)
     warnings: list = field(default_factory=list)
     fov_check: object = None
+    frame: StageFrame | None = None  # stage axes + the stage → beam map in force at this step
+    calibrated: bool = False  # a field calibration applies to this step
 
 
-def field_target(op: ExposeField, glob: GlobalAlignment | None, axes: StageAxes) -> np.ndarray:
-    """Stage target of an Expose field: its centre, corrected by the last Global Align if asked."""
+def field_target(op: ExposeField, glob: GlobalAlignment | None, frame) -> np.ndarray:
+    """Stage target of an Expose field: its centre, corrected by the last Global Align if asked
+    (*frame*: StageFrame, or StageAxes for the nominal stage → beam map)."""
     c = np.array(op.centre, float)
     if op.correct_centre and glob is not None:
-        return glob.corrected_centre(c, axes)
+        return glob.corrected_centre(c, frame)
     return c
 
 
 def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = None, presets=None,
-         library: PatternLibrary | None = None, glob: GlobalAlignment | None = None) -> list:
+         library: PatternLibrary | None = None, glob: GlobalAlignment | None = None, calibration=None,
+         preset: str | None = None, positions: dict | None = None, fieldcal=None) -> list:
     """Walk *schedule* without hardware (Global Aligns are assumed to measure *glob*'s A, or the
-    identity, and no shift).  *field_at_1x_um*: the global field calibration (field = K / mag).
-    Returns one :class:`StepPlan` per operation."""
+    nominal map, and no shift; a Field correction to measure *calibration*'s map, or the nominal
+    one).  *field_at_1x_um*: the global field calibration (field = K / mag); *preset*: the beam
+    preset in force before the schedule (None: not known); *positions* / *fieldcal*: named stage
+    positions and the field calibration settings.  Returns one :class:`StepPlan` per operation."""
+    from .fieldcal import Condition
+
     axes = axes or StageAxes()
     library = library or PatternLibrary()
+    positions = positions or {}
     glob = glob.copy() if glob is not None else None
     field_um = float(field_at_1x_um) / schedule[0].magnification
     cur = None
     mag = None
     mag_changed = False
+    cal_b = calibration.stage_to_beam if calibration is not None else None
+    cal_cond = calibration.condition if calibration is not None else None
     out = []
     for i, op in enumerate(schedule.operations):
         sp = StepPlan(i, field_um, cur)
@@ -471,22 +487,38 @@ def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = Non
                 continue
         try:
             if isinstance(op, ColumnSetting):
+                preset = op.preset or preset
                 if not op.permitted:
                     sp.warnings.append(f"magnification ×{op.magnification:g} is not one the SEM accepts "
                                        f"(nearest: ×{nearest_magnification(op.magnification)})")
                 if presets is not None and op.preset and op.preset not in presets:
                     sp.warnings.append(f"no beam preset named {op.preset!r} in the microscope module")
-                if mag is not None and op.magnification != mag:
-                    mag_changed = True
+                if mag is not None and op.magnification != mag and glob is not None:
+                    mag_changed = True  # a global alignment measured at another magnification
                 mag = op.magnification
                 field_um = float(field_at_1x_um) / op.magnification
                 cur = op.current_pa or cur
             elif isinstance(op, FieldCorrection):
-                sp.warnings.append("field correction is not implemented yet (skipped)")
+                name = op.position or (fieldcal.position if fieldcal is not None else "")
+                if name and name not in positions:
+                    sp.warnings.append(f"no stage position named {name!r} for the field calibration")
+                elif not name:
+                    x, y = (fieldcal.x, fieldcal.y) if fieldcal is not None else (0.0, 0.0)
+                    d = (fieldcal.step_fraction if fieldcal is not None else 0.3) * field_um
+                    if min(x, y) - d < 0:
+                        sp.warnings.append("the field calibration position is not set (Field → Field calibration "
+                                           "settings…)")
+                cal_cond = Condition(mag, preset)
             elif isinstance(op, ExposeField):
-                _plan_expose(sp, op, i, glob, axes, field_um, library, mag_changed, mag)
+                ok = cal_cond is not None and cal_cond == Condition(mag, preset)
+                frame = StageFrame.make(axes, cal_b if ok else None)
+                sp.frame, sp.calibrated = frame, ok
+                if not ok:
+                    sp.warnings.append(f"no field calibration for {Condition(mag, preset).describe()} (a Field "
+                                       "correction step, or Field → Run field calibration): nominal stage ↔ beam map")
+                _plan_expose(sp, op, i, glob, frame, field_um, library, mag_changed, mag)
                 if op.global_align:
-                    a = glob.linear if glob is not None else np.eye(2)
+                    a = glob.linear if glob is not None else frame.nominal_transform().linear
                     t = np.array(sp.target)
                     glob = GlobalAlignment(a, op.centre, t, (0.0, 0.0), mag, i)
                     mag_changed = False
@@ -496,11 +528,10 @@ def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = Non
     return out
 
 
-def _plan_expose(sp, op: ExposeField, i, glob, axes, field_um, library, mag_changed, mag) -> None:
-    target = field_target(op, glob, axes)
+def _plan_expose(sp, op: ExposeField, i, glob, frame, field_um, library, mag_changed, mag) -> None:
+    target = field_target(op, glob, frame)
     sp.target = (float(target[0]), float(target[1]))
-    a = glob.linear if glob is not None else np.eye(2)
-    t = FieldTransform(a, (0.0, 0.0))
+    t = FieldTransform(glob.linear, (0.0, 0.0)) if glob is not None else frame.nominal_transform()
     sp.transform = t
     half = field_um / 2.0
     if target[0] < 0 or target[1] < 0:

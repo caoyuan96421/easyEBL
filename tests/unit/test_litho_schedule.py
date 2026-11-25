@@ -14,6 +14,14 @@ from easyebl.litho.schedule import (KEEP_AS_IS, ColumnSetting, ExposeField, Fiel
 from easyebl.litho.settings import LithoSettings
 
 
+def _nocal(warnings) -> list:
+    """The warnings other than the missing field calibration."""
+    return [w for w in warnings if not w.startswith("no field calibration")]
+
+
+CAL = None  # set below: a FieldCalConfig at a usable position, no settling
+
+
 def _rot(deg, s=1.0):
     t = math.radians(deg)
     return s * np.array([[math.cos(t), -math.sin(t)], [math.sin(t), math.cos(t)]])
@@ -178,7 +186,8 @@ def test_plan_identity_fov_and_warnings():
                   ExposeField(centre=(700.0, 500.0), global_align=True, markers=[(0.0, 0.0)]),
                   ExposeField(centre=(800.0, 500.0), local_xy=True, local_marker=(60.0, 0.0))])
     ps = plan(s, 100_000.0)
-    assert ps[1].warnings == [] and ps[1].target == (500.0, 500.0) and ps[1].transform.is_identity
+    assert _nocal(ps[1].warnings) == [] and ps[1].target == (500.0, 500.0) and ps[1].transform.is_identity
+    assert any(w.startswith("no field calibration for ×1000") for w in ps[1].warnings)
     assert any("outside the field" in w for w in ps[2].warnings)
     assert any("below 0" in w for w in ps[3].warnings) and any("only moves" in w for w in ps[3].warnings)
     assert any("2–4 markers" in w for w in ps[4].warnings)
@@ -231,7 +240,7 @@ def test_importer_references(frac_gds):
     lib = PatternLibrary()
     assert lib.get(s[3].pattern).bbox == pytest.approx((-20.0, -40.0, 20.0, 40.0))  # recentred: WCS
     ps = plan(s, 100_000.0, presets=["p1"])
-    assert all(p.warnings == [] for p in ps), [p.warnings for p in ps]
+    assert all(_nocal(p.warnings) == [] for p in ps), [p.warnings for p in ps]
 
 
 def test_importer_mirrored_axes_cells_layers_and_order(frac_gds):
@@ -325,19 +334,19 @@ def test_runner_dwell_preset_dummy_none_and_out_of_field():
                               local_marker=(5.0, 0.0))])
     hw = SimulatedHardware()
     hw.answer = True  # skip the field that does not fit
-    r = ScheduleRunner(s, hw)
+    r = ScheduleRunner(s, hw, fieldcal=CAL)
     assert r.run() == "done"
-    assert r.states == ["done", "done", "skipped", "skipped", "done"]
+    assert r.states == ["done", "done", "skipped", "done", "done"]  # the Field correction calibrates
     assert len(hw.exposures) == 1 and hw.preset == "default"
     p = hw.exposures[0]["params"]
     assert p.area_dwell() == pytest.approx(2.5e-6) and p.area_step_um == pytest.approx(0.01)
     assert any(c[0] == "ask" for c in hw.calls)
     assert len(hw.measurements) == 1  # the alignment-only field measured its marker
     hw2 = SimulatedHardware()  # ask → No aborts
-    r2 = ScheduleRunner(s, hw2)
+    r2 = ScheduleRunner(s, hw2, fieldcal=CAL)
     assert r2.run() == "aborted" and r2.states[2] == "aborted"
     s.settings.on_out_of_field = "skip"
-    assert ScheduleRunner(s, SimulatedHardware()).run() == "done"
+    assert ScheduleRunner(s, SimulatedHardware(), fieldcal=CAL).run() == "done"
 
 
 def test_runner_keeps_the_global_alignment_over_a_magnification_change():
@@ -393,17 +402,20 @@ def test_demo_files(tmp_path):
 
     out = make_demo_files(str(tmp_path / "demo"))
     s = Schedule.load(out["schedule"])
-    assert len(s) == 10 and s[1].global_align and all(o.local_xy for o in s.operations[1:])
-    assert s[1].centre == (5000.0, 5000.0) and s[2].centre == (5100.0, 5000.0)
-    ps = plan(s, 100_000.0)
-    assert all(p.warnings == [] for p in ps), [p.warnings for p in ps]
-    hw = SimulatedHardware(_rot(0.3, 1.001), stage_noise_um=0.5, pivot=(5000.0, 5000.0))
-    assert ScheduleRunner(s, hw).run() == "done" and len(hw.exposures) == 9
-    for op, e in zip(s.operations[1:], hw.exposures):
+    assert len(s) == 11 and isinstance(s[1], FieldCorrection) and s[2].global_align
+    assert all(o.local_xy for o in s.fields)
+    assert s[2].centre == (5000.0, 5000.0) and s[3].centre == (5100.0, 5000.0)
+    ps = plan(s, 100_000.0, fieldcal=CAL)
+    assert all(p.warnings == [] for p in ps), [p.warnings for p in ps]  # calibrated by the Field correction
+    assert any("position is not set" in w for w in plan(s, 100_000.0)[1].warnings)
+    # (a stage landing 0.5 µm off at random would spoil the calibration fit: it refuses such a fit)
+    hw = SimulatedHardware(_rot(0.3, 1.001), stage_noise_um=0.2, pivot=(5000.0, 5000.0))
+    assert ScheduleRunner(s, hw, fieldcal=CAL).run() == "done" and len(hw.exposures) == 9
+    for op, e in zip(s.fields, hw.exposures):
         assert hw.placement_error(e, op.centre) < 1e-6
     d = Schedule.load(out["dummy"])
-    assert all(p.warnings == [] for p in plan(d, 100_000.0))
-    assert ScheduleRunner(d, SimulatedHardware()).run() == "done"
+    assert all(p.warnings == [] for p in plan(d, 100_000.0, fieldcal=CAL))
+    assert ScheduleRunner(d, SimulatedHardware(), fieldcal=CAL).run() == "done"
 
 
 def test_magnification_is_a_whole_permitted_value():
@@ -423,3 +435,140 @@ def test_magnification_is_a_whole_permitted_value():
     hw = SimulatedHardware()
     assert ScheduleRunner(Schedule([ColumnSetting(magnification=900.0)]), hw).run() == "done"
     assert hw.calls == [("mag", 900)] and type(hw.calls[0][1]) is int
+
+
+
+# ====================================================================== stage, field calibration
+from easyebl.litho.fieldcal import (Condition, FieldCalConfig, FieldCalError, FieldCalResult,  # noqa: E402
+                                    fit_stage_to_beam, measure_field_calibration, phase_correlation, shift_pattern)
+from easyebl.litho.runner import StageError  # noqa: E402
+
+CAL = FieldCalConfig(x=1000.0, y=1000.0, settle_s=0.0)
+
+
+def _beam(deg=0.5, s=1.01):
+    return _rot(deg, s)
+
+
+def test_one_way_approach_plan():
+    from types import SimpleNamespace
+
+    from easyebl.microscope.stage import StageControl
+
+    st = SimpleNamespace(backlash_um=50.0)
+    plan_ = lambda t, c: StageControl.approach_plan(st, t, c)  # noqa: E731
+    assert plan_({"X": 300.0}, {"X": 100.0}) == [{"X": 300.0}]  # ends going + by ≥ 50: direct
+    assert plan_({"X": 300.0}, {"X": 280.0}) == [{"X": 250.0}, {"X": 300.0}]  # + but too short
+    assert plan_({"X": 100.0, "Y": 500.0}, {"X": 300.0, "Y": 100.0}) == [{"X": 50.0}, {"X": 100.0, "Y": 500.0}]
+    assert plan_({"X": 20.0}, {"X": 300.0}) == [{"X": 0.0}, {"X": 20.0}]  # never below the stage zero
+    assert plan_({"Z": 10.0}, {"Z": 300.0}) == [{"Z": 10.0}]  # only X and Y
+    st.backlash_um = 0.0
+    assert plan_({"X": 100.0}, {"X": 300.0}) == [{"X": 100.0}]
+
+
+def test_stage_position_is_verified():
+    s = Schedule([ColumnSetting(), ExposeField(centre=(100.0, 100.0))])
+    r = ScheduleRunner(s, SimulatedHardware(stall_um=(2.0, 0.5)))
+    assert r.run() == "failed" and r.states[1] == "failed"
+    assert ScheduleRunner(s, SimulatedHardware(stall_um=(2.0, 0.5)), stage_tolerance_um=3.0).run() == "done"
+    assert ScheduleRunner(s, SimulatedHardware(stage_noise_um=5.0)).run() == "done"  # reads back right
+
+
+def test_phase_correlation_and_fit():
+    from scipy import ndimage
+
+    big = ndimage.gaussian_filter(np.random.default_rng(0).standard_normal((600, 600)), 3)
+
+    def crop(dx, dy):
+        return ndimage.shift(big, (dy, dx), order=3, mode="wrap")[172:428, 172:428]
+
+    a = crop(0, 0)
+    for dx, dy in ((3.3, -2.6), (-80.4, 30.7), (0.25, 0.0)):
+        sx, sy, q = phase_correlation(a, crop(dx, dy), guess=(dx, dy))
+        assert (sx, sy) == pytest.approx((dx, dy), abs=0.06) and q > 0.1
+    with pytest.raises(FieldCalError):
+        phase_correlation(a, a, guess=(250, 0))
+    B = _beam()
+    ds = shift_pattern("grid", 30.0)
+    assert len(ds) == 9 and tuple(ds[0]) == (0.0, 0.0) and len(shift_pattern("cross", 1.0)) == 5
+    b, drift, res = fit_stage_to_beam(ds, -ds @ B.T + (0.2, -0.1))
+    assert np.allclose(b, B) and np.allclose(drift, (0.2, -0.1)) and np.allclose(res, 0, atol=1e-12)
+    with pytest.raises(FieldCalError):
+        fit_stage_to_beam([[0, 0], [1, 0], [2, 0]], [[0, 0], [1, 0], [2, 0]])
+
+
+@pytest.mark.parametrize("axes", [StageAxes(), StageAxes(mirror_y=True)])
+def test_field_calibration_recovers_the_stage_to_beam_map(axes):
+    B = _beam() @ axes.matrix
+    hw = SimulatedHardware(axes=axes, stage_to_beam=B, start=(1000.0, 1000.0))
+    res = measure_field_calibration(hw, CAL, (1000.0, 1000.0), Condition(1000, None), axes=axes)
+    assert np.allclose(res.stage_to_beam, B, atol=1e-3)  # ≈ 0.1 % from noisy simulated images
+    from easyebl.litho.coords import linear_params
+
+    p = linear_params(res.correction(axes))
+    assert p["rotation_mrad"] == pytest.approx(8.727, abs=0.2) and p["scale"] == pytest.approx(1.01, abs=5e-4)
+    assert res.n_images == 9 and hw.images == 9 and "MIRRORED" not in res.describe(axes)
+    assert hw.stage_position() == (1000.0, 1000.0)  # back at the position
+    assert res.valid_for(Condition(1000, None)) and not res.valid_for(Condition(2000, None))
+    assert not res.valid_for(Condition(1000, "other preset"))
+    with pytest.raises(FieldCalError):  # shifts below the stage zero
+        measure_field_calibration(hw, CAL, (5.0, 5.0), Condition(1000, None))
+
+
+def test_calibration_corrects_exposures_until_the_column_changes():
+    B = _beam()
+    s = Schedule([ColumnSetting(magnification=1000), FieldCorrection(),
+                  ExposeField(centre=(2000.0, 2000.0), pattern=PatternSpec("dummy", size_um=60)),
+                  ColumnSetting(magnification=1000, preset="default"),
+                  ExposeField(centre=(2100.0, 2000.0), pattern=PatternSpec("dummy", size_um=60))])
+    hw = SimulatedHardware(stage_to_beam=B)
+    events = []
+    r = ScheduleRunner(s, hw, fieldcal=CAL, on_event=lambda k, d: events.append((k, d)))
+    assert r.run() == "done"
+    assert hw.placement_error(hw.exposures[0], s[2].centre) < 0.15  # calibrated: ≈ 0.1 µm over 60 µm
+    assert np.allclose(hw.exposures[0]["transform"].linear, r.calibration.stage_to_beam)
+    assert hw.exposures[1]["transform"].is_identity()  # the preset changed: the calibration no longer applies
+    assert hw.placement_error(hw.exposures[1], s[4].centre) > 0.4  # 1 % of 30 µm + the rotation
+    assert any(k == "calibration" for k, _ in events)
+    ps = plan(s, 100_000.0, fieldcal=CAL)
+    assert _nocal(ps[2].warnings) == ps[2].warnings and ps[2].calibrated  # a Field correction before it
+    assert not ps[4].calibrated and any(w.startswith("no field calibration for ×1000, beam 'default'")
+                                        for w in ps[4].warnings)
+    assert any("no stage position named 'cup'" in w
+               for w in plan(Schedule([ColumnSetting(), FieldCorrection(position="cup")]), 1e5)[1].warnings)
+
+
+def test_run_calibration_alone_and_the_corrected_centre():
+    B = _beam()
+    hw = SimulatedHardware(stage_to_beam=B, magnification=1000)
+    events = []
+    r = ScheduleRunner(Schedule(), hw, fieldcal=CAL, on_event=lambda k, d: events.append((k, d)))
+    assert r.run_calibration() == "done"
+    res = [d["result"] for k, d in events if k == "calibration"][0]
+    assert res.condition == Condition(1000.0, None)
+    # with a calibration, the corrected centre goes through B⁻¹ (stage µm), not the nominal axes
+    g = GlobalAlignment(_rot(0.2) @ res.stage_to_beam, (500.0, 500.0), (500.0, 500.0), (0.0, 0.0))
+    from easyebl.litho.coords import StageFrame
+
+    fr = StageFrame.make(StageAxes(), res.stage_to_beam)
+    c = g.corrected_centre((600.0, 500.0), fr)
+    assert np.allclose(c, [500.0, 500.0] + np.linalg.inv(fr.B) @ g.linear @ [100.0, 0.0])
+    assert np.hypot(*(c - (500.0, 500.0))) == pytest.approx(100.0, abs=0.3)  # stage µm stay true µm
+
+
+def test_simulated_sem_follows_the_stage():
+    from types import SimpleNamespace
+
+    from easyebl.app.backend import couple_sim_stage
+    from easyebl.hal import SimulatedBackend
+
+    be = SimulatedBackend()
+    stage = SimpleNamespace(positions={"X": 1000.0, "Y": 2000.0})
+    couple_sim_stage(be, stage, stage_to_beam=np.eye(2))
+    x = np.array([5.0, -3.0])
+    y = np.array([2.0, 7.0])
+    before = be._sample_at(x, y)
+    stage.positions = {"X": 1010.0, "Y": 2000.0}  # +10 µm in X: the sample moves −10 µm in the field
+    assert np.allclose(be._sample_at(x - 10.0, y), before)
+    stage.positions = {"X": 1000.0 + 120.0, "Y": 2000.0}  # the demo sample repeats every 120 µm
+    assert np.allclose(be._sample_at(x, y), before)

@@ -10,6 +10,7 @@ import json
 import os
 
 from .coords import StageAxes
+from .fieldcal import FieldCalConfig
 
 __all__ = ["LithoSettings", "StagePosition", "default_litho_settings_path"]
 
@@ -45,6 +46,9 @@ class StagePosition:
 class LithoSettings:
     stage_positions: list = field(default_factory=list)  # [StagePosition]
     axes: StageAxes = field(default_factory=StageAxes)
+    #: a schedule step fails when the stage reads back farther than this from its target (µm)
+    stage_tolerance_um: float = 1.0
+    fieldcal: FieldCalConfig = field(default_factory=FieldCalConfig)
     last_dir: str = ""
     path: str = field(default="", repr=False, compare=False)
 
@@ -77,7 +81,8 @@ class LithoSettings:
     # ---------------------------------------------------------------- file
     def to_dict(self) -> dict:
         return {"stage_positions": [p.to_dict() for p in self.stage_positions],
-                "axes": self.axes.to_dict(),
+                "axes": self.axes.to_dict(), "stage_tolerance_um": self.stage_tolerance_um,
+                "fieldcal": self.fieldcal.to_dict(),
                 "last_dir": self.last_dir}
 
     @classmethod
@@ -89,6 +94,8 @@ class LithoSettings:
                 d = json.load(fh)
             s.stage_positions = [StagePosition.from_dict(p) for p in d.get("stage_positions", [])]
             s.axes = StageAxes.from_dict(d.get("axes"))
+            s.stage_tolerance_um = float(d.get("stage_tolerance_um", 1.0))
+            s.fieldcal = FieldCalConfig.from_dict(d.get("fieldcal"))
             s.last_dir = str(d.get("last_dir", ""))
         except (OSError, ValueError, KeyError, TypeError):
             pass

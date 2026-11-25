@@ -17,7 +17,34 @@ import threading
 
 from .config import SystemConfig
 
-__all__ = ["SystemBackend", "ComponentStatus", "COMPONENTS"]
+__all__ = ["SystemBackend", "ComponentStatus", "COMPONENTS", "couple_sim_stage", "SIM_STAGE_TO_BEAM"]
+
+#: the simulators' hidden stage → beam map (what a field calibration should find): the beam axes
+#: turned 0.35° against the stage and the global field calibration 0.6 % off
+SIM_STAGE_TO_BEAM = ((1.006 * 0.99998134, -1.006 * 0.00610863), (1.006 * 0.00610863, 1.006 * 0.99998134))
+
+
+def couple_sim_stage(sim_backend, stage, stage_to_beam=SIM_STAGE_TO_BEAM, period_um: float = 120.0) -> None:
+    """Make the simulated SEM image follow the simulated stage: moving the stage by ``d`` moves the
+    sample by ``−B·d`` in the field (relative to where the stage was first read; the demo sample
+    repeats every *period_um*, so there is always something to see)."""
+    import numpy as np
+
+    b = np.asarray(stage_to_beam, float)
+    ref: dict = {}
+
+    def offset():
+        x, y = stage.positions.get("X"), stage.positions.get("Y")
+        if x is None or y is None:
+            return (0.0, 0.0)
+        if not ref:
+            ref["s"] = np.array([x, y], float)
+        o = b @ (np.array([x, y], float) - ref["s"])
+        return (float(o[0]), float(o[1]))
+
+    sim_backend.params.stage_offset = offset
+    sim_backend.params.sample_period_um = float(period_um)
+
 
 #: component key -> display name
 COMPONENTS = {"daq": "Scan DAQ", "eds": "EDS pulse processor", "microscope": "Microscope"}
@@ -138,6 +165,8 @@ class SystemBackend:
         sim_be = self.manager.backend if self.manager is not None and self.config.daq.simulated else None
         if targets:  # also without a microscope: then the manual magnification is used
             self.microscope.tie_field(targets, sim_backend=sim_be, persist=not self.config.daq.simulated)
+        if sim_be is not None and self.microscope.stage is not None and self.microscope.link.simulated:
+            couple_sim_stage(sim_be, self.microscope.stage)
 
     def close(self) -> None:
         """Stop and disconnect everything (the end of the easyEBL session)."""

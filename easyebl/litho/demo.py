@@ -10,7 +10,8 @@ writes
   label, corner marks at (±40, ±40) µm); layer 2/0: alignment crosses at (±45, ±45) µm around each field centre (meant to be
   on the sample already – not exposed);
 * ``multifield_demo.ebls.json`` – the imported schedule: a Column setting (×1000 → 100 µm
-  field, beam kept as is), Global Align on the first field (two crosses), Local XY on every
+  field, beam kept as is), a Field correction (at the position set in Field → Field
+  calibration settings…), Global Align on the first field (two crosses), Local XY on every
   field, layout origin at stage (5000, 5000) µm, layer 1 only;
 * ``dummy_demo.ebls.json`` – two dummy-pattern fields without alignment and one
   alignment-only field (no pattern), for trying the run without a GDS.
@@ -23,7 +24,7 @@ import sys
 import numpy as np
 
 from .fracture import ImportOptions, import_fractured_gds
-from .schedule import ColumnSetting, ExposeField, PatternSpec, Schedule
+from .schedule import ColumnSetting, ExposeField, FieldCorrection, PatternSpec, Schedule
 
 __all__ = ["make_multifield_gds", "make_demo_files", "DEMO_ORIGIN", "FIELD_PITCH"]
 
@@ -89,11 +90,12 @@ def make_demo_files(folder: str) -> dict:
                          global_align=True, global_markers=((-MARK, -MARK), (MARK, MARK)),
                          local_xy=True, local_marker=(-MARK, MARK), view_um=10.0, dwell_us=2.0, step_nm=20.0)
     s = import_fractured_gds(gds, opts)
+    s.operations.insert(1, FieldCorrection())  # at the position in Field → Field calibration settings…
     s.name = "multifield demo"
     s.save(os.path.join(folder, "multifield_demo.ebls.json"))
 
     ox, oy = DEMO_ORIGIN
-    d = Schedule([ColumnSetting(magnification=1000, current_pa=100.0),
+    d = Schedule([ColumnSetting(magnification=1000, current_pa=100.0), FieldCorrection(),
                   ExposeField(label="dummy 1", centre=(ox, oy), pattern=PatternSpec("dummy", size_um=40.0)),
                   ExposeField(label="dummy 2", centre=(ox + 100.0, oy), pattern=PatternSpec("dummy", size_um=60.0),
                               dwell_us=0.5),

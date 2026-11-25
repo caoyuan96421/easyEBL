@@ -34,6 +34,8 @@ class MicroscopeSettings:
     #: the magnification used while the microscope does not report one (not connected)
     manual_magnification: float = 1000.0
     jog_step_um: float = 100.0
+    #: X / Y one-way approach (backlash clearing) distance, µm; 0: off (easyebl.microscope.stage)
+    stage_backlash_um: float = 50.0
     jog_step_deg: float = 1.0
     #: named beam presets: [{"name": ..., "beam_coarse": ..., "beam_fine": ..., "stig_x": ...,
     #: "stig_y": ..., "contrast": ..., "brightness": ...}, ...] (raw SEM settings)

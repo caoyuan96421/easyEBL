@@ -236,6 +236,28 @@ def test_stage_moves_relative_and_absolute(mic):
         stage.move({"X": -1e9}, relative=True).result(30)
 
 
+def test_xy_moves_end_with_a_one_way_approach(mic):
+    """X / Y end travelling in + by the backlash distance: a move in − overshoots and comes back."""
+    link, sem, stage = mic
+    assert stage.backlash_um == 50.0
+    sent = []
+    orig = stage._move_once
+    stage._move_once = lambda targets, relative=False: (sent.append(dict(targets)), orig(targets, relative))[1]
+    x0, y0 = stage.positions["X"], stage.positions["Y"]
+    pos = stage.move({"X": x0 + 200.0}).result(30)  # + by more than 50: one move
+    assert sent == [{"X": x0 + 200.0}] and pos["X"] == pytest.approx(x0 + 200.0, abs=0.05)
+    sent.clear()
+    pos = stage.move({"X": -150.0, "Y": 10.0}, relative=True).result(60)  # − in X, + by only 10 in Y
+    assert sent == [{"X": x0 + 50.0 - 50.0, "Y": y0 + 10.0 - 50.0}, {"X": x0 + 50.0, "Y": y0 + 10.0}]
+    assert pos["X"] == pytest.approx(x0 + 50.0, abs=0.05) and pos["Y"] == pytest.approx(y0 + 10.0, abs=0.05)
+    sent.clear()
+    stage.move({"Z": 10.0}, relative=True).result(30)  # Z: direct
+    assert len(sent) == 1
+    sent.clear()
+    stage.move({"X": -100.0}, relative=True, approach=False).result(30)
+    assert sent == [{"X": -100.0}]
+
+
 def test_hand_control_release_and_engage(mic):
     link, sem, stage = mic
     sim = link.session.simulator

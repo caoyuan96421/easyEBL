@@ -15,6 +15,7 @@ from easyebl.app.config import SystemConfig  # noqa: E402
 from easyebl.litho.runner import MarkRequest, SimulatedHardware  # noqa: E402
 from easyebl.litho.schedule import ColumnSetting, ExposeField, FieldCorrection, PatternSpec, Schedule  # noqa: E402
 from easyebl.litho.settings import LithoSettings  # noqa: E402
+from easyebl.litho.fieldcal import FieldCalConfig  # noqa: E402
 
 
 def _rot(deg, s=1.0):
@@ -34,7 +35,9 @@ def win(qtbot, tmp_path):
     from easyebl.litho.module import LithoWindow
 
     hw = SimulatedHardware(_rot(0.3, 1.001), stage_noise_um=0.3, pivot=(5000.0, 5000.0), start=(5000.0, 5000.0))
-    w = LithoWindow(hw, LithoSettings.load(str(tmp_path / "litho.json")))
+    settings = LithoSettings.load(str(tmp_path / "litho.json"))
+    settings.fieldcal = FieldCalConfig(x=4700.0, y=5000.0, settle_s=0.0)
+    w = LithoWindow(hw, settings)
     w.ask_on_close = False
     qtbot.addWidget(w)
     w.show()
@@ -49,26 +52,26 @@ def test_window_open_edit_save_run(win, tmp_path, demo):
     assert not tab.b_del.isEnabled()  # the first Column setting stays
 
     assert win.open_schedule(demo["schedule"])
-    assert tab.list.count() == 10 and not win.warnings()
+    assert tab.list.count() == 11 and not win.warnings()
     x, y = win.view._patterns.getData()
     assert np.nanmin(x) == pytest.approx(4960.0, abs=0.5) and np.nanmax(x) == pytest.approx(5240.0, abs=0.5)
     assert np.nanmax(y) == pytest.approx(5040.0, abs=0.5)  # the layout in SCS around the origin (5000, 5000)
 
     # the step editor
-    tab.select(2)
+    tab.select(3)
     win.replan()  # (debounced after a selection)
     ed = tab.editor
     assert isinstance(ed.op, ExposeField) and len(win.view._wcs_grid.getData()[0])
     assert not [b for b in ed.findChildren(QtWidgets.QToolButton) if "stage" in b.text()]  # no stage button
     boxes = {b.title(): b for b in ed.findChildren(QtWidgets.QGroupBox)}
     boxes["Global Align (markers in WCS: µm from the field centre)"].setChecked(True)
-    assert win.schedule[2].global_align and win.schedule[2].markers == [(-10.0, -10.0), (10.0, 10.0)]
+    assert win.schedule[3].global_align and win.schedule[3].markers == [(-10.0, -10.0), (10.0, 10.0)]
     assert win.modified
     win.view.stepClicked.emit(5)
     assert tab.selected() == 5
     tab.select(0)
     tab.delete()
-    assert isinstance(win.schedule[0], ColumnSetting) and len(win.schedule) == 10
+    assert isinstance(win.schedule[0], ColumnSetting) and len(win.schedule) == 11
 
     # stage positions persist; "New field here" adds an Expose field there
     win.tab_positions.add("Faraday cup", 100.0, 200.0)
@@ -89,9 +92,9 @@ def test_window_open_edit_save_run(win, tmp_path, demo):
     assert win.open_schedule(demo["schedule"])
     assert win.run(confirm=False)
     assert win.wait(30)
-    assert tab.states == ["done"] * 10, win.log_box.toPlainText()
+    assert tab.states == ["done"] * 11, win.log_box.toPlainText()
     assert len(win.hw.exposures) == 9
-    for op, e in zip(win.schedule.operations[1:], win.hw.exposures):
+    for op, e in zip(win.schedule.fields, win.hw.exposures):
         assert win.hw.placement_error(e, op.centre) < 1e-6
     assert win.glob is not None and "Global alignment: rot +5.24 mrad" in win.l_global.text()
     assert tab.b_run.isEnabled() and not tab.b_abort.isEnabled()
@@ -231,7 +234,7 @@ def test_move_all_fields(win, demo, qtbot, monkeypatch):
     assert a["first"][1] == (5000.0, 5000.0)
     assert a["bbox"][1] == pytest.approx((5100.0, 4900.0))  # 3 × 3 fields of 100 µm, first at the top left
     assert a["marker"][1] == pytest.approx((4955.0, 4955.0))  # marker 1 = WCS (−45, −45) of field 1
-    win.hw.stage = np.array([7000.0, 6000.0])
+    win.hw.stage = win.hw.readback = np.array([7000.0, 6000.0])
 
     d = MoveFieldsDialog(a, win.hw.stage_position(), click=(100.0, 200.0))
     qtbot.addWidget(d)
@@ -263,3 +266,73 @@ def test_move_all_fields(win, demo, qtbot, monkeypatch):
     acts = [x.text() for x in win._last_menu.actions() if x.text()]
     assert acts[0] == "Move…"
     win._last_menu.close()
+
+
+
+def test_field_calibration_from_the_menu(win, qtbot, monkeypatch):
+    from easyebl.litho.module.dialogs import FieldCalDialog
+
+    menu = [a.text() for a in win.menuBar().actions()[1].menu().actions() if a.text()]
+    assert {"Field calibration settings…", "Run field calibration now", "Forget the field calibration"} <= set(menu)
+    assert win.l_cal.text() == "Field calibration: none"
+    # the settings dialog round trip
+    win.settings.add_position("Faraday cup", 4600.0, 5100.0)
+    d = FieldCalDialog(win.settings.fieldcal, win.settings.positions(), win.hw.stage_position)
+    qtbot.addWidget(d)
+    d.pos.setCurrentIndex(d.pos.findData("Faraday cup"))
+    d.pattern.setCurrentIndex(d.pattern.findData("cross"))
+    v = d.value()
+    assert v.position == "Faraday cup" and v.pattern == "cross" and not d.x.isEnabled()
+
+    def fake_exec(dlg):
+        dlg.pos.setCurrentIndex(dlg.pos.findData("Faraday cup"))
+        dlg.settle.setValue(0.0)
+        return QtWidgets.QDialog.Accepted
+
+    monkeypatch.setattr(FieldCalDialog, "exec", fake_exec)
+    win.fieldcal_dialog()
+    assert LithoSettings.load(win.settings.path).fieldcal.position == "Faraday cup"
+    # run it: the simulated hardware has the nominal map (B = I); its stage lands exactly here
+    win.hw.stage_noise = 0.0
+    assert win.run_field_calibration()
+    assert win.wait(30)
+    assert win.calibration is not None and np.allclose(win.calibration.stage_to_beam, np.eye(2), atol=3e-3)
+    assert win.calibration.position == (4600.0, 5100.0)
+    win._update_status()
+    assert win.l_cal.text().startswith("Field calibration: rot") and "×1000" in win.l_cal.text()
+    win.hw.mag = 2000.0  # another magnification: no longer valid
+    win._update_status()
+    assert "not ×2000" in win.l_cal.text()
+    win.forget_calibration()
+    assert win.calibration is None
+
+
+def test_stage_settings_dialog(win, monkeypatch):
+    from easyebl.litho.module.dialogs import StageAxesDialog
+
+    def fake_exec(dlg):
+        dlg.my.setChecked(True)
+        dlg.tol.setValue(0.5)
+        return QtWidgets.QDialog.Accepted
+
+    monkeypatch.setattr(StageAxesDialog, "exec", fake_exec)
+    win.edit_axes()
+    s = LithoSettings.load(win.settings.path)
+    assert s.axes.mirror_y and s.stage_tolerance_um == 0.5
+
+
+def test_field_calibration_in_the_program(ui, qtbot):
+    """BackendHardware on the simulators: real stage moves (one-way approach), SEM captures and the
+    simulated image following the stage – the calibration finds the simulators' hidden map."""
+    from easyebl.app.backend import SIM_STAGE_TO_BEAM
+
+    mic = ui.backend.microscope
+    w = ui.open("litho")
+    w.ask_on_close = False
+    w.settings.fieldcal = FieldCalConfig(x=300.0, y=300.0, settle_s=0.1, image_px=256, pattern="cross")
+    assert w.run_field_calibration()
+    qtbot.waitUntil(lambda: w.runner is None, timeout=180000)
+    assert w.calibration is not None, w.log_box.toPlainText()
+    assert np.allclose(w.calibration.stage_to_beam, np.asarray(SIM_STAGE_TO_BEAM), atol=5e-3), \
+        (w.calibration.stage_to_beam, w.log_box.toPlainText())
+    assert mic.stage.positions["X"] == pytest.approx(300.0, abs=0.1)

@@ -214,6 +214,7 @@ class OpEditor(QtWidgets.QWidget):
         super().__init__(parent)
         self.op: Operation | None = None
         self.presets = lambda: None
+        self.positions = lambda: []  # () -> stage position names
         self.cells = lambda path: []
         self.current_for = lambda op: None
         self.readout = None
@@ -289,7 +290,20 @@ class OpEditor(QtWidgets.QWidget):
         en.toggled.connect(lambda on: self._set("enabled", bool(on)))
         top.addRow(en)
         if isinstance(op, FieldCorrection):
-            top.addRow(QtWidgets.QLabel("Field correction (SCS ↔ BCS) is not implemented yet: this step is skipped."))
+            info = QtWidgets.QLabel("Field calibration: images at known stage shifts give the stage → beam map, valid "
+                                    "for the present magnification and beam preset (Field → Field calibration "
+                                    "settings… for how).")
+            info.setWordWrap(True)
+            top.addRow(info)
+            pos = QtWidgets.QComboBox()
+            pos.addItem("the configured position", "")
+            for n in self.positions():
+                pos.addItem(n, n)
+            if op.position and pos.findData(op.position) < 0:
+                pos.addItem(f"{op.position} (unknown)", op.position)
+            pos.setCurrentIndex(max(0, pos.findData(op.position)))
+            pos.currentIndexChanged.connect(lambda _: self._set("position", pos.currentData()))
+            top.addRow("at", pos)
             notes = QtWidgets.QLineEdit(op.notes)
             notes.editingFinished.connect(lambda: self._set("notes", notes.text()))
             top.addRow("notes", notes)

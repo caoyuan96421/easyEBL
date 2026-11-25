@@ -19,6 +19,13 @@
    "current_pa": null
   },
   {
+   "type": "field_correction",
+   "label": "",
+   "enabled": true,
+   "position": "",
+   "notes": ""
+  },
+  {
    "type": "expose",
    "label": "FIELD_R1C1 #1",
    "enabled": true,
