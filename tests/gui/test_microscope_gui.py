@@ -51,7 +51,7 @@ def test_microscope_window(qtbot, bundle):
     n_sent = len(bundle.link.session.simulator.received)
     bundle.link.session.simulator.sem["FOCUS C"] = "9262"  # focused at WD 22 on the SEM panel
     bundle.sem.refresh(("FOCUS C",)).result(5)
-    qtbot.waitUntil(lambda: w.focus_c.value() == 9262 and w.l_wd.text().startswith("22.0"), timeout=2000)
+    qtbot.waitUntil(lambda: w.focus_c.value() == 9262 and abs(w.wd.value() - 22.0) < 0.01, timeout=2000)
     time.sleep(0.3)
     assert len(bundle.link.session.simulator.received) == n_sent + 1  # only the R FOCUS C read
     # stage: the SEM PC has it (#STAGE OFF) between moves; no enable button any more

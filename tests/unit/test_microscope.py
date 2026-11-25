@@ -85,25 +85,29 @@ def test_wd_from_focus_table():
 def test_sem_computes_wd_from_the_focus(mic):
     link, sem, stage = mic
     sim = link.session.simulator
-    sem.set_working_distance(22).result(10)  # the SEM sets the table focus for WD 22
+    from easyebl.microscope.s3000.focus_wd import focus_for_wd
+
+    n0 = len(sim.received)
+    sem.set_working_distance(22.0).result(10)  # through the focus: FOCUS C and F of the table
     assert sim.sem["FOCUS C"] == "9262" and sem.state["focus_coarse"] == 9262
-    assert sem.working_distance_mm() == pytest.approx(22, abs=0.01) and sem.state["wd_readback_mm"] == 22
+    assert sem.working_distance_mm() == pytest.approx(22, abs=0.01)
+    sem.set_working_distance(15.437).result(10)  # any value, not whole mm
+    c, f = focus_for_wd(15.437)
+    assert (sem.state["focus_coarse"], sem.state["focus_fine"]) == (c, f)
+    assert sem.working_distance_mm() == pytest.approx(15.437, abs=0.002)
+    sent = sim.received[n0:]
+    assert not any(ln.startswith("WD") or ln == "R WD" for ln in sent)  # never WD n, never R WD
+    assert f"FOCUS C {c}" in sent and f"FOCUS F {f}" in sent
+    with pytest.raises(ValueError):
+        sem.set_working_distance(2.0)
+    sem.set_focus("C", 9262).result(10)
     sem.set_focus("F", 2048 + 1000).result(10)  # fine focus: a fraction of a mm
-    wd = sem.working_distance_mm()
-    assert 21.4 < wd < 21.6
+    assert 21.4 < sem.working_distance_mm() < 21.6
     sem.set_focus("C", 100).result(10)  # the SEM holds the coarse focus at its minimum
     assert sem.state["focus_coarse"] == 5174 and sem.working_distance_mm() == 60.0
-    # the whole-mm readback is a cross-check only: a disagreement is reported once
-    sub = link.events.subscribe()
-    sem.set_focus("C", 9262).result(10)
-    sim.sem["FOCUS C"] = "9598"  # (the SEM's own WD readback now says 20) ...
-    sem.refresh(("WD",)).result(10)  # ... while the focus last read says 21.5
-    notes = [e.message for e in sub.drain() if e.kind == "info"]
-    assert any("differs from the SEM's WD readback (20 mm)" in m for m in notes)
-    sem.refresh(("WD",)).result(10)
-    assert not [e for e in sub.drain() if e.kind == "info"]  # not repeated
-    sub.close()
-    assert "SEM WD" not in {t.name for t in link.poller.tasks()}  # WD is not polled
+    sem.refresh().result(10)
+    assert "wd_readback_mm" not in sem.state and "R WD" not in sim.received  # WD is never read
+    assert "SEM WD" not in {t.name for t in link.poller.tasks()}
 
 
 def test_sem_settings_go_before_polling(mic):

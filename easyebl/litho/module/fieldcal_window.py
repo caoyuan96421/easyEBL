@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..coords import StageAxes
-from ..fieldcal import FieldCalResult
+from ..fieldcal import WEAK_MATCH_PSR, FieldCalResult
 
 __all__ = ["FieldCalWindow"]
 
@@ -231,11 +231,14 @@ class FieldCalWindow(QtWidgets.QDialog):
                 "common to all images"),
             row("fit rms", f"{d['rms_um'] * 1e3:.1f} nm", f"{d['rms_px']:.2f} px"),
             row("worst residual", f"{d['max_residual_um'] * 1e3:.1f} nm"),
-            row("weakest match", f"{weak:.2f}", "correlation peak 0…1" + (" – low" if weak < 0.05 else "")),
+            row("weakest match", f"{weak:.1f}", "peak-to-sidelobe ratio" + (" – low" if weak < WEAK_MATCH_PSR else "")),
             row("stage axes", "MISMATCH" if d["mirror_mismatch"] else "agree", _mirror_text(axes)),
         ]
         if d["mirror_mismatch"]:
             rows.insert(0, row("<i>numbers for</i>", _mirror_text(d["axes_used"]), "as measured"))
+        if d["rejected"]:
+            rows.append(row("left out", ", ".join(f"image {i + 1}" for i in d["rejected"]),
+                            "far off the others: a bad match"))
         rows += [
             row("B·M", f"[[{m[0, 0]:+.5f}, {m[0, 1]:+.5f}],", ""),
             row("", f"[{m[1, 0]:+.5f}, {m[1, 1]:+.5f}]]", "identity: as nominal"),
@@ -265,10 +268,13 @@ class FieldCalWindow(QtWidgets.QDialog):
             q = res.quality[r] if r < len(res.quality) else float("nan")
             cells = [f"({s[r, 0]:+.2f}, {s[r, 1]:+.2f})", f"({pred[r, 0]:+.3f}, {pred[r, 1]:+.3f})",
                      f"({meas[r, 0]:+.3f}, {meas[r, 1]:+.3f})", f"({fitted[r, 0]:+.3f}, {fitted[r, 1]:+.3f})",
-                     f"({resid[r, 0] * 1e3:+.0f}, {resid[r, 1] * 1e3:+.0f})", f"{q:.2f}"]
+                     f"({resid[r, 0] * 1e3:+.0f}, {resid[r, 1] * 1e3:+.0f})",
+                     f"{q:.1f}" + (" (left out)" if r in res.rejected else "")]
             for c, t in enumerate(cells):
                 it = QtWidgets.QTableWidgetItem(t)
                 it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                if r in res.rejected or q < WEAK_MATCH_PSR:
+                    it.setForeground(QtGui.QBrush(QtGui.QColor("#f77" if r in res.rejected else "#fb4")))
                 self.table.setItem(r, c, it)
         self._pred.setData(pos=pred)
         self._meas.setData(pos=meas)

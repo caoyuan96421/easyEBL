@@ -28,29 +28,29 @@ from typing import Callable
 from .control import MicroscopeControl, NotAvailable
 from .link import READ, SEM_SET, MicroscopeLink
 from .s3000 import commands as C
-from .s3000.focus_wd import COARSE_MIN, wd_from_focus
+from .s3000.focus_wd import COARSE_MIN, WD_RANGE_MM, focus_for_wd, wd_from_focus
 
 __all__ = ["SEMControl", "STATUS_ITEMS", "ALL_ITEMS", "POLL_LEVELS", "MAGNIFICATIONS", "SCAN_MODES", "PRESET_KEYS"]
 
 #: read on start and by "Refresh"
-ALL_ITEMS = ("HV", "MAG", "WD", "EMI", "BEAM C", "BEAM F", "FOCUS C", "FOCUS F", "STG X", "STG Y",
+ALL_ITEMS = ("HV", "MAG", "EMI", "BEAM C", "BEAM F", "FOCUS C", "FOCUS F", "STG X", "STG Y",
              "CONT", "BRT", "RUN", "INPUTS AF", "SCAN")
 #: the readbacks that matter most to imaging / EDS
-STATUS_ITEMS = ("MAG", "HV", "WD")
+STATUS_ITEMS = ("MAG", "HV", "FOCUS C", "FOCUS F")
 #: background-read priority levels (easyebl.microscope.poll; each level is read half as often as the
 #: one above): 1 what imaging / EDS depend on, 2 the column settings, 4 (default) the rest
 POLL_LEVELS = {"MAG": 1, "HV": 1,
                "FOCUS C": 2, "FOCUS F": 2, "STG X": 2, "STG Y": 2, "BEAM C": 2, "BEAM F": 2}
 POLL_LEVEL_DEFAULT = 4
-#: not polled: the working distance is computed from the focus (s3000.focus_wd); the SEM's own
-#: whole-mm ``WD`` readback is read on start / refresh and after ``WD n`` only, as a cross-check
-NOT_POLLED = ("WD",)
+#: not polled (none): the working distance is never read from the SEM – it is computed from the
+#: coarse and fine focus (s3000.focus_wd), with µm resolution
+NOT_POLLED: tuple = ()
 
 MAGNIFICATIONS: tuple[int, ...] = C.ALLOWED_MAGNIFICATIONS
 SCAN_MODES = C.SCAN_MODES  # {"F": "TV scan 1", …}
 
 # readback item -> state key
-_KEYS = {"HV": "hv_kv", "MAG": "mag", "WD": "wd_readback_mm", "EMI": "emission", "BEAM C": "beam_coarse",
+_KEYS = {"HV": "hv_kv", "MAG": "mag", "EMI": "emission", "BEAM C": "beam_coarse",
          "BEAM F": "beam_fine", "FOCUS C": "focus_coarse", "FOCUS F": "focus_fine", "STG X": "stig_x",
          "STG Y": "stig_y", "CONT": "contrast", "BRT": "brightness", "RUN": "running", "INPUTS AF": "detector",
          "SCAN": "scan"}
@@ -102,7 +102,6 @@ class SEMControl(MicroscopeControl):
         self._jobs: dict = {}
         self._listeners: list[Callable[[dict], None]] = []
         self._polling = bool(polling)
-        self._wd_warned = None
         for item in (i for i in ALL_ITEMS if i not in NOT_POLLED):
             link.poller.add(f"SEM {item}", lambda s, i=item: self._read_items(s, (i,)), owner=self,
                             key=("sem-read", (item,)), what=f"SEM read {item}", enabled=lambda: self._polling,
@@ -145,7 +144,6 @@ class SEMControl(MicroscopeControl):
     # ------------------------------------------------------------------ cache
     def _update(self, changes: dict) -> None:
         now = time.time()
-        note = None
         with self._lock:
             if "focus_coarse" in changes or "focus_fine" in changes:
                 c = changes.get("focus_coarse", self.state.get("focus_coarse"))
@@ -156,10 +154,6 @@ class SEMControl(MicroscopeControl):
             self.state.update(changes)
             for k in changes:
                 self.t_read[k] = now
-            if "wd_mm" in changes or "wd_readback_mm" in changes:
-                note = self._check_wd()
-        if note:
-            self.link.events.emit("info", note)
         if diff:
             for fn in list(self._listeners):
                 try:
@@ -167,19 +161,6 @@ class SEMControl(MicroscopeControl):
                 except Exception:  # noqa: BLE001 - a listener must not break the link
                     pass
             self.link.events.emit("sem", "", changes=diff)
-
-    def _check_wd(self) -> str | None:
-        """The computed WD against the SEM's whole-mm readback: a notice when they disagree
-        (the focus table was measured at one HV setpoint)."""
-        wd, rb = self.state.get("wd_mm"), self.state.get("wd_readback_mm")
-        if not isinstance(wd, float) or not isinstance(rb, int) or abs(wd - rb) <= 0.75:
-            self._wd_warned = None
-            return None
-        if self._wd_warned == (round(wd), rb):
-            return None
-        self._wd_warned = (round(wd), rb)
-        return (f"WD from the focus ({wd:.2f} mm) differs from the SEM's WD readback ({rb} mm): "
-                f"the focus table may not hold at this HV setpoint")
 
     def _read_items(self, session, items) -> dict:
         out = {}
@@ -423,17 +404,27 @@ class SEMControl(MicroscopeControl):
 
         return self.link.submit(barrier, SEM_SET, "beam preset")
 
-    def set_working_distance(self, mm: int) -> concurrent.futures.Future:
-        """``WD n`` (3–60 mm, whole mm): the SEM sets the coarse focus for that WD and centres the
-        fine focus; both are read back, so :meth:`working_distance_mm` follows."""
-        text = C.working_distance(int(round(mm)))
+    def set_working_distance(self, mm: float) -> concurrent.futures.Future:
+        """Set the working distance (mm, any value in 4–60) through the focus: ``FOCUS C`` and
+        ``FOCUS F`` from the focus table (s3000.focus_wd), not the SEM's whole-mm ``WD n``; both
+        are read back, so :meth:`working_distance_mm` follows."""
+        mm = float(mm)
+        lo, hi = 4.0, float(WD_RANGE_MM[1])  # the focus table's range
+        if not lo <= mm <= hi:
+            raise ValueError(f"working distance must be {lo:g}–{hi:g} mm (got {mm:g})")
+        c, f = focus_for_wd(mm)
+        with self._lock:  # a pending coarse / fine request is replaced by this WD
+            self._targets["focus_coarse"] = C.focus("C", c)
+            self._targets["focus_fine"] = C.focus("F", f)
 
-        def send(session, t):
-            session.sem.command(t)
-            self._update({"wd_readback_mm": int(t.split()[1])})
+        def send(session, value):
+            cc, ff = value
+            session.sem.command(C.focus("C", cc))
+            session.sem.command(C.focus("F", ff))
+            self._update({"focus_coarse": cc, "focus_fine": ff})
             self._read_items(session, ("FOCUS C", "FOCUS F"))
 
-        return self._set_latest("wd", text, send, text)
+        return self._set_latest("wd", (c, f), send, f"WD {mm:.3f} mm (FOCUS C {c}, F {f})")
 
     # scan, detector -----------------------------------------------------------------
     def set_scan(self, mode: str) -> concurrent.futures.Future:

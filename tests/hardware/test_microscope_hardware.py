@@ -32,11 +32,10 @@ def test_every_readback_parses(microscope):
     link, sem, stage = microscope
     got = sem.refresh().result(30)
     assert link.state == "connected"
-    for key in ("mag", "wd_readback_mm", "focus_coarse", "focus_fine", "stig_x", "stig_y", "beam_coarse", "beam_fine",
+    for key in ("mag", "focus_coarse", "focus_fine", "stig_x", "stig_y", "beam_coarse", "beam_fine",
                 "contrast", "brightness"):
         assert isinstance(got.get(key), int), (key, got.get(key))
-    # the working distance computed from the focus agrees with the SEM's whole-mm readback
-    assert sem.working_distance_mm() == pytest.approx(got["wd_readback_mm"], abs=0.75)
+    assert 3.0 <= sem.working_distance_mm() <= 60.0  # computed from the focus (WD is not read)
     assert got["mag"] in MAGNIFICATIONS
     assert isinstance(got.get("hv_on"), bool) and isinstance(got.get("running"), bool)
     assert len(ALL_ITEMS) == len({i for i in ALL_ITEMS})
@@ -101,15 +100,19 @@ def test_repeated_magnification_steps_coalesce(microscope):
 
 def test_working_distance_and_restore(microscope):
     link, sem, stage = microscope
-    wd0 = sem.refresh(("WD",)).result(10)["wd_readback_mm"]
-    new = wd0 + 1 if wd0 < 60 else wd0 - 1
+    sem.refresh(("FOCUS C", "FOCUS F")).result(10)
+    c0, f0 = sem.state["focus_coarse"], sem.state["focus_fine"]
+    wd0 = sem.working_distance_mm()
+    new = wd0 + 0.5 if wd0 < 59 else wd0 - 0.5
     try:
-        sem.set_working_distance(new).result(10)
-        assert sem.refresh(("WD",)).result(10)["wd_readback_mm"] == new
-        assert sem.working_distance_mm() == pytest.approx(new, abs=0.05)  # WD n -> the table focus
+        sem.set_working_distance(new).result(10)  # FOCUS C / F from the table
+        sem.refresh(("FOCUS C", "FOCUS F")).result(10)
+        assert sem.working_distance_mm() == pytest.approx(new, abs=0.01)
     finally:
-        sem.set_working_distance(wd0).result(10)
-    assert sem.refresh(("WD",)).result(10)["wd_readback_mm"] == wd0
+        sem.set_focus("C", c0).result(10)
+        sem.set_focus("F", f0).result(10)
+    sem.refresh(("FOCUS C", "FOCUS F")).result(10)
+    assert (sem.state["focus_coarse"], sem.state["focus_fine"]) == (c0, f0)
 
 
 def test_freeze_and_run(microscope):

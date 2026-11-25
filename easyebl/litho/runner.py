@@ -186,7 +186,7 @@ class SimulatedHardware(LithoHardware):
                  presets=("default",), seed: int = 0, delay_s: float = 0.0, start=(0.0, 0.0), pivot=(0.0, 0.0),
                  stage_to_beam=None, stall_um=(0.0, 0.0), beam_linear=None, beam_k: float = 0.0,
                  grid_at=None, grid_pitch_um: float = 1.0, grid_rotation_rad: float = 0.01,
-                 wd_mm: float | None = 15.0):
+                 wd_mm: float | None = 15.0, image_noise: float = 0.05, image_contrast: float = 1.0):
         from .coords import S3000_AXES
 
         self.sample = np.eye(2) if sample_linear is None else np.asarray(sample_linear, float)
@@ -209,6 +209,8 @@ class SimulatedHardware(LithoHardware):
         self.grid_at = grid_at
         self.grid_pitch = float(grid_pitch_um)
         self.grid_rotation = float(grid_rotation_rad)
+        self.image_noise = float(image_noise)  # rms noise of the images (texture rms × contrast)
+        self.image_contrast = float(image_contrast)
         self.preset = None
         self.last_preset = None
         self.exposures: list = []
@@ -323,7 +325,7 @@ class SimulatedHardware(LithoHardware):
         tile, tex = self._texture[f]
         k = tex.shape[0] / tile
         img = ndimage.map_coordinates(tex, [-q[:, 1] * k, q[:, 0] * k], order=1, mode="grid-wrap")
-        img = img.reshape(n, n) + self.rng.normal(0.0, 0.05, (n, n))
+        img = self.image_contrast * img.reshape(n, n) + self.rng.normal(0.0, self.image_noise, (n, n))
         return img, (pix, pix)
 
     def ask(self, text):

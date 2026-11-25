@@ -467,3 +467,44 @@ def test_simulated_sem_follows_the_stage():
     before = be._sample_at(x, y)
     stage.positions = {"X": 1010.0, "Y": 2000.0}
     assert np.allclose(be._sample_at(x - 10.0, y), before)
+
+
+def test_field_calibration_on_noisy_low_contrast_images():
+    """De-noise + flatten + partial whitening: a map is found where pure phase correlation fails."""
+    from easyebl.litho.fieldcal import WEAK_MATCH_PSR
+
+    b = _rot(0.5) @ S3000_AXES.matrix
+    old = FieldCalConfig(x=1000.0, y=1000.0, settle_s=0.0, denoise_px=0.0, background_fraction=0.0, whitening=1.0,
+                         max_residual_px=1e9)
+    for contrast, noise in ((0.1, 0.3), (0.05, 0.5)):  # signal-to-noise 0.33 and 0.1
+        for seed in range(3):
+            hw = SimulatedHardware(stage_to_beam=b, start=(1000.0, 1000.0), image_contrast=contrast, image_noise=noise,
+                                   seed=seed)
+            cfg = FieldCalConfig(x=1000.0, y=1000.0, settle_s=0.0, max_residual_px=3.0)  # noisy: more scatter
+            res = measure_field_calibration(hw, cfg, (1000.0, 1000.0), Condition(1000, None), axes=S3000_AXES)
+            assert np.abs(res.stage_to_beam - b).max() < 0.012, (contrast, seed, res.stage_to_beam)
+            assert res.problem is None and min(res.quality) > WEAK_MATCH_PSR
+    hw = SimulatedHardware(stage_to_beam=b, start=(1000.0, 1000.0), image_contrast=0.1, image_noise=0.3)
+    res = measure_field_calibration(hw, old, (1000.0, 1000.0), Condition(1000, None), axes=S3000_AXES)
+    assert np.abs(res.stage_to_beam - b).max() > 0.1  # the old matcher on the same images
+    # clean images stay as precise as before
+    hw = SimulatedHardware(stage_to_beam=b, start=(1000.0, 1000.0))
+    res = measure_field_calibration(hw, CAL, (1000.0, 1000.0), Condition(1000, None), axes=S3000_AXES)
+    assert np.abs(res.stage_to_beam - b).max() < 3e-4 and res.rejected == []
+
+
+def test_robust_fit_drops_a_bad_match():
+    from easyebl.litho.fieldcal import fit_robust, prefilter
+
+    b = _rot(0.3, 1.002)
+    ds = shift_pattern("grid", 30.0)
+    meas = -ds @ b.T + np.random.default_rng(0).normal(0, 0.005, ds.shape)
+    meas[4] += (3.0, -2.0)  # one image matched the wrong feature
+    bb, drift, res, dropped = fit_robust(ds, meas)
+    assert dropped == [4] and np.allclose(bb, b, atol=2e-3) and np.hypot(*res[4]) > 3.0
+    bb, _, _, dropped = fit_robust(ds, -ds @ b.T)
+    assert dropped == [] and np.allclose(bb, b)
+    img = np.random.default_rng(1).normal(size=(64, 64)) + np.linspace(0, 50, 64)[None, :]  # a strong gradient
+    flat = prefilter(img, 1.0, 8.0)
+    slope = lambda a: abs(np.polyfit(np.arange(64), a.mean(0), 1)[0])  # noqa: E731
+    assert slope(flat) < 0.1 * slope(img)  # the gradient is (nearly) gone

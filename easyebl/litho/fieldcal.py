@@ -6,10 +6,12 @@ sample …) the procedure
 1. moves the stage there and takes a reference image (scan rotation 0, centred);
 2. moves the stage by known shifts ``Δs`` (a 3 × 3 grid or a cross of ±d, d a fraction of
    the field) and takes an image at each;
-3. measures each image's shift against the reference by phase correlation (sub-pixel) –
-   a feature moves by ``−B·Δs`` in BCS;
-4. fits ``B`` (and a constant drift) by least squares; the residuals tell how well the
-   images matched.
+3. measures each image's shift against the reference: both images are de-noised (Gaussian
+   low-pass) and flattened (a heavily blurred copy subtracted: gradients, charging), then
+   matched by partially whitened phase correlation (sub-pixel) – a feature moves by ``−B·Δs``
+   in BCS; the match quality is the peak-to-sidelobe ratio of the correlation;
+4. fits ``B`` (and a constant drift) by least squares, dropping an image whose residual is far
+   beyond the others; the residuals tell how well the images matched.
 
 The image shifts are converted to BCS (true µm) through the beam calibration of the condition
 (its linear part), so ``B`` holds the rotation between stage and beam axes and the mirror of the
@@ -29,7 +31,8 @@ import numpy as np
 
 from .coords import StageAxes, linear_params
 
-__all__ = ["FieldCalConfig", "FieldCalResult", "Condition", "phase_correlation", "shift_pattern", "fit_stage_to_beam",
+__all__ = ["FieldCalConfig", "FieldCalResult", "Condition", "phase_correlation", "prefilter", "fit_robust",
+           "WEAK_MATCH_PSR", "shift_pattern", "fit_stage_to_beam",
            "measure_field_calibration", "FieldCalError"]
 
 
@@ -94,6 +97,9 @@ class FieldCalConfig:
     frames: int = 1
     settle_s: float = 0.5  # after each stage move, before the image
     max_residual_px: float = 1.5  # a fit worse than this (rms, pixels) is refused
+    denoise_px: float = 2.5  # Gaussian low-pass before matching (σ, pixels; 0: off)
+    background_fraction: float = 0.125  # subtracted blur (σ as a fraction of the image; 0: off)
+    whitening: float = 0.5  # cross-power spectrum ÷ |·|^w: 1 pure phase correlation, 0 plain correlation
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -115,7 +121,8 @@ class FieldCalResult:
     timestamp: float = field(default_factory=time.time)
     shifts: list = field(default_factory=list)  # [(Δs, measured image shift)] for display
     predicted: list = field(default_factory=list)  # nominal image shift of each image (stage axes)
-    quality: list = field(default_factory=list)  # phase-correlation peak of each image (0…1)
+    quality: list = field(default_factory=list)  # peak-to-sidelobe ratio of each image's match
+    rejected: list = field(default_factory=list)  # indices of images left out of the fit (outliers)
     drift: tuple = (0.0, 0.0)  # constant image shift of the fit (µm)
     pixel_um: float = 0.0
     problem: str | None = None  # why the fit was refused (None: usable)
@@ -160,7 +167,9 @@ class FieldCalResult:
             "drift_um": tuple(map(float, self.drift)),
             "rms_um": self.residual_um, "rms_px": self.residual_um / px,
             "max_residual_um": float(np.max(np.hypot(res[:, 0], res[:, 1]))) if len(res) else 0.0,
-            "weakest_match": float(min(self.quality)) if self.quality else float("nan"),
+            "weakest_match": float(min(q for i, q in enumerate(self.quality) if i not in self.rejected))
+            if self.quality else float("nan"),
+            "rejected": list(self.rejected),
             "matrix": c,
         }
 
@@ -224,11 +233,42 @@ def _crops(a, b, gx: int, gy: int):
     return a[y0 - gy:y1 - gy, x0 - gx:x1 - gx], b[y0:y1, x0:x1]
 
 
-def phase_correlation(ref: np.ndarray, img: np.ndarray, guess=(0.0, 0.0), upsample: int = 20
-                      ) -> tuple[float, float, float]:
-    """Shift (dcol, drow) in pixels that moves *ref*'s content onto *img*'s, and the peak height
-    (0…1, the match quality).  *guess*: the expected shift – only the overlapping parts are
-    compared, so shifts of a large part of the image work; sub-pixel by an upsampled DFT."""
+#: a match with a peak-to-sidelobe ratio below this is weak (a featureless or very noisy image)
+WEAK_MATCH_PSR = 6.0
+
+
+def prefilter(img: np.ndarray, denoise_px: float = 1.5, background_px: float = 0.0) -> np.ndarray:
+    """De-noise (Gaussian low-pass, σ *denoise_px*) and flatten (minus a blur of σ *background_px*:
+    brightness gradients, charging) an image for matching.  Both images of a pair must get the same."""
+    from scipy import ndimage
+
+    a = np.asarray(img, float)
+    out = ndimage.gaussian_filter(a, denoise_px, mode="reflect") if denoise_px > 0 else a.copy()
+    if background_px > 0:
+        out -= ndimage.gaussian_filter(a, background_px, mode="reflect")
+    return out
+
+
+def _psr(c: np.ndarray, iy: int, ix: int, exclude: int = 5) -> float:
+    """Peak-to-sidelobe ratio of a (circular) correlation surface around its peak at (iy, ix)."""
+    ny, nx = c.shape
+    mask = np.ones_like(c, bool)
+    ry = (np.arange(-exclude, exclude + 1) + iy) % ny
+    rx = (np.arange(-exclude, exclude + 1) + ix) % nx
+    mask[np.ix_(ry, rx)] = False
+    side = c[mask]
+    sd = float(side.std())
+    return float((c[iy, ix] - side.mean()) / sd) if sd > 0 else float("inf")
+
+
+def phase_correlation(ref: np.ndarray, img: np.ndarray, guess=(0.0, 0.0), upsample: int = 20,
+                      whitening: float = 1.0) -> tuple[float, float, float]:
+    """Shift (dcol, drow) in pixels that moves *ref*'s content onto *img*'s, and the match quality
+    (the correlation's peak-to-sidelobe ratio; > :data:`WEAK_MATCH_PSR` is a clear match).
+    *guess*: the expected shift – only the overlapping parts are compared, so shifts of a large
+    part of the image work.  *whitening*: the cross-power spectrum is divided by its magnitude to
+    this power (1: pure phase correlation – sharp, but noise counts as much as the feature;
+    ≈ 0.6: robust on noisy, low-contrast images); sub-pixel by an upsampled DFT."""
     a = np.asarray(ref, float)
     b = np.asarray(img, float)
     if a.shape != b.shape:
@@ -239,22 +279,47 @@ def phase_correlation(ref: np.ndarray, img: np.ndarray, guess=(0.0, 0.0), upsamp
     fa = np.fft.fft2((a - a.mean()) * w)
     fb = np.fft.fft2((b - b.mean()) * w)
     cross = fb * np.conj(fa)
-    r = cross / (np.abs(cross) + 1e-12)  # phase correlation: a sharp peak for the integer search
+    mag = np.abs(cross)
+    r = cross / (mag ** float(whitening) + 1e-12 * (mag.max() ** float(whitening) + 1e-300))
     c = np.fft.ifft2(r).real
     ny, nx = c.shape
     iy, ix = np.unravel_index(int(np.argmax(c)), c.shape)
-    peak = float(c[iy, ix])
+    quality = _psr(c, iy, ix)
     sy = iy - ny if iy > ny // 2 else iy
     sx = ix - nx if ix > nx // 2 else ix
     if upsample > 1:
-        region = int(np.ceil(upsample * 3))  # ±1.5 px: the phase-only integer peak may be one pixel off in noise
+        region = int(np.ceil(upsample * 3))  # ±1.5 px: the integer peak may be one pixel off in noise
         centre = region // 2
-        # sub-pixel on the plain cross-power (the phase-only peak is biased towards whole pixels)
+        # sub-pixel on the plain cross-power (a whitened peak is biased towards whole pixels)
         up = _upsampled_dft(np.conj(cross), region, upsample, (centre - sy * upsample, centre - sx * upsample))
         uy, ux = np.unravel_index(int(np.argmax(np.abs(up))), up.shape)
         sy = sy + (uy - centre) / upsample
         sx = sx + (ux - centre) / upsample
-    return float(sx + gx), float(sy + gy), peak
+    return float(sx + gx), float(sy + gy), quality
+
+
+def fit_robust(stage_shifts, image_shifts, floor: float = 0.0, min_images: int = 5,
+               k: float = 3.0) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+    """:func:`fit_stage_to_beam`, dropping the worst image while its residual is beyond *k* × the
+    robust spread of the others (and above *floor*), keeping at least *min_images*.  Returns
+    (B, drift, residuals of every image (N, 2), indices dropped)."""
+    s = np.atleast_2d(np.asarray(stage_shifts, float))
+    d = np.atleast_2d(np.asarray(image_shifts, float))
+    keep = list(range(len(s)))
+    dropped: list = []
+    while True:
+        b, drift, _ = fit_stage_to_beam(s[keep], d[keep])
+        res = d - (-(s @ b.T) + drift)
+        if len(keep) <= min_images:
+            break
+        n = np.hypot(res[keep, 0], res[keep, 1])
+        worst = int(np.argmax(n))
+        others = np.delete(n, worst)
+        spread = 1.4826 * float(np.median(others)) if len(others) else 0.0
+        if n[worst] <= max(k * spread, floor):
+            break
+        dropped.append(keep.pop(worst))
+    return b, drift, res, sorted(dropped)
 
 
 def fit_stage_to_beam(stage_shifts, image_shifts) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -316,18 +381,21 @@ def measure_field_calibration(hw, config: FieldCalConfig, position, condition: C
             hw.move_stage(float(pos[0]), float(pos[1]))
         except Exception:  # noqa: BLE001 - the measurement error (if any) is the one to report
             pass
-    ref = images[0]
+    bg = config.background_fraction * float(config.image_px)
+    filtered = [prefilter(im, config.denoise_px, bg) for im in images]
+    ref = filtered[0]
     meas, quality, predicted = [], [], []
     nominal = axes.matrix if axes is not None else np.eye(2)
     mirrors = [nominal] + [np.diag(d) for d in ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
                            if not np.allclose(np.diag(d), nominal)]
-    for img, ds in zip(images, shifts):
+    for img, ds in zip(filtered, shifts):
         predicted.append(tuple(map(float, -nominal @ ds)))  # the nominal image shift (µm)
         best = None
         for m in mirrors:
             e = -m @ ds
             try:
-                dc, dr, q = phase_correlation(ref, img, guess=(e[0] / pixel[0], -e[1] / pixel[1]))
+                dc, dr, q = phase_correlation(ref, img, guess=(e[0] / pixel[0], -e[1] / pixel[1]),
+                                              whitening=config.whitening)
             except FieldCalError:
                 continue
             if best is None or q > best[2] + 1e-9:
@@ -342,18 +410,22 @@ def measure_field_calibration(hw, config: FieldCalConfig, position, condition: C
     meas = np.array(meas)
     if beamcal is not None:
         meas = np.atleast_2d(beamcal.linear_to_bcs(meas))
-    b, drift, res = fit_stage_to_beam(shifts, meas)
-    rms = float(np.sqrt(np.mean(np.sum(res ** 2, axis=1))))
+    b, drift, res, dropped = fit_robust(shifts, meas, floor=0.5 * max(pixel))
+    used = [i for i in range(len(shifts)) if i not in dropped]
+    rms = float(np.sqrt(np.mean(np.sum(res[used] ** 2, axis=1))))
     out = FieldCalResult(b, condition, field_um, (float(pos[0]), float(pos[1])), rms, len(shifts),
                          shifts=[(tuple(map(float, s)), tuple(map(float, m))) for s, m in zip(shifts, meas)],
                          predicted=predicted, quality=quality, drift=(float(drift[0]), float(drift[1])),
-                         pixel_um=float(max(pixel)), beamcal_id=getattr(beamcal, "id", None))
+                         pixel_um=float(max(pixel)), beamcal_id=getattr(beamcal, "id", None), rejected=dropped)
+    if dropped:
+        log("field calibration: image(s) " + ", ".join(str(i + 1) for i in dropped)
+            + " left out (far off the others: a bad match)")
     if rms > config.max_residual_px * max(pixel):
         out.problem = (f"the images do not match well (fit rms {rms * 1e3:.0f} nm = {rms / max(pixel):.1f} px; "
                        "is there a feature with structure in the field?)")
         raise FieldCalError(out.problem, out)
     log(f"field calibration: {out.describe(axes)} (drift {drift[0] * 1e3:+.0f}, {drift[1] * 1e3:+.0f} nm, "
-        f"weakest match {min(quality):.2f})")
+        f"weakest match {min(quality[i] for i in used):.1f})")
     if axes is not None and out.mirror_mismatch(axes):
         sug = out.suggested_axes()
         log("field calibration: the images move against the stage axes setting; it should be mirror X "

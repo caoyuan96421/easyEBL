@@ -272,9 +272,11 @@ S-3000. On top of it:
   transaction already on the wire (replies take 0.25–1 s).  After a reply times out the link stops
   until you check the SEM and press **Resync** (nothing is ever resent automatically).
 * **`SEMControl`** (column HAL): HV setpoint / on / off, magnification (the 65-step list), working
-  distance, coarse/fine focus, stigmator, condenser coarse/fine (raw 0–99), SEM display contrast /
+  distance (never read from the SEM: computed from the coarse and fine focus through the S-3000's
+  focus table, µm resolution; setting a WD, any value in 4–60 mm, sends the table's `FOCUS C` and
+  `FOCUS F`), coarse/fine focus, stigmator, condenser coarse/fine (raw 0–99), SEM display contrast /
   brightness / scan mode / freeze, detector, AFC / ASF / ABC / AGA.  Readbacks are cached (instant for
-  the GUIs), refreshed after each setting and by a slow MAG / HV / WD poll (default 10 s) so changes
+  the GUIs), refreshed after each setting and by the background reads so changes
   on the SEM panel are seen.  Repeated settings coalesce: ten wheel steps during one transaction
   become one `MAG` with the final value.
 * **`StageControl`** (stage HAL): X, Y, Z in µm and R, T in degrees.  Positions are polled at the
@@ -377,8 +379,10 @@ Run the beam calibration first, then the field calibration, at the same conditio
 * **Field calibration** (*Field calibration settings…*, *Run field calibration now*, or a *Field
   calibration* step): a reference image at a fixed stage position with a structured feature,
   then one at each of a 3 × 3 grid (or 5-point cross) of stage shifts of ±30 % of the field;
-  the shifts (phase correlation, sub-pixel), converted to BCS through the beam calibration,
-  give `B`.  Its rotation is used; its scale (stage encoder against the grid) is a check.  A
+  the images are de-noised (Gaussian, 2.5 px) and flattened (a wide blur subtracted), matched
+  by partially whitened phase correlation (sub-pixel; quality: the peak-to-sidelobe ratio), and an
+  image far off the others is left out of the fit; the shifts, converted to BCS through the beam
+  calibration, give `B` (de-noise, flatten and whitening are in the settings).  Its rotation is used; its scale (stage encoder against the grid) is a check.  A
   window shows the progress and the result (rotation, scale, stretch, shear, drift, residuals,
   a table and a plot); *Accept* uses it, *Discard* drops it (and stops a run).  Each image is
   matched for every mirroring, so a wrong mirror setting shows as a mismatch, pointing to the

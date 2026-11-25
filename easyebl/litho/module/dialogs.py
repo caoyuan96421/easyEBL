@@ -181,6 +181,16 @@ class FieldCalDialog(QtWidgets.QDialog):
         self.frames.setValue(config.frames)
         self.settle = _spin(config.settle_s, 0, 60, 2, " s", 0.1)
         self.maxres = _spin(config.max_residual_px, 0.1, 50, 1, " px", 0.5)
+        self.denoise = _spin(config.denoise_px, 0, 20, 1, " px", 0.5)
+        self.denoise.setSpecialValueText("off")
+        self.denoise.setToolTip("Gaussian low-pass (σ) before matching: about the size of the feature's detail; "
+                                "more for noisier images")
+        self.bgfrac = _spin(config.background_fraction * 100, 0, 50, 1, " % of the image", 2.5)
+        self.bgfrac.setSpecialValueText("off")
+        self.bgfrac.setToolTip("a blur this wide (σ) is subtracted: brightness gradients and charging do not match")
+        self.whiten = _spin(config.whitening, 0, 1, 2, "", 0.1)
+        self.whiten.setToolTip("1: pure phase correlation (sharp, but noise counts as much as the feature); "
+                               "lower is more robust on noisy, low-contrast images")
         f = QtWidgets.QFormLayout()
         f.addRow("position", self.pos)
         h = QtWidgets.QHBoxLayout()
@@ -195,6 +205,9 @@ class FieldCalDialog(QtWidgets.QDialog):
         f.addRow("frames averaged", self.frames)
         f.addRow("settle after a move", self.settle)
         f.addRow("refuse a fit worse than", self.maxres)
+        f.addRow("de-noise", self.denoise)
+        f.addRow("flatten (background)", self.bgfrac)
+        f.addRow("whitening", self.whiten)
         self.last = QtWidgets.QLabel("last calibration: " + (last if last else "none"))
         self.last.setWordWrap(True)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -226,7 +239,8 @@ class FieldCalDialog(QtWidgets.QDialog):
                               pattern=self.pattern.currentData(), step_fraction=self.step.value() / 100.0,
                               image_fraction=self.width.value() / 100.0, image_px=int(self.px.currentData()),
                               frames=int(self.frames.value()), settle_s=self.settle.value(),
-                              max_residual_px=self.maxres.value())
+                              max_residual_px=self.maxres.value(), denoise_px=self.denoise.value(),
+                              background_fraction=self.bgfrac.value() / 100.0, whitening=self.whiten.value())
 
 
 class BeamCalDialog(QtWidgets.QDialog):
