@@ -6,7 +6,8 @@
 * magnification – the SEM (the field follows through the global field calibration);
 * beam condition – the microscope module's beam presets (never HV, never the beam itself);
 * marks – the SEM imaging window: the scan zooms onto the predicted mark (beam shift + scan
-  width, the column is not touched) and the user clicks the mark (pick mode);
+  width, the column is not touched); each click centres the scan there, *Confirm* takes the scan
+  centre (centring pick mode);
 * exposure – :class:`~easyebl.litho.writer.LithoWriter` on its own DAQ handle (the imaging
   engine is stopped first, so it does not scan over the resist).
 
@@ -249,7 +250,7 @@ class BackendHardware(LithoHardware):
                     self.engine.set_field_of_view(r.view_um, center_um=r.predicted_xcs)
                     self.engine.run()
                     sem.request_pick(f"{r.label} (CCS {r.ccs[0]:.2f}, {r.ccs[1]:.2f} µm) – "
-                                     "predicted at the cross",
+                                     "predicted at the magenta cross, centre it on the green one",
                                      lambda xy: fut.done() or fut.set_result(xy), targets=[r.predicted_xcs])
 
                 def cancel():

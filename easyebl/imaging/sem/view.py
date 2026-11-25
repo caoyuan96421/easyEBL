@@ -188,6 +188,7 @@ class SEMImageView(QtWidgets.QWidget):
         self._paint_ms = 0.0
         self._pick_prompt: str | None = None  # pick mode on when not None
         self._pick_targets: list = []  # crosses (field µm)
+        self._pick_centre_cross = False  # a cross at the image centre (centring pick)
 
     # ---------------------------------------------------------------- data
     def set_frame(self, frame, levels) -> None:
@@ -251,16 +252,19 @@ class SEMImageView(QtWidgets.QWidget):
     def pick_mode(self) -> bool:
         return self._pick_prompt is not None
 
-    def start_pick(self, prompt: str, targets=()) -> None:
-        """Pick mode: the next left click emits :attr:`pointPicked` (beam shift by drag is off)."""
+    def start_pick(self, prompt: str, targets=(), centre_cross: bool = False) -> None:
+        """Pick mode: a left click emits :attr:`pointPicked` (beam shift by drag is off); *targets*
+        are drawn as magenta crosses, *centre_cross* draws a green cross at the image centre."""
         self._pick_prompt = str(prompt)
         self._pick_targets = [tuple(map(float, t)) for t in targets]
+        self._pick_centre_cross = bool(centre_cross)
         self.setCursor(QtCore.Qt.CrossCursor)
         self.update()
 
     def stop_pick(self) -> None:
         self._pick_prompt = None
         self._pick_targets = []
+        self._pick_centre_cross = False
         if not self._measure_mode:
             self.unsetCursor()
         self.update()
@@ -337,6 +341,17 @@ class SEMImageView(QtWidgets.QWidget):
                         p.drawLine(QtCore.QPointF(c.x() + 4, c.y()), QtCore.QPointF(c.x() + 14, c.y()))
                         p.drawLine(QtCore.QPointF(c.x(), c.y() - 14), QtCore.QPointF(c.x(), c.y() - 4))
                         p.drawLine(QtCore.QPointF(c.x(), c.y() + 4), QtCore.QPointF(c.x(), c.y() + 14))
+                p.restore()
+            if self._pick_centre_cross and f is not None:  # the image centre: where the mark goes
+                c = r.center()
+                p.save()
+                p.setClipRect(r)
+                for pen in (QtGui.QPen(QtGui.QColor(0, 0, 0, 170), 4), QtGui.QPen(QtGui.QColor(80, 255, 120), 2)):
+                    p.setPen(pen)
+                    p.drawLine(QtCore.QPointF(c.x() - 30, c.y()), QtCore.QPointF(c.x() - 6, c.y()))
+                    p.drawLine(QtCore.QPointF(c.x() + 6, c.y()), QtCore.QPointF(c.x() + 30, c.y()))
+                    p.drawLine(QtCore.QPointF(c.x(), c.y() - 30), QtCore.QPointF(c.x(), c.y() - 6))
+                    p.drawLine(QtCore.QPointF(c.x(), c.y() + 6), QtCore.QPointF(c.x(), c.y() + 30))
                 p.restore()
         else:
             p.setPen(QtGui.QColor(120, 120, 120))

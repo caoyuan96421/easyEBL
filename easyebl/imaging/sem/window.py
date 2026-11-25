@@ -100,7 +100,14 @@ class SEMWindow(QtWidgets.QMainWindow):
         self._sub = engine.subscribe(maxlen=200)
 
         self.view = SEMImageView()
-        self.setCentralWidget(self.view)
+        self.pick_bar = self._make_pick_bar()
+        central = QtWidgets.QWidget()
+        cl = QtWidgets.QVBoxLayout(central)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+        cl.addWidget(self.pick_bar)
+        cl.addWidget(self.view, 1)
+        self.setCentralWidget(central)
         self.scan = ScanPanel(engine, self.notify)
         self.capture = CapturePanel()
         self.image = ImagePanel(engine, self.cb, self.notify)
@@ -228,6 +235,8 @@ class SEMWindow(QtWidgets.QMainWindow):
         sc("Ctrl+S", self.save_dialog)
         sc("Ctrl+A", self.auto_contrast)
         sc("Esc", lambda: self.cancel_pick() if self.view.pick_mode else self.engine.stop())
+        sc("Return", lambda: self.confirm_pick() if self.view.pick_mode else None)
+        sc("Enter", lambda: self.confirm_pick() if self.view.pick_mode else None)
         for key, dx, dy in (("Shift+Left", -1, 0), ("Shift+Right", 1, 0), ("Shift+Up", 0, 1), ("Shift+Down", 0, -1)):
             sc(key, lambda dx=dx, dy=dy: self.fov.step(dx, dy))
         sc("Ctrl++", lambda: self.fov.zoom(+1))
@@ -386,21 +395,99 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.l_ptr.setText("" if xy is None else f"x {xy[0]:+.3f} µm, y {xy[1]:+.3f} µm")
 
     # ---------------------------------------------------------------- pick (lithography alignment)
-    def request_pick(self, prompt: str, callback, targets=()) -> None:
-        """Ask the user to click a point in the image: ``callback((x_um, y_um))`` with the field
-        position, or ``callback(None)`` when cancelled (Esc, another request, window closed).
-        *targets* are drawn as crosses (e.g. the predicted mark position)."""
+    def _make_pick_bar(self) -> QtWidgets.QFrame:
+        bar = QtWidgets.QFrame()
+        bar.setStyleSheet("QFrame{background:#5a1846} QLabel{color:white}")
+        h = QtWidgets.QHBoxLayout(bar)
+        h.setContentsMargins(8, 4, 8, 4)
+        self.l_pick = QtWidgets.QLabel()
+        self.l_pick.setWordWrap(True)
+        self.b_pick_confirm = QtWidgets.QPushButton("Confirm (Enter)")
+        self.b_pick_confirm.setToolTip("the scan centre (the green centre cross) is the marker position")
+        self.b_pick_confirm.setStyleSheet("QPushButton{background:#2e7d32;color:white;font-weight:bold;"
+                                          "padding:4px 12px}")
+        self.b_pick_confirm.clicked.connect(self.confirm_pick)
+        self.b_pick_reset = QtWidgets.QPushButton("Reset")
+        self.b_pick_reset.setToolTip("back to the predicted position")
+        self.b_pick_reset.clicked.connect(self.reset_pick)
+        self.b_pick_cancel = QtWidgets.QPushButton("Cancel (Esc)")
+        self.b_pick_cancel.clicked.connect(self.cancel_pick)
+        h.addWidget(self.l_pick, 1)
+        for b in (self.b_pick_reset, self.b_pick_cancel, self.b_pick_confirm):
+            h.addWidget(b)
+        bar.hide()
+        return bar
+
+    def request_pick(self, prompt: str, callback, targets=(), centre: bool = True) -> None:
+        """Ask the user for a point: ``callback((x_um, y_um))`` with the field position, or
+        ``callback(None)`` when cancelled (Esc, another request, window closed).  *targets* are drawn
+        as magenta crosses (e.g. the predicted mark position).
+
+        *centre* (default): every click moves the scan centre there (beam shift, clamped to the
+        field) so the mark comes under the green centre cross, as often as wanted; *Confirm*
+        (Enter) answers the scan centre, *Reset* goes back to the first target.  Otherwise the
+        first click answers."""
         self.cancel_pick()
         self._pick_cb = callback
+        self._pick_centre = bool(centre)
+        self._pick_home = tuple(map(float, targets[0])) if len(targets) else tuple(self.engine.config.center_um)
+        self._pick_clicks = 0
+        self._pick_clamped = False
+        self._pick_prompt = prompt
         self.view.pointPicked.connect(self._picked)
-        self.view.start_pick(prompt + "   (click the mark · Esc cancels)", targets)
+        hint = ("click the mark to centre it, again to refine · Enter confirms · Esc cancels" if centre
+                else "click the mark · Esc cancels")
+        self.view.start_pick(prompt + f"   ({hint})", targets, centre_cross=centre)
+        if centre:
+            self._update_pick_bar()
+            self.pick_bar.show()
         self.notify("pick: " + prompt)
 
+    def _update_pick_bar(self) -> None:
+        c = self.engine.config.center_um
+        dx, dy = c[0] - self._pick_home[0], c[1] - self._pick_home[1]
+        txt = (f"<b>{self._pick_prompt}</b><br>scan centre ({c[0]:+.3f}, {c[1]:+.3f}) µm · "
+               f"({dx:+.3f}, {dy:+.3f}) µm from the prediction · {self._pick_clicks} click(s)")
+        if self._pick_clamped:
+            txt += " · <span style='color:#fc6'>centre limited by the field edge</span>"
+        self.l_pick.setText(txt)
+
     def _picked(self, x: float, y: float) -> None:
+        if not getattr(self, "_pick_centre", False):
+            cb = self._end_pick()
+            if cb is not None:
+                self.notify(f"picked ({x:+.3f}, {y:+.3f}) µm")
+                cb((x, y))
+            return
+        try:
+            c = self.engine.set_beam_shift(x, y).center_um
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"error: {e}")
+            return
+        self._pick_clicks += 1
+        self._pick_clamped = abs(c[0] - x) > 1e-6 or abs(c[1] - y) > 1e-6
+        self.fov.sync()
+        self._update_pick_bar()
+
+    def confirm_pick(self) -> None:
+        """(centring pick) Answer the scan centre."""
+        if getattr(self, "_pick_cb", None) is None:
+            return
+        c = tuple(float(v) for v in self.engine.config.center_um)
         cb = self._end_pick()
-        if cb is not None:
-            self.notify(f"picked ({x:+.3f}, {y:+.3f}) µm")
-            cb((x, y))
+        self.notify(f"marker at ({c[0]:+.3f}, {c[1]:+.3f}) µm")
+        cb(c)
+
+    def reset_pick(self) -> None:
+        if getattr(self, "_pick_cb", None) is None:
+            return
+        try:
+            self.engine.set_beam_shift(*self._pick_home)
+            self.fov.sync()
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"error: {e}")
+        self._pick_clamped = False
+        self._update_pick_bar()
 
     def _end_pick(self):
         cb = getattr(self, "_pick_cb", None)
@@ -410,6 +497,7 @@ class SEMWindow(QtWidgets.QMainWindow):
         except (RuntimeError, TypeError):
             pass
         self.view.stop_pick()
+        self.pick_bar.hide()
         return cb
 
     def cancel_pick(self) -> None:

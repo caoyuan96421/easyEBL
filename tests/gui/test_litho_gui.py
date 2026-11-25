@@ -316,10 +316,22 @@ def test_litho_in_the_program_marks_are_clicked_in_the_sem_window(ui, qtbot):
     sem = ui.windows["sem"]
     cfg = ui.backend.engine.config
     assert cfg.width_um == pytest.approx(10.0) and cfg.center_um == pytest.approx((3.0, -2.0))  # zoomed on the mark
-    assert sem.view._pick_targets == [(3.0, -2.0)]
+    assert sem.view._pick_targets == [(3.0, -2.0)] and sem.view._pick_centre_cross and sem.pick_bar.isVisible()
+    # each click centres the scan there; nothing is answered until Confirm
+    eng = ui.backend.engine
     sem.view.pointPicked.emit(3.4, -1.7)
+    assert eng.config.center_um == pytest.approx((3.4, -1.7)) and "1 click(s)" in sem.l_pick.text()
+    sem.view.pointPicked.emit(3.5, -1.6)
+    assert eng.config.center_um == pytest.approx((3.5, -1.6)) and "(+0.500, +0.400)" in sem.l_pick.text()
+    sem.reset_pick()
+    assert eng.config.center_um == pytest.approx((3.0, -2.0))
+    sem.view.pointPicked.emit(1e4, 0.0)  # beyond the field: the centre stops at the edge
+    assert eng.config.center_um[0] < 1e4 and "field edge" in sem.l_pick.text()
+    sem.view.pointPicked.emit(3.45, -1.65)
+    assert "xy" not in out and sem.view.pick_mode
+    sem.b_pick_confirm.click()
     qtbot.waitUntil(lambda: "xy" in out, timeout=10000)
-    assert out["xy"] == [(3.4, -1.7)] and not sem.view.pick_mode
+    assert out["xy"] == [pytest.approx((3.45, -1.65))] and not sem.view.pick_mode and not sem.pick_bar.isVisible()
     qtbot.waitUntil(lambda: not ui.backend.engine.is_scanning, timeout=10000)
 
     out.clear()

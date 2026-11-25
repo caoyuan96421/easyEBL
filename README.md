@@ -410,8 +410,12 @@ Run the beam calibration first, then the field calibration, at the same conditio
   paths are stored relative to the file.
 * **Running** an Exposure, field by field: the stage goes to the field's target; for each marker
   the SEM imaging window zooms its scan onto the predicted position (beam shift and scan width)
-  and asks you to **click the marker** (Esc aborts); the SEM scan stops and the pattern is
-  written through the chain.  A pattern outside the field is skipped or aborts, as set in
+  (magenta cross).  **Each click centres the scan on the clicked point** (beam shift, clamped at
+  the field edge), so the marker comes under the green centre cross; click again to refine, as
+  often as you like.  The bar above the image shows the scan centre, its offset from the
+  prediction and the clicks; **Confirm** (Enter) takes the scan centre as the marker position,
+  *Reset* goes back to the prediction, *Cancel* (Esc) aborts the run.  Then the SEM scan stops
+  and the pattern is written through the chain.  A pattern outside the field is skipped or aborts, as set in
   *Schedule settings*.
 * **Demo files**: `python -m easyebl.litho.demo` writes them to `examples/litho/`:
   `multifield_demo.gds` (3 × 3 fields of 80 µm on a 100 µm pitch; layer 1 the pattern, layer 2
