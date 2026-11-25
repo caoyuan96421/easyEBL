@@ -286,6 +286,12 @@ class RasterPlan:
         return p0 + (p1 - p0) * w[:, None]
 
     def _check_extent(self) -> None:
+        self.cal.um_to_volts(self.extent_points(), limit_v=self.limit_v)  # raises OutOfFieldError
+
+    def extent_points(self) -> np.ndarray:
+        """Field positions (µm) of the trajectory's extremes: the first pre-line step and the last
+        pixel of the first and last rows, both scan directions.  Every other sample (pixels,
+        flyback, frame settle) lies between them.  With the centre at 0 they scale with the width."""
         cfg = self.cfg
         pts = []
         for line in {0, cfg.ny - 1}:
@@ -297,7 +303,7 @@ class RasterPlan:
                 v = float(self._v_of_row(self.line_rows[line]))
                 for col in (col_first, col_last):
                     pts.append(self._to_field(np.array([self._u_of_index(col)]), np.array([v]))[0])
-        self.cal.um_to_volts(np.array(pts), limit_v=self.limit_v)  # raises OutOfFieldError
+        return np.array(pts)
 
     # -------------------------------------------------------------- samples
     def line_start_sample(self, frame: int, line: int) -> int:

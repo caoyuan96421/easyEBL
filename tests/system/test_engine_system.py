@@ -101,6 +101,23 @@ def test_invalid_settings_raise_in_caller_and_keep_scanning(make_engine):
     assert eng.wait_frame(seq, complete=True, timeout=10) is not None
 
 
+@pytest.mark.parametrize("changes", [dict(nx=64, ny=64), dict(nx=2000, ny=2000), dict(nx=256, ny=128, dwell_s=2e-5),
+                                     dict(nx=256, ny=256, rotation_rad=0.3), dict(nx=256, ny=256, center_um=(5.0, -3.0)),
+                                     dict(nx=256, ny=128, bidirectional=True), dict(nx=256, ny=256, preline_mode="hold")])
+def test_max_scan_width_is_exact(make_engine, changes):
+    """The computed widest scan fits the AO range sample by sample, and 0.1 % more does not (unless
+    the full field itself is the limit)."""
+    eng, _ = make_engine()
+    w = eng.max_scan_width(**changes)
+    cfg = eng.config.with_(height_um=None, **changes)
+    assert 0 < w <= 100.0 and eng._fits(cfg.with_(width_um=w))
+    if w < 99.9:
+        assert not eng._fits(cfg.with_(width_um=w * 1.001))
+    assert eng.fit_width(10.0, **changes) == 10.0 and eng.fit_width(1e4, **changes) == w
+    fr = eng.capture(frames=1, width_um=eng.fit_width(1e4, **changes), **changes).result(30)
+    assert fr.config.width_um == pytest.approx(w)
+
+
 def test_beam_shift_is_clamped_to_the_field(make_engine):
     eng, _ = make_engine()
     assert eng.set_beam_shift(1e4, 0).center_um[0] < 5  # the scan starts at (nearly) the full field

@@ -302,6 +302,12 @@ def test_litho_in_the_program_marks_are_clicked_in_the_sem_window(ui, qtbot):
     assert w.hw.field_um() == pytest.approx(ui.backend.engine.calibration.field_size_um)
     assert w.hw.field_at_1x_um() == pytest.approx(ui.backend.microscope.field_scale.k_um)
     assert w.hw.working_distance_mm() == pytest.approx(ui.backend.microscope.sem.working_distance_mm())
+    # a calibration image of the whole field: narrowed to what the ±10 V range takes (line start, flyback)
+    field = w.hw.field_um()
+    img, (pxx, pxy) = w.hw.capture_image(field, 64)
+    assert img.shape == (64, 64) and 0.6 * field < 64 * pxx < field and pxx == pytest.approx(pxy)
+    img, (pxx, _) = w.hw.capture_image(0.5 * field, 64)
+    assert 64 * pxx == pytest.approx(0.5 * field)  # fits: as asked
 
     req = MarkRequest("mark 1", (3.0, -2.0), (1003.0, 998.0), (3.0, -2.0), 10.0)
     out = {}

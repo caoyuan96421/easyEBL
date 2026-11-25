@@ -503,6 +503,43 @@ class ImagingEngine:
         """Scan field width (µm); clamped so the scan fits the deflection field."""
         return self.update(width_um=self._fit_width(self.config, width_um))
 
+    def max_scan_width(self, **changes) -> float:
+        """The widest scan (µm) with the current settings and *changes* (``nx``, ``ny``, ``rate``,
+        ``dwell_s``, ``preline_s``, ``center_um``, ``rotation_rad`` …) whose whole waveform stays
+        within the AO limit, and at most the full field.
+
+        Computed, not searched: the trajectory's extremes (:meth:`RasterPlan.extent_points` – the
+        first ramp pre-line step, ``ceil(round(preline_s·rate) / samples_per_pixel)`` pixels before
+        the first pixel, and the last pixel of the first / last rows) are ``W·q + c`` for a width
+        ``W``; µm → volts is affine (``A·p + b``), so each output component gives
+        ``|W·(A q)_j + (A c + b)_j| ≤ limit`` – a bound on ``W`` – and the smallest wins."""
+        changes = dict(changes)
+        center = np.asarray(changes.pop("center_um", self.config.center_um), float)
+        changes.pop("width_um", None)
+        h = changes.pop("height_um", None)
+        base = self.config.with_(**changes)
+        aspect = (float(h) / base.width_um) if h is not None else None  # a fixed height scales along
+        unit = base.with_(width_um=1.0, height_um=aspect, center_um=(0.0, 0.0))
+        cal = self.calibration
+        q = RasterPlan(unit, cal, limit_v=float("inf")).extent_points()  # µm per µm of width
+        t = cal.um_to_volts_transform
+        a = q @ t.linear.T
+        o = center @ t.linear.T + t.offset
+        lim = self.ao_limit_v
+        w = self.max_width_um(unit)  # the scan itself: at most the full field
+        for ai, oi in zip(a.ravel(), np.broadcast_to(o, a.shape).ravel()):
+            if abs(oi) > lim:
+                return 0.0  # the centre itself is out of range
+            if ai > 0:
+                w = min(w, (lim - oi) / ai)
+            elif ai < 0:
+                w = min(w, (-lim - oi) / ai)
+        return float(w) * (1 - 1e-9)  # a hair inside: the stream is checked with no tolerance
+
+    def fit_width(self, width_um: float, **changes) -> float:
+        """*width_um*, or :meth:`max_scan_width` if that is smaller."""
+        return min(float(width_um), self.max_scan_width(**changes))
+
     def _fit_width(self, cfg: RasterConfig, width_um: float) -> float:
         """*width_um*, or the largest width below it at which *cfg* fits the field."""
         lo, hi = 1e-6 * self.calibration.field_size_um, min(float(width_um), self.max_width_um(cfg))

@@ -176,11 +176,22 @@ class BackendHardware(LithoHardware):
         return self.bundle.sem.magnification() or getattr(self.bundle.field_scale, "magnification", None)
 
     def capture_image(self, width_um, px, frames=1):
-        """A centred photo scan of *width_um* (scan rotation 0) with the imaging engine."""
-        self.status(f"field calibration: imaging {width_um:.3g} µm")
-        f = self.engine.capture(frames=int(frames), nx=int(px), ny=int(px), width_um=float(width_um),
-                                center_um=(0.0, 0.0), rotation_rad=0.0)
-        frame = f.result(max(60.0, 4 * frames * self.engine.frame_time_s()))
+        """A centred photo scan of *width_um* (scan rotation 0) with the imaging engine – narrowed to the
+        widest that fits the ±10 V range when the scan waveform (line start, flyback) would not; the
+        returned pixel size is the one scanned."""
+        n = int(px)
+        geo = dict(nx=n, ny=n, center_um=(0.0, 0.0), rotation_rad=0.0)
+        w = float(width_um)
+        fit = float(self.engine.fit_width(w, **geo))
+        if fit < w * (1 - 1e-6):
+            self.status(f"imaging {fit:.4g} µm: {w:.4g} µm does not fit the deflection range")
+            w = fit
+        else:
+            self.status(f"imaging {w:.4g} µm at {n} px")
+        f = self.engine.capture(frames=int(frames), width_um=w, **geo)
+        c = self.engine.config
+        per_frame = self.engine.frame_time_s() * n * n / max(1, c.nx * c.ny)  # this capture's pixels
+        frame = f.result(max(60.0, 4 * frames * per_frame + 30.0))
         self.engine.stop()
         return frame.image, tuple(frame.config.pixel_size_um)
 
