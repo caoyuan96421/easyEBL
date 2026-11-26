@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import contextlib
 import time
 from typing import Callable, Sequence
 
@@ -145,8 +146,27 @@ class LithoWriter:
         total = max(1, job.stats.total_samples)
         cb = (lambda n: progress(min(1.0, n / total))) if progress else None
         t0 = time.perf_counter()
-        res = self.handle.run_stream(job.settings.rate, job.chunks(), progress=cb, timeout=timeout)
+        with self._external_scan():
+            res = self.handle.run_stream(job.settings.rate, job.chunks(), progress=cb, timeout=timeout)
         return ExposureReport(job.stats, res.aborted, res.samples_written, time.perf_counter() - t0)
+
+    @contextlib.contextmanager
+    def _external_scan(self):
+        """The SEM on external scan (the DAQ's X / Y) for the stream: claimed on this handle (the HAL
+        blanks the beam before switching) and released after it – also when it fails – unless it is
+        on already (e.g. a lease with ``external_control=True``).  Without external-control lines in
+        the DAQ configuration nothing is switched."""
+        h = self.handle
+        if not getattr(h, "has_external_control", False) or h.external_control is True:
+            yield
+            return
+        h.set_external_control(True)
+        try:
+            if h.external_control is not True:
+                raise RuntimeError("the SEM could not be switched to external scan: not exposing")
+            yield
+        finally:
+            h.release("external_control")
 
     def expose(
         self,

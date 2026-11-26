@@ -3,12 +3,10 @@ from __future__ import annotations
 
 from PySide6 import QtWidgets
 
-from ..beamcal import BeamCalConfig
 from ..coords import StageAxes
-from ..fieldcal import FieldCalConfig
 from .tabs import _spin
 
-__all__ = ["StageAxesDialog", "MoveFieldsDialog", "FieldCalDialog", "BeamCalDialog"]
+__all__ = ["StageAxesDialog", "MoveFieldsDialog", "MoveStageDialog"]
 
 
 class StageAxesDialog(QtWidgets.QDialog):
@@ -142,160 +140,118 @@ class MoveFieldsDialog(QtWidgets.QDialog):
             self.bb.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(v is not None)
 
 
+class MoveStageDialog(QtWidgets.QDialog):
+    """Move the stage to the clicked position, a marker of a chip, or a named stage position.
 
-class FieldCalDialog(QtWidgets.QDialog):
-    """Field calibration settings: where (a named stage position or coordinates) and how."""
+    Every target is ``(label, (x, y), z)`` in SCS µm, *z* the stage Z that has it in focus at the WD
+    now (None: no height there, or the WD unknown – Z is kept).  *click*: a target or None;
+    *markers*: {chip name: [targets]}; *positions*: [targets]; *chip*: the chip shown first."""
 
-    def __init__(self, config: FieldCalConfig, positions: dict, stage_position=None, last=None, parent=None):
+    def __init__(self, click=None, markers=None, positions=(), chip: str = "", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Field calibration")
-        self.stage_position = stage_position or (lambda: None)
-        intro = QtWidgets.QLabel(
-            "At a fixed stage position with a feature that has structure (a Faraday cup, a calibration sample), "
-            "images are taken at known stage shifts; their shifts give the stage → beam map: the rotation between "
-            "stage and beam (the images go through the beam calibration of the condition: run that first).  It is "
-            "valid for the magnification, beam preset and WD it was measured at.")
-        intro.setWordWrap(True)
-        self.pos = QtWidgets.QComboBox()
-        self.pos.addItem("the coordinates below", "")
-        for n in positions:
-            self.pos.addItem(n, n)
-        if config.position and self.pos.findData(config.position) < 0:
-            self.pos.addItem(f"{config.position} (unknown)", config.position)
-        self.pos.setCurrentIndex(max(0, self.pos.findData(config.position)))
-        self.x, self.y = _spin(config.x, 0, 1e6, 2), _spin(config.y, 0, 1e6, 2)
-        b_cur = QtWidgets.QPushButton("Use current stage position")
-        b_cur.clicked.connect(self._use_stage)
-        self.pattern = QtWidgets.QComboBox()
-        self.pattern.addItem("3 × 3 grid (9 images)", "grid")
-        self.pattern.addItem("cross (5 images)", "cross")
-        self.pattern.setCurrentIndex(max(0, self.pattern.findData(config.pattern)))
-        self.step = _spin(config.step_fraction * 100, 1, 45, 1, " % of the field", 5)
-        self.width = _spin(config.image_fraction * 100, 10, 100, 0, " % of the field", 5)
-        self.px = QtWidgets.QComboBox()
-        for n in (128, 256, 512, 1024):
-            self.px.addItem(f"{n} × {n}", n)
-        self.px.setCurrentIndex(max(0, self.px.findData(config.image_px)))
-        self.frames = QtWidgets.QSpinBox()
-        self.frames.setRange(1, 64)
-        self.frames.setValue(config.frames)
-        self.settle = _spin(config.settle_s, 0, 60, 2, " s", 0.1)
-        self.maxres = _spin(config.max_residual_px, 0.1, 50, 1, " px", 0.5)
-        self.denoise = _spin(config.denoise_px, 0, 20, 1, " px", 0.5)
-        self.denoise.setSpecialValueText("off")
-        self.denoise.setToolTip("Gaussian low-pass (σ) before matching: about the size of the feature's detail; "
-                                "more for noisier images")
-        self.bgfrac = _spin(config.background_fraction * 100, 0, 50, 1, " % of the image", 2.5)
-        self.bgfrac.setSpecialValueText("off")
-        self.bgfrac.setToolTip("a blur this wide (σ) is subtracted: brightness gradients and charging do not match")
-        self.whiten = _spin(config.whitening, 0, 1, 2, "", 0.1)
-        self.whiten.setToolTip("1: pure phase correlation (sharp, but noise counts as much as the feature); "
-                               "lower is more robust on noisy, low-contrast images")
-        f = QtWidgets.QFormLayout()
-        f.addRow("position", self.pos)
-        h = QtWidgets.QHBoxLayout()
-        h.addWidget(self.x)
-        h.addWidget(self.y)
-        f.addRow("X, Y", h)
-        f.addRow(b_cur)
-        f.addRow("stage shifts", self.pattern)
-        f.addRow("shift", self.step)
-        f.addRow("image width", self.width)
-        f.addRow("image", self.px)
-        f.addRow("frames averaged", self.frames)
-        f.addRow("settle after a move", self.settle)
-        f.addRow("refuse a fit worse than", self.maxres)
-        f.addRow("de-noise", self.denoise)
-        f.addRow("flatten (background)", self.bgfrac)
-        f.addRow("whitening", self.whiten)
-        self.last = QtWidgets.QLabel("last calibration: " + (last if last else "none"))
-        self.last.setWordWrap(True)
-        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
+        self.setWindowTitle("Move stage")
+        self.click = click
+        self.markers = dict(markers or {})
+        self.positions = list(positions)
+        self.group = QtWidgets.QButtonGroup(self)
+        self.b_click = QtWidgets.QRadioButton("to the clicked position")
+        self.b_marker = QtWidgets.QRadioButton("to a marker of the chip")
+        self.b_position = QtWidgets.QRadioButton("to a stage position")
+        for b in (self.b_click, self.b_marker, self.b_position):
+            self.group.addButton(b)
+        self.l_click = QtWidgets.QLabel(self._text(click) if click is not None else "(no click)")
+        self.chip = QtWidgets.QComboBox()
+        for n in self.markers:
+            self.chip.addItem(n, n)
+        self.chip.setCurrentIndex(max(0, self.chip.findData(chip)))
+        self.marker = QtWidgets.QComboBox()
+        self.position = QtWidgets.QComboBox()
+        for k, t in enumerate(self.positions):
+            self.position.addItem(self._text(t), k)
+        self.focus = QtWidgets.QCheckBox("in focus: Z for the height there at the WD now (else Z stays)")
+        self.focus.setChecked(True)
+        self.info = QtWidgets.QLabel()
+        self.info.setWordWrap(True)
+        f = QtWidgets.QGridLayout()
+        f.addWidget(self.b_click, 0, 0)
+        f.addWidget(self.l_click, 0, 1, 1, 2)
+        f.addWidget(self.b_marker, 1, 0)
+        f.addWidget(self.chip, 1, 1)
+        f.addWidget(self.marker, 1, 2)
+        f.addWidget(self.b_position, 2, 0)
+        f.addWidget(self.position, 2, 1, 1, 2)
+        f.setColumnStretch(2, 1)
+        self.b_click.setEnabled(click is not None)
+        self.b_marker.setEnabled(any(self.markers.values()))
+        self.b_position.setEnabled(bool(self.positions))
+        self.bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        self.bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Move")
+        self.bb.accepted.connect(self.accept)
+        self.bb.rejected.connect(self.reject)
         lay = QtWidgets.QVBoxLayout(self)
-        lay.addWidget(intro)
         lay.addLayout(f)
-        lay.addWidget(self.last)
-        lay.addWidget(bb)
-        self.pos.currentIndexChanged.connect(self._sync)
-        self._sync()
-        self.resize(520, 560)
+        lay.addWidget(self.focus)
+        lay.addWidget(self.info)
+        lay.addWidget(self.bb)
+        self.chip.currentIndexChanged.connect(self._fill_markers)
+        for w in (self.b_click, self.b_marker, self.b_position, self.focus):
+            w.toggled.connect(self._update)
+        self.marker.currentIndexChanged.connect(lambda *_: self._select(self.b_marker))
+        self.position.currentIndexChanged.connect(lambda *_: self._select(self.b_position))
+        self.marker.activated.connect(lambda *_: self._select(self.b_marker))  # the same item picked again
+        self.position.activated.connect(lambda *_: self._select(self.b_position))
+        self._fill_markers()
+        for b in (self.b_click, self.b_marker, self.b_position):
+            if b.isEnabled():
+                b.setChecked(True)
+                break
+        self._update()
+        self.resize(560, 220)
 
-    def _sync(self, *_):
-        on = not self.pos.currentData()
-        self.x.setEnabled(on)
-        self.y.setEnabled(on)
+    @staticmethod
+    def _text(t) -> str:
+        label, (x, y), z = t
+        return f"{label}  ({x:.2f}, {y:.2f}" + (f", Z {z:.1f}" if z is not None else ", Z kept") + ") µm"
 
-    def _use_stage(self):
-        pos = self.stage_position()
-        if pos is not None:
-            self.pos.setCurrentIndex(0)
-            self.x.setValue(pos[0])
-            self.y.setValue(pos[1])
+    def _select(self, b) -> None:
+        if b.isEnabled() and not b.isChecked():
+            b.setChecked(True)
+        self._update()
 
-    def value(self) -> FieldCalConfig:
-        return FieldCalConfig(position=self.pos.currentData() or "", x=self.x.value(), y=self.y.value(),
-                              pattern=self.pattern.currentData(), step_fraction=self.step.value() / 100.0,
-                              image_fraction=self.width.value() / 100.0, image_px=int(self.px.currentData()),
-                              frames=int(self.frames.value()), settle_s=self.settle.value(),
-                              max_residual_px=self.maxres.value(), denoise_px=self.denoise.value(),
-                              background_fraction=self.bgfrac.value() / 100.0, whitening=self.whiten.value())
+    def _fill_markers(self, *_):
+        self.marker.blockSignals(True)
+        self.marker.clear()
+        for k, t in enumerate(self.markers.get(self.chip.currentData(), [])):
+            self.marker.addItem(self._text(t), k)
+        self.marker.blockSignals(False)
+        self._update()
 
+    def target(self):
+        """The chosen ``(label, (x, y), z)`` or None."""
+        if self.b_click.isChecked():
+            return self.click
+        if self.b_marker.isChecked():
+            ts = self.markers.get(self.chip.currentData(), [])
+            k = self.marker.currentData()
+            return ts[k] if k is not None and 0 <= k < len(ts) else None
+        if self.b_position.isChecked():
+            k = self.position.currentData()
+            return self.positions[k] if k is not None else None
+        return None
 
-class BeamCalDialog(QtWidgets.QDialog):
-    """Beam calibration settings: the named stage position of the grid sample (X, Y, Z) and the image."""
+    def value(self):
+        """(x, y, z | None) stage µm, or None."""
+        t = self.target()
+        if t is None:
+            return None
+        (x, y), z = t[1], t[2]
+        return float(x), float(y), (None if z is None or not self.focus.isChecked() else float(z))
 
-    def __init__(self, config: BeamCalConfig, positions: dict, last=None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Beam calibration")
-        intro = QtWidgets.QLabel(
-            "One image of a calibration sample with a square grid (1 µm pitch) over the whole field of view, at "
-            "≤ 0.1 µm pixels (5000 × 5000 for a 500 µm field).  The fit gives the beam's X / Y scale, shear "
-            "and pincushion distortion (the grid's rotation and shift are left out).  Valid for the magnification and "
-            "WD it was measured at; run it before the field calibration.")
-        intro.setWordWrap(True)
-        self.pos = QtWidgets.QComboBox()
-        for n, p in positions.items():
-            z = p[2] if len(p) > 2 else None
-            self.pos.addItem(f"{n}  ({p[0]:.1f}, {p[1]:.1f}" + (f", Z {z:.1f})" if z is not None else ", Z not stored)"), n)
-        if config.position and self.pos.findData(config.position) < 0:
-            self.pos.addItem(f"{config.position} (unknown)", config.position)
-        if config.position:
-            self.pos.setCurrentIndex(max(0, self.pos.findData(config.position)))
-        self.px = QtWidgets.QSpinBox()
-        self.px.setRange(200, 20000)
-        self.px.setSingleStep(500)
-        self.px.setValue(int(config.pixels))
-        self.px.setSuffix(" px across")
-        self.pitch = _spin(config.pitch_um, 0.05, 100, 3, " µm", 0.1)
-        self.frames = QtWidgets.QSpinBox()
-        self.frames.setRange(1, 64)
-        self.frames.setValue(config.frames)
-        self.maxrms = _spin(config.max_rms_um * 1e3, 1, 5000, 0, " nm", 10)
-        f = QtWidgets.QFormLayout()
-        f.addRow("grid sample at", self.pos)
-        f.addRow("image", self.px)
-        f.addRow("grid pitch", self.pitch)
-        f.addRow("frames averaged", self.frames)
-        f.addRow("refuse a fit worse than", self.maxrms)
-        self.last = QtWidgets.QLabel("for the condition now: " + (last if last else "none"))
-        self.last.setWordWrap(True)
-        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.addWidget(intro)
-        if not positions:
-            w = QtWidgets.QLabel("No stage positions yet: add the grid sample's position in the Stage Positions tab.")
-            w.setStyleSheet("color:#fb4")
-            w.setWordWrap(True)
-            lay.addWidget(w)
-        lay.addLayout(f)
-        lay.addWidget(self.last)
-        lay.addWidget(bb)
-        self.resize(560, 420)
-
-    def value(self) -> BeamCalConfig:
-        return BeamCalConfig(pitch_um=self.pitch.value(), pixels=int(self.px.value()), frames=int(self.frames.value()),
-                             max_rms_um=self.maxrms.value() * 1e-3, position=self.pos.currentData() or "")
+    def _update(self, *_):
+        v = self.value()
+        self.bb.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(v is not None)
+        if v is None:
+            self.info.setText("nothing to move to")
+        else:
+            self.info.setText(f"stage → ({v[0]:.2f}, {v[1]:.2f}) µm" + (f", Z {v[2]:.1f} µm" if v[2] is not None
+                                                                         else ", Z stays"))

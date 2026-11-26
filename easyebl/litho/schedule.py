@@ -1,14 +1,22 @@
-"""The exposure schedule (no Qt): chips, and Column setting / Field calibration / Exposure steps.
+"""The exposure schedule (no Qt): chips, and Column setting / Beam calibration / Field calibration /
+Exposure steps.
 
-* **Chip** – a sample with its own chip coordinates (CCS, :mod:`easyebl.litho.coords`): a name
-  and the stage position of the CCS origin (nominal, through the stage axes).  A Global Align
-  measures where the chip really is (CCS → SCS, affine); that holds for every later Exposure on
-  the chip.
-* **Column setting** (``column``) – beam preset of the microscope module (or keep as is),
+* **Working distance** – one WD for the whole schedule (:attr:`Schedule.wd_mm`): the first Column
+  setting sets the focus to it and nothing changes the column's focus after that; every sample is
+  brought into focus with the stage's Z alone, from its height ``H = WD − Z``
+  (:mod:`easyebl.litho.height`): ``Z = 1000·WD − H``.
+* **Chip** – a sample with its own chip coordinates (CCS, :mod:`easyebl.litho.coords`): a name,
+  the stage position of the CCS origin (nominal, through the stage axes) and its height (none /
+  constant / a plane through ≥ 3 points).  A Global Align measures where the chip really is
+  (CCS → SCS, affine); that holds for every later Exposure on the chip.
+* Every schedule starts with three fixed steps (not deleted, moved or disabled):
+  **Column setting** (``column``) – beam preset of the microscope module (or keep as is),
   magnification (sets the field from the global field calibration), optional nominal beam
-  current (for the dose readout).  Every schedule starts with one; more may follow.
-* **Field calibration** (``field_correction``) – the stage → beam map at a stage position; valid
-  for the column condition (magnification, beam preset, WD) and beam calibration it was measured at.
+  current (for the dose readout), and the schedule's WD; **Beam calibration**
+  (``beam_calibration``) – the grid image at a named stage position (:mod:`easyebl.litho.beamcal`);
+  **Field calibration** (``field_correction``) – the stage → beam map at a named stage position,
+  valid for the column condition (magnification, beam preset, WD) and beam calibration it was
+  measured at.  More Column settings / calibrations may follow (e.g. another magnification).
 * **Exposure** (``exposure``) – a whole GDS file on a chip.  Its origin is the CCS origin + an
   offset (no rotation).  Each cell of the top level is one *field*: its centre (the cell's
   bounding-box centre, or its origin) is the field centre, its coordinates relative to that are
@@ -21,7 +29,8 @@
 
   An Exposure without a GDS file aligns only (one field at the Global Align markers).
 
-Saved as JSON (``format: easyebl-schedule``, version 3).  :func:`plan` walks a schedule without
+Saved as JSON (``format: easyebl-schedule``, version 4; version 3 files are read: the WD and the
+calibration steps are added).  :func:`plan` walks a schedule without
 hardware: fields, stage targets, maps and warnings per step.
 """
 from __future__ import annotations
@@ -36,17 +45,22 @@ import numpy as np
 from ..core.transforms import AffineTransform
 from ..microscope.s3000.commands import ALLOWED_MAGNIFICATIONS
 from . import dose as dosemod
+from .beamcal import BeamCalConfig
 from .coords import S3000_AXES, ChipTransform, FieldMap, StageAxes, check_field, stage_rotation
+from .fieldcal import FieldCalConfig
 from .gds import GDSDoseMapping, load_library, pattern_from_cell
 from .geometry import Dot, Pattern, Polyline, rectangle
+from .height import ChipHeight, z_for
 
-__all__ = ["Operation", "ColumnSetting", "FieldCorrection", "Exposure", "Chip", "PatternSpec", "PatternLibrary",
+__all__ = ["Operation", "ColumnSetting", "BeamCalibrationStep", "FieldCorrection", "Exposure", "Chip", "PatternSpec", "PatternLibrary",
            "FieldDef", "MarkerAssignment", "exposure_fields", "assign_markers", "ScheduleSettings", "Schedule",
            "StepPlan", "FieldPlan", "plan", "OP_TYPES", "SCHEDULE_FORMAT", "ScheduleError", "dummy_pattern",
-           "KEEP_AS_IS", "dose_readout", "MAGNIFICATIONS", "nearest_magnification", "op_from_dict", "find_beamcal"]
+           "KEEP_AS_IS", "position_problem", "dose_readout", "MAGNIFICATIONS", "nearest_magnification", "op_from_dict", "find_beamcal",
+           "FIXED_STEPS", "DEFAULT_WD_MM"]
 
 SCHEDULE_FORMAT = "easyebl-schedule"
-SCHEDULE_VERSION = 3
+SCHEDULE_VERSION = 4
+DEFAULT_WD_MM = 15.0
 KEEP_AS_IS = ""  # the column setting's preset: keep the beam as it is
 #: the magnifications the S-3000 accepts (manual section 8)
 MAGNIFICATIONS: tuple = ALLOWED_MAGNIFICATIONS
@@ -180,24 +194,34 @@ class PatternLibrary:
 # ====================================================================== chips
 @dataclass
 class Chip:
-    """A sample with its own CCS: *origin* is the nominal stage position of the CCS origin."""
+    """A sample with its own CCS: *origin* is the nominal stage position of the CCS origin;
+    *height* its H = WD − Z (:class:`~easyebl.litho.height.ChipHeight`, map points in CCS)."""
 
     name: str = "Chip 1"
     origin: tuple = (0.0, 0.0)
     note: str = ""
+    height: ChipHeight = field(default_factory=ChipHeight)
 
     def __post_init__(self):
         self.origin = _xy(self.origin)
+        if isinstance(self.height, dict):
+            self.height = ChipHeight.from_dict(self.height)
 
     def nominal(self, axes: StageAxes) -> ChipTransform:
         return ChipTransform.nominal(self.origin, axes)
 
+    def z_at(self, ccs, wd_mm: float | None) -> float | None:
+        """The stage Z that has the chip in focus at CCS *ccs* at *wd_mm* (None: Z kept)."""
+        h = self.height.at(ccs)
+        return None if h is None or wd_mm is None else z_for(wd_mm, h)
+
     def to_dict(self) -> dict:
-        return {"name": self.name, "origin": list(self.origin), "note": self.note}
+        return {"name": self.name, "origin": list(self.origin), "note": self.note, "height": self.height.to_dict()}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Chip":
-        return cls(str(d.get("name", "Chip 1")), d.get("origin", (0.0, 0.0)), str(d.get("note", "")))
+        return cls(str(d.get("name", "Chip 1")), d.get("origin", (0.0, 0.0)), str(d.get("note", "")),
+                   ChipHeight.from_dict(d.get("height")))
 
 
 # ====================================================================== operations
@@ -251,18 +275,66 @@ class ColumnSetting(Operation):
         return s + (f", {self.current_pa:g} pA" if self.current_pa else "")
 
 
+class _CalibrationStep(Operation):
+    """A step with a calibration *config* (a dataclass with ``position``, ``to_dict`` / ``from_dict``)."""
+
+    CONFIG: ClassVar[type] = object
+
+    @property
+    def position(self) -> str:
+        return self.config.position
+
+    @position.setter
+    def position(self, name: str) -> None:
+        self.config.position = str(name)
+
+    def to_dict(self, base_dir: str | None = None) -> dict:
+        d = super().to_dict(base_dir)
+        d["config"] = self.config.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict, base_dir: str | None = None) -> "Operation":
+        d = dict(d)
+        cfg = cls.CONFIG.from_dict(d.pop("config", None))
+        if d.get("position"):  # version 3: the position on the step, the rest in the litho settings
+            cfg.position = str(d["position"])
+        op = super().from_dict(d, base_dir)
+        op.config = cfg
+        return op
+
+
 @dataclass
-class FieldCorrection(Operation):
-    """Field calibration (stage → beam map) at a stage position, valid for the column condition it
-    is measured at (see :mod:`easyebl.litho.fieldcal`)."""
+class BeamCalibrationStep(_CalibrationStep):
+    """Beam calibration: one image of a calibration grid at a named stage position (in focus through
+    its height), fitted (:mod:`easyebl.litho.beamcal`); valid for the magnification and WD."""
+
+    TYPE: ClassVar[str] = "beam_calibration"
+    TITLE: ClassVar[str] = "Beam calibration"
+    CONFIG: ClassVar[type] = BeamCalConfig
+    config: BeamCalConfig = field(default_factory=BeamCalConfig)
+    reuse: bool = False  # use a stored beam calibration of the same magnification and WD (else measure)
+
+    def summary(self) -> str:
+        where = f"at {self.position!r}" if self.position else "no position"
+        return where + (", stored one if there is" if self.reuse else "")
+
+
+@dataclass
+class FieldCorrection(_CalibrationStep):
+    """Field calibration (stage → beam map) at a named stage position (in focus through its height),
+    valid for the column condition it is measured at (see :mod:`easyebl.litho.fieldcal`)."""
 
     TYPE: ClassVar[str] = "field_correction"
     TITLE: ClassVar[str] = "Field calibration"
-    position: str = ""  # a named stage position; "": the one in the field calibration settings
+    CONFIG: ClassVar[type] = FieldCalConfig
+    config: FieldCalConfig = field(default_factory=FieldCalConfig)
     notes: str = ""
+    reuse: bool = False  # keep the field calibration in force when it applies (same condition, beam calibration)
 
     def summary(self) -> str:
-        return f"at {self.position!r}" if self.position else "at the configured position"
+        where = f"at {self.position!r}" if self.position else "no position"
+        return where + (", the one in force if it applies" if self.reuse else "")
 
 
 ORDERS = ("file", "raster", "serpentine")
@@ -340,7 +412,9 @@ class Exposure(Operation):
         return super().from_dict(d, base_dir)
 
 
-OP_TYPES: dict = {c.TYPE: c for c in (ColumnSetting, FieldCorrection, Exposure)}
+OP_TYPES: dict = {c.TYPE: c for c in (ColumnSetting, BeamCalibrationStep, FieldCorrection, Exposure)}
+#: the first steps of every schedule, in this order (not deleted, moved or disabled)
+FIXED_STEPS: tuple = (ColumnSetting, BeamCalibrationStep, FieldCorrection)
 
 
 def op_from_dict(d: dict, base_dir: str | None = None) -> Operation:
@@ -497,6 +571,7 @@ class ScheduleSettings:
     serpentine: bool = False
     order: str = "as_is"
     on_out_of_field: str = "ask"  # ask (skip the field or abort) | skip | abort
+    max_z_change_um: float = 2000.0  # a stage Z move (to bring a sample into focus) larger than this fails
 
 
 @dataclass
@@ -506,11 +581,17 @@ class Schedule:
     settings: ScheduleSettings = field(default_factory=ScheduleSettings)
     vector_settings: dict = field(default_factory=dict)  # VectorScanSettings overrides
     chips: list = field(default_factory=list)  # [Chip]
+    wd_mm: float = DEFAULT_WD_MM  # the working distance of the whole schedule
     path: str = field(default="", compare=False)
 
     def __post_init__(self):
-        if not self.operations or not isinstance(self.operations[0], ColumnSetting):
-            self.operations.insert(0, ColumnSetting())
+        for k, cls in enumerate(FIXED_STEPS):
+            if len(self.operations) <= k or not isinstance(self.operations[k], cls):
+                self.operations.insert(k, cls())
+            self.operations[k].enabled = True
+        self.wd_mm = float(self.wd_mm)
+        if not 4.0 <= self.wd_mm <= 60.0:
+            raise ScheduleError(f"the working distance must be 4–60 mm (got {self.wd_mm:g})")
 
     def __len__(self) -> int:
         return len(self.operations)
@@ -525,11 +606,17 @@ class Schedule:
         self.operations.extend(ops)
         return self
 
+    @staticmethod
+    def is_fixed(i: int) -> bool:
+        """Step *i* is one of the fixed first steps (Column setting, Beam / Field calibration)."""
+        return 0 <= i < len(FIXED_STEPS)
+
     def can_delete(self, i: int) -> bool:
-        return 0 < i < len(self.operations)
+        return len(FIXED_STEPS) <= i < len(self.operations)
 
     def can_move(self, i: int, j: int) -> bool:
-        return 0 < i < len(self.operations) and 0 < j < len(self.operations)
+        n = len(FIXED_STEPS)
+        return n <= i < len(self.operations) and n <= j < len(self.operations)
 
     @property
     def exposures(self) -> list:
@@ -576,7 +663,7 @@ class Schedule:
 
     # ---------------------------------------------------------------- file
     def to_dict(self, base_dir: str | None = None) -> dict:
-        return {"format": SCHEDULE_FORMAT, "version": SCHEDULE_VERSION, "name": self.name,
+        return {"format": SCHEDULE_FORMAT, "version": SCHEDULE_VERSION, "name": self.name, "wd_mm": self.wd_mm,
                 "settings": asdict(self.settings), "vector_settings": dict(self.vector_settings),
                 "chips": [c.to_dict() for c in self.chips],
                 "operations": [o.to_dict(base_dir) for o in self.operations]}
@@ -586,13 +673,16 @@ class Schedule:
         if d.get("format") != SCHEDULE_FORMAT:
             raise ScheduleError("not an easyEBL schedule file")
         v = int(d.get("version", 1))
-        if v != SCHEDULE_VERSION:
-            raise ScheduleError(f"schedule file version {v} is not supported (this program reads version "
+        if v not in (3, SCHEDULE_VERSION):
+            raise ScheduleError(f"schedule file version {v} is not supported (this program reads versions 3 and "
                                 f"{SCHEDULE_VERSION}: chips and Exposures of whole GDS files)")
         known = {f.name for f in fields(ScheduleSettings)}
         st = ScheduleSettings(**{k: v for k, v in (d.get("settings") or {}).items() if k in known})
-        return cls([op_from_dict(o, base_dir) for o in d.get("operations", [])], d.get("name", ""), st,
-                   dict(d.get("vector_settings") or {}), [Chip.from_dict(c) for c in d.get("chips", [])])
+        ops = [op_from_dict(o, base_dir) for o in d.get("operations", [])]
+        if v == 3 and len(ops) > 1 and isinstance(ops[1], FieldCorrection):
+            ops.insert(1, BeamCalibrationStep())  # its Field calibration right after the Column setting stays the 3rd
+        return cls(ops, d.get("name", ""), st, dict(d.get("vector_settings") or {}),
+                   [Chip.from_dict(c) for c in d.get("chips", [])], float(d.get("wd_mm", DEFAULT_WD_MM)))
 
     def save(self, path: str | None = None) -> str:
         path = path or self.path
@@ -630,6 +720,7 @@ class FieldPlan:
     centre_ccs: tuple
     target: tuple  # SCS
     map: FieldMap  # FCS → XCS
+    z: float | None = None  # stage Z that has the field in focus at the schedule's WD (None: Z kept)
     local_marker: tuple | None = None
     is_global: bool = False
     fov_check: object = None
@@ -656,38 +747,57 @@ class StepPlan:
         return self.fields[0].target if self.fields else None
 
 
+def position_problem(name: str, positions: dict, what: str) -> str | None:
+    """Why the named stage position *name* cannot be used for *what* (None: it can)."""
+    if not name:
+        return f"no stage position chosen for the {what}"
+    p = positions.get(name)
+    if p is None:
+        return f"no stage position named {name!r} for the {what}"
+    if getattr(p, "h", None) is None:
+        return f"the stage position {name!r} has no height (Replace it with the current stage, in focus)"
+    return None
+
+
 def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = None, presets=None,
          library: PatternLibrary | None = None, chips: dict | None = None, calibration=None,
-         preset: str | None = None, positions: dict | None = None, fieldcal=None, beamcals=None,
-         wd_mm: float | None = None) -> list:
+         preset: str | None = None, positions: dict | None = None, beamcals=None, start: int = 0) -> list:
     """Walk *schedule* without hardware.  *chips*: {chip name: measured ChipTransform} (else the
     nominal map from the chip origin; a Global Align is assumed to measure what is known);
-    *calibration*: the field calibration, *beamcals*: the beam calibrations, *wd_mm*: the working
-    distance now; *field_at_1x_um*: the global field calibration (field = K / mag); *preset*: the
-    beam preset in force before the schedule (None: not known); *positions* / *fieldcal*: named
-    stage positions and the field calibration settings.  One :class:`StepPlan` per operation."""
+    *calibration*: the field calibration in force, *beamcals*: the stored beam calibrations;
+    *field_at_1x_um*: the global field calibration (field = K / mag); *preset*: the beam preset in
+    force before the schedule (None: not known); *positions*: {name: StagePosition}; *start*: a run
+    from that step (≥ the fixed steps: they are skipped, the calibrations in force must apply).
+    The working distance is the schedule's.  One :class:`StepPlan` per operation."""
     from .fieldcal import Condition
 
     axes = axes or S3000_AXES
     library = library or PatternLibrary()
     positions = positions or {}
     chips = {k: v.copy() for k, v in (chips or {}).items()}
+    wd = schedule.wd_mm
     field_um = float(field_at_1x_um) / schedule[0].magnification
     cur = None
     mag = None
     cal = calibration
+    beams = list(beamcals or [])
+    beam_measured: list = []  # conditions a Beam calibration step of the schedule measures
     cal_measured_cond = None  # a Field calibration step in the schedule
+    skip = start if start >= len(FIXED_STEPS) else 0
+    if skip:  # the fixed steps are not run: the column stays as it is (assumed as the schedule says)
+        mag = schedule[0].magnification
+        preset = schedule[0].preset or preset
+        cur = schedule[0].current_pa
     out = []
     for i, op in enumerate(schedule.operations):
         sp = StepPlan(i, field_um, cur)
         out.append(sp)
-        if not op.enabled:
-            if i == 0:
-                sp.warnings.append("the first Column setting is always applied")
-            else:
-                continue
+        if i < skip:
+            continue
+        if not op.enabled and not schedule.is_fixed(i):
+            continue
         try:
-            cond = Condition(mag, preset, wd_mm)
+            cond = Condition(mag, preset, wd)
             if isinstance(op, ColumnSetting):
                 preset = op.preset or preset
                 if not op.permitted:
@@ -698,25 +808,31 @@ def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = Non
                 mag = op.magnification
                 field_um = float(field_at_1x_um) / op.magnification
                 cur = op.current_pa or cur
-                cond = Condition(mag, preset, wd_mm)
-                if find_beamcal(beamcals, cond) is None:
-                    sp.warnings.append(f"no beam calibration for {cond.describe()} (Field → Run beam calibration): "
-                                       "nominal beam")
+                cond = Condition(mag, preset, wd)
+                if i > 0 and find_beamcal(beams, cond) is None and not any(c.matches(cond, False)
+                                                                           for c in beam_measured):
+                    sp.warnings.append(f"no beam calibration for {cond.describe()} (add a Beam calibration step "
+                                       "after this one): nominal beam")
+            elif isinstance(op, BeamCalibrationStep):
+                w = position_problem(op.position, positions, "beam calibration")
+                if w:
+                    sp.warnings.append(w)
+                if op.reuse and find_beamcal(beams, cond) is not None:
+                    sp.beamcal = find_beamcal(beams, cond)
+                beam_measured.append(cond)
             elif isinstance(op, FieldCorrection):
-                name = op.position or (fieldcal.position if fieldcal is not None else "")
-                if name and name not in positions:
-                    sp.warnings.append(f"no stage position named {name!r} for the field calibration")
-                elif not name:
-                    x, y = (fieldcal.x, fieldcal.y) if fieldcal is not None else (0.0, 0.0)
-                    d = (fieldcal.step_fraction if fieldcal is not None else 0.3) * field_um
-                    if min(x, y) - d < 0:
-                        sp.warnings.append("the field calibration position is not set (Field → Field calibration "
-                                           "settings…)")
-                if find_beamcal(beamcals, cond) is None:
-                    sp.warnings.append("measured without a beam calibration for this condition")
+                kept = op.reuse and cal is not None and cal.valid_for(cond, find_beamcal(beams, cond))
+                if kept:  # the one in force is kept (as long as the beam calibration stays the stored one)
+                    sp.calibrated = True
+                else:
+                    w = position_problem(op.position, positions, "field calibration")
+                    if w:
+                        sp.warnings.append(w)
+                    if find_beamcal(beams, cond) is None and not any(c.matches(cond, False) for c in beam_measured):
+                        sp.warnings.append("measured without a beam calibration for this condition")
                 cal_measured_cond = cond
             elif isinstance(op, Exposure):
-                bc = find_beamcal(beamcals, cond)
+                bc = find_beamcal(beams, cond)
                 if cal_measured_cond is not None and cal_measured_cond.matches(cond):
                     ok, b = True, (cal.stage_to_beam if cal is not None else axes.matrix)
                 else:
@@ -725,8 +841,8 @@ def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = Non
                 bmat = stage_rotation(b, axes) if b is not None else axes.matrix
                 sp.calibrated, sp.beamcal, sp.condition, sp.stage_to_beam = ok, bc, cond, bmat
                 if not ok:
-                    sp.warnings.append(f"no field calibration for {cond.describe()} (a Field calibration step, or "
-                                       "Field → Run field calibration): nominal stage ↔ beam rotation")
+                    sp.warnings.append(f"no field calibration for {cond.describe()} (a Field calibration step): "
+                                       "nominal stage ↔ beam rotation")
                 _plan_exposure(sp, op, schedule, chips, axes, bmat, bc, field_um, library, i)
         except Exception as e:  # noqa: BLE001 - reported per step
             sp.warnings.append(f"{type(e).__name__}: {e}")
@@ -742,6 +858,10 @@ def _plan_exposure(sp: StepPlan, op: Exposure, schedule: Schedule, chips: dict, 
         return
     g = chips.get(chip.name) or chip.nominal(axes)
     sp.chip = g
+    if chip.height.mode == "none":
+        sp.warnings.append(f"chip {chip.name} has no height: the stage's Z is kept (Chips → Height…)")
+    elif chip.height.problem():
+        sp.warnings.append(f"chip {chip.name}: {chip.height.problem()}")
     flds = exposure_fields(op, library)
     if not flds:
         sp.warnings.append("no fields: the GDS has no non-empty top-level cells" if op.path
@@ -757,8 +877,10 @@ def _plan_exposure(sp: StepPlan, op: Exposure, schedule: Schedule, chips: dict, 
         f = flds[k]
         tgt = g.to_scs(np.asarray(f.centre_ccs, float))
         fm = FieldMap.make(g, f.centre_ccs, tgt, bmat, beamcal=bc)
-        fp = FieldPlan(k, f.name, f.centre_ccs, (float(tgt[0]), float(tgt[1])), fm, asg.local.get(k),
-                       k == asg.global_field)
+        fp = FieldPlan(k, f.name, f.centre_ccs, (float(tgt[0]), float(tgt[1])), fm,
+                       chip.z_at(f.centre_ccs, schedule.wd_mm), asg.local.get(k), k == asg.global_field)
+        if fp.z is not None and fp.z < 0:
+            fp.warnings.append("stage Z below 0 (the stage refuses negative coordinates)")
         if tgt[0] < 0 or tgt[1] < 0:
             fp.warnings.append("stage target below 0 (the stage refuses negative coordinates)")
         if not op.alignment_only:

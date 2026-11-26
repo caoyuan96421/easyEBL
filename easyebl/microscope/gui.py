@@ -410,9 +410,39 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
                               "and a second move is refused; STOP never waits.  The stage has no homing or "
                               "collision model – watch the chamber camera when moving Z, R or T.")
         lay.addWidget(self.g_jog)
-        lay.addStretch(1)
+        lay.addWidget(self._positions_box(), 1)
         self._show_move_state()
         return w
+
+    def _positions_box(self):
+        """The Lithography window's Stage Positions (the same list, shared settings): X, Y and the
+        height H = WD − Z; a move to one sets Z for focus at the WD now."""
+        from ..litho.module.tabs import StagePositionsTab
+        from ..litho.settings import LithoSettings
+
+        g = QtWidgets.QGroupBox("Stage positions")
+        v = QtWidgets.QVBoxLayout(g)
+        v.setContentsMargins(4, 4, 4, 4)
+
+        def pos():
+            x, y = self.stage.positions.get("X"), self.stage.positions.get("Y")
+            return None if x is None or y is None else (float(x), float(y))
+
+        def z():
+            val = self.stage.positions.get("Z")
+            return None if val is None else float(val)
+
+        self.positions_tab = StagePositionsTab(LithoSettings.shared(), pos, z, self.sem.working_distance_mm)
+        self.positions_tab.table.setMinimumHeight(110)
+        self.positions_tab.gotoRequested.connect(self.goto_position)
+        v.addWidget(self.positions_tab)
+        return g
+
+    def goto_position(self, x: float, y: float, z=None):
+        targets = {"X": float(x), "Y": float(y)}
+        if z is not None:
+            targets["Z"] = float(z)
+        return self.move(targets, relative=False)
 
     # ================================================================ helpers
     def notify(self, msg: str):

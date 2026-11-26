@@ -175,3 +175,37 @@ def test_out_of_field_pattern_rejected_before_streaming(make_manager, calibratio
     with pytest.raises(OutOfFieldError):
         w.write_polygon(rectangle(40, 40, 55, 45), PARAMS)
     assert m.backend.dose.total_charge() == 0
+
+
+def test_the_writer_streams_with_the_sem_on_external_scan(make_manager, calibration):
+    """Every exposure (the Vector / GDS tools as the litho schedule) claims the SEM's external scan for
+    the stream and gives it back afterwards, also when the stream fails."""
+    m, w = setup(make_manager, calibration)
+    h = w.handle
+    assert h.has_external_control and h.external_control is not True
+    seen = []
+    real = h.run_stream
+
+    def stream(*a, **kw):
+        seen.append((h.external_control, "external_control" in h.claimed))
+        return real(*a, **kw)
+
+    h.run_stream = stream
+    rep = w.write_polygon(rectangle(-2, -2, 2, 2), PARAMS)
+    assert not rep.aborted and seen == [(True, True)]
+    assert h.external_control is not True and "external_control" not in h.claimed
+
+    def broken(*a, **kw):
+        raise RuntimeError("stream failed")
+
+    h.run_stream = broken
+    with pytest.raises(RuntimeError, match="stream failed"):
+        w.write_polygon(rectangle(-2, -2, 2, 2), PARAMS)
+    assert h.external_control is not True and "external_control" not in h.claimed
+    # the SEM on external scan already (another handle holds the switch): streamed, the switch left alone
+    other = m.get_handle("imaging")
+    other.set_external_control(True)
+    seen.clear()
+    h.run_stream = stream
+    w.write_polygon(rectangle(-2, -2, 2, 2), PARAMS)
+    assert seen == [(True, False)] and h.external_control is True and "external_control" in other.claimed

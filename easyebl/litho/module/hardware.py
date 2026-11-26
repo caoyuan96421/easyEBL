@@ -5,6 +5,8 @@
 * stage – :class:`~easyebl.microscope.stage.StageControl` (X, Y, Z; every move behind the modal wait dialog);
 * magnification – the SEM (the field follows through the global field calibration);
 * beam condition – the microscope module's beam presets (never HV, never the beam itself);
+* focus by hand – a prompt that does not block the other windows, with the SEM window scanning
+  live (before a beam calibration);
 * marks – the SEM imaging window: the scan zooms onto the predicted mark (beam shift + scan
   width, the column is not touched); each click centres the scan there, *Confirm* takes the scan
   centre (centring pick mode);
@@ -22,7 +24,51 @@ from PySide6 import QtCore, QtWidgets
 
 from ..runner import LithoHardware
 
-__all__ = ["GuiBridge", "BackendHardware"]
+__all__ = ["GuiBridge", "BackendHardware", "FocusPrompt"]
+
+
+class FocusPrompt(QtWidgets.QDialog):
+    """Not modal (the SEM and Microscope windows stay usable), on top: *Continue* / *Abort*.
+    ``answered(bool)`` once; closing it is Abort."""
+
+    answered = QtCore.Signal(bool)
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lithography: focus and stigmate")
+        self.setModal(False)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._done = False
+        lab = QtWidgets.QLabel(text)
+        lab.setWordWrap(True)
+        self.text = lab
+        self.b_continue = QtWidgets.QPushButton("Continue")
+        self.b_continue.setDefault(True)
+        self.b_abort = QtWidgets.QPushButton("Abort")
+        self.b_continue.clicked.connect(lambda: self.finish(True))
+        self.b_abort.clicked.connect(lambda: self.finish(False))
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self.b_abort)
+        row.addWidget(self.b_continue)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(lab)
+        lay.addLayout(row)
+        self.resize(440, 160)
+
+    def finish(self, ok: bool) -> None:
+        if not self._done:
+            self._done = True
+            self.answered.emit(bool(ok))
+        self.hide()
+        self.deleteLater()
+
+    def reject(self):  # Esc / closing
+        self.finish(False)
+
+    def closeEvent(self, ev):  # noqa: N802
+        self.finish(False)
+        ev.accept()
 
 
 class GuiBridge(QtCore.QObject):
@@ -82,6 +128,7 @@ class BackendHardware(LithoHardware):
         self.status = lambda text: None  # set by the window (what the run waits for)
         self.move_dialog = None  # the "Stage moving" dialog while a programmed move runs
         self.move_dialogs = 0  # how many were shown
+        self.focus_prompt = None  # the "focus and stigmate" prompt while it waits
 
     # ---------------------------------------------------------------- column
     def _autotune(self):
@@ -118,6 +165,14 @@ class BackendHardware(LithoHardware):
         except Exception:  # noqa: BLE001
             wd = None
         return None if wd is None else float(wd)
+
+    def set_working_distance(self, wd_mm):
+        """The focus to *wd_mm* through FOCUS C / F (read back: :meth:`working_distance_mm` follows)."""
+        sem = getattr(self.bundle, "sem", None) if self.bundle is not None else None
+        if sem is None or not self.bundle.connected:
+            raise RuntimeError("no microscope: the working distance cannot be set")
+        self.status(f"working distance {float(wd_mm):g} mm")
+        sem.set_working_distance(float(wd_mm)).result(30)
 
     def stage_position(self):
         st = self.stage
@@ -295,15 +350,81 @@ class BackendHardware(LithoHardware):
 
         return bool(self.bridge.call(show))
 
+    def prepare_run(self):
+        sem = getattr(self.bundle, "sem", None) if self.bundle is not None else None
+        if sem is None or not self.bundle.connected:
+            raise RuntimeError("the microscope is not connected")
+        self.status("SEM: RUN mode, Slow scan 1")
+        # only what is not so already: the SEM refuses RUN ON when running (E2, "unexecutable")
+        self._ensure(sem, "RUN", "running", True, lambda: sem.set_running(True))
+        self._ensure(sem, "SCAN", "scan", "1", lambda: sem.set_scan("1"))
+
+    @staticmethod
+    def _ensure(sem, item: str, key: str, want, send) -> None:
+        """Read *item*; send only when ``sem.state[key]`` is not *want*.  A refusal is an error only
+        when the SEM is still not so afterwards."""
+        sem.refresh((item,)).result(30)
+        if sem.state.get(key) == want:
+            return
+        try:
+            send().result(30)
+        except Exception:
+            sem.refresh((item,)).result(30)
+            if sem.state.get(key) != want:
+                raise
+
+    def ask_focus(self, text):
+        """The SEM window scans live over the full field; the prompt waits (not modal) – focus and
+        stigmate on the SEM panel or in the Microscope / SEM windows.  The scan stops afterwards."""
+        self.status("focus and stigmate by hand, then Continue")
+
+        def show(fut):
+            if self.open_sem is not None:
+                try:
+                    sem = self.open_sem()
+                    if sem is not None:
+                        self.engine.full_field()
+                        self.engine.run()
+                except Exception:  # noqa: BLE001 - the prompt still shows (the SEM's own display works too)
+                    pass
+            d = FocusPrompt(text, self.parent)
+            self.focus_prompt = d
+
+            def answered(ok):
+                self.focus_prompt = None
+                try:
+                    self.engine.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                if not fut.done():
+                    fut.set_result(bool(ok))
+
+            d.answered.connect(answered)
+            d.show()
+            d.raise_()
+
+        def cancel():
+            d = getattr(self, "focus_prompt", None)
+            if d is not None:
+                d.finish(False)
+
+        return bool(self.bridge.call(show, on_cancel=cancel))
+
     # ---------------------------------------------------------------- exposure
     def expose(self, pattern, params, transform, settings):
         from ..writer import LithoWriter
 
         self.engine.stop()
         self.engine.wait_idle(5.0)
-        self.status(f"exposing {len(pattern)} element(s)")
         w = LithoWriter(self.handle, self.engine.calibration, settings)
-        return w.expose(pattern, params, transform, progress=self.progress)
+        job = w.compile(pattern, params, transform)  # before the lease: compiling does not hold the DAQ
+        # The DAQ reserved for the exposure (the imaging engine cannot scan over the resist meanwhile)
+        # and the SEM on external scan for it (the HAL blanks the beam before switching; the previous
+        # scan source comes back when the lease ends, also on failure).  The writer refuses to stream
+        # if the SEM is not on external scan.
+        with self.handle.exclusive("lithography exposure", timeout=30.0, external_control=True):
+            self.status(f"exposing {len(pattern)} element(s)")
+            return w.expose_job(job, progress=self.progress)
 
     def abort(self):
         self.bridge.cancelled.set()

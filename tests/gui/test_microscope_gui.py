@@ -282,3 +282,36 @@ def test_auto_gun_alignment_button(qtbot, bundle, monkeypatch):
     w.b_aga.click()
     qtbot.waitUntil(lambda: "AGA ON" in sim.received, timeout=5000)
     w.close()
+
+
+def test_stage_positions_in_the_microscope_window(qtbot, bundle):
+    """The Lithography window's Stage Positions, in the Microscope window: the same list (shared settings), H =
+    WD − Z recorded from the stage and the focus now, Go to (in focus) moves X, Y and Z."""
+    from easyebl.litho.module.tabs import StagePositionsTab
+    from easyebl.litho.settings import LithoSettings
+    from easyebl.microscope.gui import MicroscopeWindow
+
+    w = MicroscopeWindow(bundle.link, bundle.sem, bundle.stage, bundle.settings, owns_link=False)
+    qtbot.addWidget(w)
+    shared = LithoSettings.shared()
+    pt = w.positions_tab
+    assert pt.settings is shared
+    litho = StagePositionsTab(shared)  # as in the Lithography window
+    qtbot.addWidget(litho)
+    wd = bundle.sem.working_distance_mm()
+    x, y, z = (bundle.stage.positions[k] for k in ("X", "Y", "Z"))
+    pt.add_current("Cup")
+    p = shared.positions()["Cup"]
+    assert (p.x, p.y) == pytest.approx((x, y)) and p.h == pytest.approx(1000.0 * wd - z)
+    assert litho.table.rowCount() == 1 and litho.table.item(0, 0).text() == "Cup"
+    assert LithoSettings.load(shared.path).positions()["Cup"] == p  # saved
+    moves = []
+    w.move = lambda targets, relative=False: moves.append((targets, relative))
+    pt.table.selectRow(0)
+    pt.b_go.click()
+    assert moves == [({"X": p.x, "Y": p.y, "Z": pytest.approx(1000.0 * wd - p.h)}, False)]
+    pt.b_go_xy.click()
+    assert moves[-1] == ({"X": p.x, "Y": p.y}, False)
+    litho.table.selectRow(0)
+    litho.delete_selected()
+    assert pt.table.rowCount() == 0

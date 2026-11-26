@@ -85,11 +85,9 @@ class Condition:
 
 @dataclass
 class FieldCalConfig:
-    """How to calibrate (stored in the litho settings)."""
+    """How to calibrate (a Field calibration step of the schedule)."""
 
-    position: str = ""  # a named stage position ("" : the x / y below)
-    x: float = 0.0
-    y: float = 0.0
+    position: str = ""  # the named stage position (its X, Y and height H)
     pattern: str = "grid"  # grid (3 × 3) | cross (5)
     step_fraction: float = 0.3  # stage shift d / field
     image_fraction: float = 0.8  # scan width / field

@@ -1,5 +1,6 @@
-"""Persistent lithography settings: named stage positions, calibration settings and the beam
-calibrations (JSON, no Qt).
+"""Persistent lithography settings: named stage positions (X, Y and height H) and the beam
+calibrations (JSON, no Qt).  How to calibrate is part of the schedule (its Beam calibration and
+Field calibration steps).
 
 Stored per user in ``%APPDATA%\\easyEBL\\litho.json`` (Windows) or
 ``~/.config/easyebl/litho.json``; ``EASYEBL_LITHO_SETTINGS`` overrides the path.  The stage axes
@@ -11,8 +12,9 @@ from dataclasses import dataclass, field
 import json
 import os
 
-from .beamcal import BeamCalConfig, BeamCalibration
-from .fieldcal import Condition, FieldCalConfig
+from .beamcal import BeamCalibration
+from .fieldcal import Condition
+from .height import z_for
 
 __all__ = ["LithoSettings", "StagePosition", "default_litho_settings_path"]
 
@@ -29,21 +31,30 @@ def default_litho_settings_path() -> str:
 
 @dataclass
 class StagePosition:
-    """A fixed object on the stage (calibration sample, Faraday cup …), SCS µm; *z* None: not recorded."""
+    """A fixed object on the stage (calibration sample, Faraday cup …): X, Y (SCS µm) and its height
+    *h* = WD − Z (µm, :mod:`easyebl.litho.height`: in focus at ``Z = 1000·WD − h``); None: not
+    recorded (a position from an older file, which stored Z)."""
 
     name: str
     x: float
     y: float
-    z: float | None = None
+    h: float | None = None
     note: str = ""
 
+    def z_at(self, wd_mm: float | None) -> float | None:
+        """The stage Z that has the position in focus at *wd_mm* (None: no height, or WD unknown)."""
+        return None if self.h is None or wd_mm is None else z_for(wd_mm, self.h)
+
     def to_dict(self) -> dict:
-        return {"name": self.name, "x": self.x, "y": self.y, "z": self.z, "note": self.note}
+        return {"name": self.name, "x": self.x, "y": self.y, "h": self.h, "note": self.note}
 
     @classmethod
     def from_dict(cls, d: dict) -> "StagePosition":
-        z = d.get("z")
-        return cls(str(d["name"]), float(d["x"]), float(d["y"]), None if z is None else float(z), str(d.get("note", "")))
+        h = d.get("h")  # an older file's "z" (a stage Z without its WD) cannot be converted
+        return cls(str(d["name"]), float(d["x"]), float(d["y"]), None if h is None else float(h), str(d.get("note", "")))
+
+
+_SHARED: dict = {}
 
 
 @dataclass
@@ -51,16 +62,24 @@ class LithoSettings:
     stage_positions: list = field(default_factory=list)  # [StagePosition]
     #: a schedule step fails when the stage reads back farther than this from its target (µm)
     stage_tolerance_um: float = 0.5
-    fieldcal: FieldCalConfig = field(default_factory=FieldCalConfig)
-    beamcal: BeamCalConfig = field(default_factory=BeamCalConfig)
     beamcals: list = field(default_factory=list)  # [BeamCalibration], one per condition (magnification, WD)
     last_dir: str = ""
     path: str = field(default="", repr=False, compare=False)
 
+    @classmethod
+    def shared(cls, path: str | None = None) -> "LithoSettings":
+        """The one instance of the settings file *path* in this process (the Lithography and the
+        Microscope windows share it, so their Stage Positions agree)."""
+        key = os.path.normcase(os.path.abspath(path or default_litho_settings_path()))
+        s = _SHARED.get(key)
+        if s is None:
+            s = _SHARED[key] = cls.load(path)
+        return s
+
     # ---------------------------------------------------------------- positions
     def positions(self) -> dict:
-        """{name: (x, y, z | None)}."""
-        return {p.name: (p.x, p.y, p.z) for p in self.stage_positions}
+        """{name: StagePosition}."""
+        return {p.name: p for p in self.stage_positions}
 
     def find(self, name: str) -> int:
         return next((i for i, p in enumerate(self.stage_positions) if p.name == name), -1)
@@ -74,12 +93,12 @@ class LithoSettings:
             k += 1
         return f"{base} {k}"
 
-    def add_position(self, name: str, x: float, y: float, z: float | None = None, note: str = "") -> StagePosition:
+    def add_position(self, name: str, x: float, y: float, h: float | None = None, note: str = "") -> StagePosition:
         if not name.strip():
             raise ValueError("a stage position needs a name")
         if self.find(name) >= 0:
             raise ValueError(f"a stage position named {name!r} exists already")
-        p = StagePosition(name.strip(), float(x), float(y), None if z is None else float(z), note)
+        p = StagePosition(name.strip(), float(x), float(y), None if h is None else float(h), note)
         self.stage_positions.append(p)
         return p
 
@@ -98,7 +117,6 @@ class LithoSettings:
     def to_dict(self) -> dict:
         return {"stage_positions": [p.to_dict() for p in self.stage_positions],
                 "stage_tolerance_um": self.stage_tolerance_um,
-                "fieldcal": self.fieldcal.to_dict(), "beamcal": self.beamcal.to_dict(),
                 "beamcals": [b.to_dict() for b in self.beamcals],
                 "last_dir": self.last_dir}
 
@@ -111,8 +129,6 @@ class LithoSettings:
                 d = json.load(fh)
             s.stage_positions = [StagePosition.from_dict(p) for p in d.get("stage_positions", [])]
             s.stage_tolerance_um = float(d.get("stage_tolerance_um", 0.5))
-            s.fieldcal = FieldCalConfig.from_dict(d.get("fieldcal"))
-            s.beamcal = BeamCalConfig.from_dict(d.get("beamcal"))
             s.beamcals = [BeamCalibration.from_dict(b, Condition.from_dict) for b in d.get("beamcals", [])]
             s.last_dir = str(d.get("last_dir", ""))
         except (OSError, ValueError, KeyError, TypeError):

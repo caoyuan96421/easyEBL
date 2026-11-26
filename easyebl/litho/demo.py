@@ -9,10 +9,12 @@ writes
   exposure pattern of every field (grating, dot array, ring, a single-pixel line, field
   label, corner marks at (±40, ±40) µm); layer 2/0: alignment crosses at (±45, ±45) µm around
   each field centre (meant to be on the sample already – not exposed);
-* ``multifield_demo.ebls.json`` – chip "Demo chip" (CCS origin at stage (5000, 5000) µm), a
-  Column setting (×1000 → 100 µm field, beam kept as is), a Field calibration (at the position set
-  in Field → Field calibration settings…) and one Exposure of the whole GDS (layer 1): Global
-  Align on two crosses of the first field, a Local marker (the upper-left cross) in every field;
+* ``multifield_demo.ebls.json`` – chip "Demo chip" (CCS origin at stage (5000, 5000) µm, no
+  height: Z kept), the fixed steps – Column setting (×1000 → 100 µm field, beam kept as is, WD
+  15 mm), Beam calibration at the stage position "Calibration grid", Field calibration at
+  "Faraday cup" (record both in the Stage Positions tab, in focus) – and one Exposure of the
+  whole GDS (layer 1): Global Align on two crosses of the first field, a Local marker (the
+  upper-left cross) in every field;
 * ``dummy_demo.ebls.json`` – the same GDS written without alignment, then an alignment-only
   Exposure (two crosses), for trying the run.
 """
@@ -21,11 +23,13 @@ from __future__ import annotations
 import os
 import sys
 
-from .schedule import Chip, ColumnSetting, Exposure, FieldCorrection, Schedule
+from .schedule import BeamCalibrationStep, Chip, ColumnSetting, Exposure, FieldCorrection, Schedule
 
-__all__ = ["make_multifield_gds", "make_demo_files", "DEMO_ORIGIN", "FIELD_PITCH"]
+__all__ = ["make_multifield_gds", "make_demo_files", "DEMO_ORIGIN", "FIELD_PITCH", "GRID_POSITION", "CUP_POSITION"]
 
 DEMO_ORIGIN = (5000.0, 5000.0)  # stage position of the CCS (layout) origin
+GRID_POSITION = "Calibration grid"  # the stage positions the calibration steps use
+CUP_POSITION = "Faraday cup"
 FIELD_PITCH = 100.0
 MARK = 45.0  # alignment crosses at (±MARK, ±MARK) around each field centre
 
@@ -85,14 +89,21 @@ def make_demo_files(folder: str) -> dict:
     os.makedirs(folder, exist_ok=True)
     gds = os.path.abspath(make_multifield_gds(os.path.join(folder, "multifield_demo.gds")))
     chip = Chip("Demo chip", DEMO_ORIGIN)
-    s = Schedule([ColumnSetting(magnification=1000), FieldCorrection(),
+
+    def fixed(**column):
+        b, f = BeamCalibrationStep(), FieldCorrection()
+        b.position, f.position = GRID_POSITION, CUP_POSITION
+        return [ColumnSetting(magnification=1000, **column), b, f]
+
+    s = Schedule(fixed() + [
                   Exposure(chip=chip.name, path=gds, layers=[(1, 0)], order="raster", dwell_us=2.0, step_nm=20.0,
                            global_align=True, global_markers=[(-MARK, -MARK), (MARK, MARK)],
                            local_align=True, local_markers=demo_local_markers(), view_um=10.0)],
+                 wd_mm=15.0,
                  name="multifield demo", chips=[chip])
     s.save(os.path.join(folder, "multifield_demo.ebls.json"))
 
-    d = Schedule([ColumnSetting(magnification=1000, current_pa=100.0), FieldCorrection(),
+    d = Schedule(fixed(current_pa=100.0) + [
                   Exposure(label="no alignment", chip=chip.name, path=gds, layers=[(1, 0)], dwell_us=0.5),
                   Exposure(label="align only", chip=chip.name, global_align=True,
                            global_markers=[(-MARK, -MARK), (MARK, MARK)])],

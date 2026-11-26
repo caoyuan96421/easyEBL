@@ -187,14 +187,18 @@ class FieldCalWindow(QtWidgets.QDialog):
         self._buttons("done")
 
     def show_result(self, res: FieldCalResult, axes: StageAxes, ask: bool = True) -> None:
-        """Show *res*; *ask*: wait for Accept / Discard (a refused result is only shown)."""
+        """Show *res*; *ask*: wait for Accept / Discard (a refused result: *Use anyway* overrides)."""
         self.result = res
         self.axes = axes
         self.bar.setValue(self.bar.maximum())
         refused = res.problem is not None
-        self.awaiting = bool(ask and not refused)
+        self.awaiting = bool(ask)
+        self.b_accept.setText("Use anyway" if refused else "Accept")
+        self.b_accept.setDefault(not refused)
+        self.b_discard.setDefault(refused)
         if refused:
-            self.step.setText(f"REFUSED: {res.problem}")
+            self.step.setText(f"REFUSED: {res.problem}" + (" – Use anyway to override, Discard to stop"
+                                                           if self.awaiting else ""))
             self.step.setStyleSheet("color:#f77")
         else:
             self.step.setText("measured: Accept to use it, Discard to drop it" if self.awaiting else "measured")
@@ -289,7 +293,8 @@ class FieldCalWindow(QtWidgets.QDialog):
         if not self.awaiting:
             return
         self.awaiting = False
-        self.step.setText("accepted: in use" if ok else "discarded")
+        over = ok and getattr(self.result, "problem", None) is not None
+        self.step.setText(("used anyway (override)" if over else "accepted: in use") if ok else "discarded")
         self.step.setStyleSheet("color:#5d5" if ok else "color:#fb4")
         self._buttons("done")
         self.decided.emit(bool(ok))

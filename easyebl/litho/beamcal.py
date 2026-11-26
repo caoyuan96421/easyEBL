@@ -183,7 +183,7 @@ class BeamCalibration:
 
 @dataclass
 class BeamCalConfig:
-    """How to calibrate (stored in the litho settings)."""
+    """How to calibrate (the Beam calibration step of the schedule)."""
 
     pitch_um: float = 1.0
     pixels: int = 5000  # image: pixels × pixels over the current full field
@@ -191,6 +191,10 @@ class BeamCalConfig:
     max_rms_um: float = 0.05  # a fit worse than this (rms) is refused
     position: str = ""  # named stage position of the calibration grid
     filter_periods: float = 3.0  # low-pass sigma, in grid periods
+    #: before the image: zoom to *focus_magnification* at the grid and wait for the user to focus and stigmate
+    #: by hand (the WD then read back becomes the run's WD); off: image at once
+    manual_focus: bool = True
+    focus_magnification: int = 10000
 
     def to_dict(self) -> dict:
         return asdict(self)
