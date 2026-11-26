@@ -117,7 +117,11 @@ Open → *SEM imaging*.  The window looks and works like a commercial SEM screen
 * **Run / Freeze** (F5): Freeze finishes the frame; press again to stop at once. **Single** (F6).
 * **Speed**: TV · Fast 1–2 · Slow 1–3 · Photo 1–3 (0.5–160 µs per pixel; F3/F4 step faster or slower). A
   speed preset also sets the pre-line, flyback and settling times; they are shown in the status bar, not
-  adjustable. **Pixels**: 320×240 to 2560×1920.
+  adjustable. **Pixels**: 320×240 to 2560×1920, or *Custom…* – any size up to 16384 × 16384 (presets
+  4096², 5000², 8000², 10000²; the dialog shows the frame time and the image memory).  The capture size
+  has *Custom…* too, for ultra-high-resolution photos.  Frames are assembled and published on a thread of
+  their own, so whole-image work (an 8000 × 8000 frame is 256 MB) never holds up the DAQ output buffer;
+  partial frames of a large scan are published less often (copying kept under 10 % of the time).
 * **Capture** (F9): photo scan at its own size, speed and integration. Saved automatically as a 16‑bit TIFF (raw volts), a PNG, a PNG with the data bar, and JSON metadata.
 * **Contrast / Brightness**, **Auto C/B** (Ctrl+A, one-shot or continuous), and running **averaging**.
 * **Field of view** group: **size** (the swept range), **position** (beam shift) and **rotation**.  The

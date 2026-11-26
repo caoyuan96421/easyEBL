@@ -301,3 +301,43 @@ def test_sem_mouse_shift_pan_zoom_digital_zoom_and_menu(qtbot, sem):
     assert w.stage_move_for(eng.config.center_um[0] + 5.0, 3.0) == pytest.approx((-5.0, 3.0))
     w.stage_mirror = (False, False)
     assert w.stage_move_for(5.0, 3.0) == pytest.approx((5.0, 3.0))
+
+
+def test_custom_ultrahigh_resolution_scan_and_capture(qtbot, sem, monkeypatch):
+    from PySide6 import QtWidgets
+
+    from easyebl.imaging.sem.panels import CustomSizeDialog
+
+    w, eng = sem, sem.engine
+
+    def fake_exec(dlg):
+        dlg.set_size(8000, 8000)
+        assert "64 Mpixel" in dlg.info.text() and "256 MB" in dlg.info.text() and "frame" in dlg.info.text()
+        return QtWidgets.QDialog.Accepted
+
+    monkeypatch.setattr(CustomSizeDialog, "exec", fake_exec)
+    res = w.scan.res
+    i = res.findData(None)
+    assert res.itemText(i) == "Custom…"
+    res.setCurrentIndex(i)
+    w.scan._res_chosen(i)
+    assert (eng.config.nx, eng.config.ny) == (8000, 8000)
+    assert res.currentText() == "8000 × 8000 (custom)"  # kept in the list
+    w.scan._res_chosen(res.findData("640x480"))
+    res.setCurrentIndex(res.findData("640x480"))
+    w.scan._res_chosen(res.currentIndex())
+    assert (eng.config.nx, eng.config.ny) == (640, 480)
+    # the capture size too
+    cres = w.capture.res
+    j = cres.findData(None)
+    cres.setCurrentIndex(j)
+    w.capture._res_chosen(j)
+    assert cres.currentData() == "8000x8000"
+    got = []
+    w.capture.captureRequested.connect(got.append)
+    w.capture.request()
+    assert got[0]["nx"] == 8000 and got[0]["ny"] == 8000
+    monkeypatch.setattr(CustomSizeDialog, "exec", lambda dlg: QtWidgets.QDialog.Rejected)
+    cres.setCurrentIndex(cres.findData(None))
+    w.capture._res_chosen(cres.currentIndex())
+    assert cres.currentData() == "8000x8000"  # cancelled: back to the previous size

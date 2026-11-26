@@ -11,7 +11,9 @@
 Threading model
 ---------------
 * **One scan thread** owns the DAQ handle.  It runs one hardware stream per
-  scanning session; all waveform generation and AI processing happen there.
+  scanning session: waveform generation, writing and reading happen there.  The AI
+  blocks go to a frame thread of the stream (assembly, publishing, capture
+  averaging), so whole-image work never holds up the output buffer.
 * **Commands** (``run``, ``freeze``, ``update`` …) may be called from any
   thread.  They validate their arguments in the caller's thread (raising
   ``ValueError`` there, without disturbing the stream), store the new desired
@@ -45,6 +47,7 @@ import concurrent.futures
 from dataclasses import dataclass, field, replace
 import itertools
 import math
+import queue
 import sys
 import threading
 import time
@@ -157,9 +160,52 @@ class EngineStatus:
         return ", ".join(parts)
 
 
+class _AsyncFeed:
+    """Hands the AI blocks of a stream to a thread of their own, so frame assembly, publishing and
+    capture averaging (whole-image work: an 8000 × 8000 frame is 256 MB) never hold up the thread
+    that keeps the DAQ's output buffer filled.  :meth:`put` copies the block (the driver reuses its
+    buffer) and returns at once; :meth:`close` waits until every block has been processed.  An error
+    on the worker is raised by the next :meth:`put` (the stream stops, as before) or by :meth:`close`."""
+
+    def __init__(self, fn, name: str = "easyebl-frames"):
+        self._fn = fn
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._error: BaseException | None = None
+        self.backlog = 0  # samples queued, not yet processed
+        self.backlog_max = 0
+        self._t = threading.Thread(target=self._loop, name=name, daemon=True)
+        self._t.start()
+
+    def put(self, block) -> None:
+        if self._error is not None:
+            raise self._error
+        b = np.array(block, copy=True)
+        self.backlog += b.shape[1]
+        self.backlog_max = max(self.backlog_max, self.backlog)
+        self._q.put(b)
+
+    def _loop(self) -> None:
+        while True:
+            b = self._q.get()
+            if b is None:
+                return
+            if self._error is None:
+                try:
+                    self._fn(b)
+                except BaseException as e:  # noqa: BLE001 - handed to the stream thread
+                    self._error = e
+            self.backlog -= b.shape[1]
+
+    def close(self, timeout: float | None = None, raise_error: bool = True) -> None:
+        self._q.put(None)
+        self._t.join(timeout)
+        if raise_error and self._error is not None:
+            raise self._error
+
+
 @dataclass
 class _Run:
-    """Per-stream bookkeeping (touched only by the scan thread)."""
+    """Per-stream bookkeeping (the scan thread and the stream's frame thread)."""
 
     rate: float
     acc: ImageAccumulator
@@ -170,6 +216,7 @@ class _Run:
     scan_row: int | None = None
     frames_completed: int = 0
     t_pub: float = 0.0
+    pub_cost_s: float = 0.0  # time the last partial-frame publish took (sets the next interval)
     last_hw_end: float | None = None
     fps_hw: float = 0.0
     pub_times: list = field(default_factory=list)
@@ -974,18 +1021,25 @@ class ImagingEngine:
         with self._lock:
             self._run, self._monitor = run, mon
         self._streams += 1
+        feed = _AsyncFeed(asm.feed)  # frames are assembled off the thread that feeds the DAQ
+        failed = True
         try:
             self.handle.run_stream(
                 rate,
                 prog.chunks(),
                 ai_channels=chans,
-                on_ai=asm.feed,
+                on_ai=feed.put,
                 timeout=opts.device_timeout_s,
                 latency_s=latency,
                 monitor=mon,
                 ai_range_v=opts.ai_range_v,
+                # every block processed (a capture's last frame included) before another handle,
+                # e.g. an EDS lease, can take the device
+                before_release=lambda: feed.close(raise_error=False),
             )
+            failed = False
         finally:
+            feed.close(raise_error=not failed)
             if asm.t_first_sample is not None and t_cmd is not None:
                 self._start_latency = asm.t_first_sample - t_cmd
         reason = prog.end_reason
@@ -1007,7 +1061,7 @@ class ImagingEngine:
             return old
         return ImageAccumulator(chans)
 
-    # ---- assembler callbacks (scan thread)
+    # ---- assembler callbacks (the stream's frame thread, :class:`_AsyncFeed`)
     def _on_line(self, rec: FrameRecord, j: int, row: int, vals: np.ndarray) -> None:
         run = self._run
         cfg = rec.source.cfg
@@ -1039,9 +1093,12 @@ class ImagingEngine:
                 ca.add_row(row, vals)
         run.rows_done = j + 1
         run.scan_row = row
-        if now - run.t_pub >= 1.0 / self._opts.publish_hz:
-            run.t_pub = now
+        # partial frames: at most publish_hz, and no more often than keeps the copying under 10 % of
+        # the time (an 8000 × 8000 image takes ≈ 0.13 s to copy)
+        if now - run.t_pub >= max(1.0 / self._opts.publish_hz, 10.0 * run.pub_cost_s):
             self._publish(run, rec, complete=False)
+            run.t_pub = time.perf_counter()
+            run.pub_cost_s = run.t_pub - now
 
     def _capture_acc(self, run: _Run, rec: FrameRecord):
         if rec.capture_id in run.captures:
@@ -1102,8 +1159,9 @@ class ImagingEngine:
         """Pixels pinned at the AI range limit mean clipped video – usually wiring or range."""
         rng = self._opts.ai_range_v or self.daq_config.ai_range_v
         img = f.image
+        k = max(1, int(math.sqrt(img.size / 1e6)))  # at most ≈ 1 M pixels: a fraction does not need all
         with np.errstate(invalid="ignore"):
-            frac = float(np.mean(np.abs(img) >= 0.98 * rng))
+            frac = float(np.mean(np.abs(img[::k, ::k]) >= 0.98 * rng))
         run.saturation = frac
         if frac > SATURATION_WARN and not run.sat_warned:
             run.sat_warned = True

@@ -373,3 +373,45 @@ def test_capture_future_is_a_real_future(make_engine):
     fut = eng.capture(frames=1)
     assert isinstance(fut, concurrent.futures.Future)
     assert fut.result(timeout=20).kind == "capture"
+
+
+def test_frame_processing_never_blocks_the_stream_thread():
+    """AI blocks are handed to the stream's frame thread: slow whole-image work there does not hold up
+    the caller (the thread that feeds the DAQ); close() waits for it; its errors come back."""
+    from easyebl.imaging.engine.core import _AsyncFeed
+
+    done = []
+
+    def slow(block):
+        time.sleep(0.05)
+        done.append(block.shape)
+
+    feed = _AsyncFeed(slow)
+    buf = np.zeros((1, 1000))
+    t0 = time.perf_counter()
+    for _ in range(10):
+        feed.put(buf)
+        buf[:] = 7.0  # the driver reuses its buffer: the queued copy must not change
+    assert time.perf_counter() - t0 < 0.05 and len(done) < 10
+    feed.close()
+    assert len(done) == 10 and feed.backlog == 0 and feed.backlog_max >= 1000
+
+    def bad(block):
+        raise ValueError("boom")
+
+    feed = _AsyncFeed(bad)
+    feed.put(buf)
+    time.sleep(0.05)
+    with pytest.raises(ValueError):
+        feed.put(buf)
+    with pytest.raises(ValueError):
+        feed.close()
+
+
+def test_partial_frames_are_published_less_often_when_large(make_engine, quiet_params):
+    eng, _ = make_engine(quiet_params)
+    eng.update(nx=256, ny=256, dwell_s=2e-6)
+    eng.run()
+    eng.wait_frame(complete=True, timeout=20)
+    run = eng._run
+    assert run.pub_cost_s > 0  # measured: the next partial publish waits ≥ 10 × this

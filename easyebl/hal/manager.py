@@ -810,6 +810,7 @@ class DAQManager:
         latency_s: float | None = None,
         monitor=None,
         ai_range_v: float | None = None,
+        before_release: Callable[[], None] | None = None,
     ) -> StreamResult:
         self._validate_stream(rate, ai_channels)
         if latency_s is not None and not (np.isfinite(latency_s) and latency_s > 0):
@@ -876,6 +877,11 @@ class DAQManager:
                               else _unknown_beam())
                 self._active = None
                 self._active_abort = None
+            if before_release is not None:  # still holding the device: e.g. finish processing its data
+                try:
+                    before_release()
+                except Exception:  # noqa: BLE001 - the caller's to report; the device must be released
+                    pass
             self._op_lock.release()
             if lost is not None:
                 self._mark_lost(lost)
@@ -1061,6 +1067,7 @@ class DAQHandle:
         latency_s: float | None = None,
         monitor=None,
         ai_range_v: float | None = None,
+        before_release: Callable[[], None] | None = None,
     ) -> StreamResult:
         """Run a hardware-timed stream.
 
@@ -1070,11 +1077,14 @@ class DAQHandle:
         the beam); None = the configured, conservative default.  ``monitor``:
         a :class:`~easyebl.hal.backend.StreamMonitor` updated while streaming.
         ``ai_range_v``: AI input range for this stream (None = configured).
+        ``before_release()``: called when the stream has ended, while the device is still held (e.g.
+        to finish processing the data before a waiting lease takes the device).
         Raises :class:`DeviceLostError` if the device is (or goes) away.
         """
         self._check()
         return self._mgr._run(
-            self, rate, chunks, ai_channels, on_ai, progress, timeout, latency_s, monitor, ai_range_v
+            self, rate, chunks, ai_channels, on_ai, progress, timeout, latency_s, monitor, ai_range_v,
+            before_release,
         )
 
     def abort(self) -> bool:

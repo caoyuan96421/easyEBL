@@ -6,7 +6,7 @@ from typing import Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..engine import RESOLUTIONS, SCAN_SPEEDS, EngineState, ImagingEngine, speed_of
+from ..engine import RESOLUTIONS, SCAN_SPEEDS, EngineState, ImagingEngine, speed_by_name, speed_of
 from ...microscope.control import MicroscopeControl, NotAvailable
 from .display import ContrastBrightness
 
@@ -46,6 +46,90 @@ def _dspin(lo, hi, dec, suffix, step):
     s.setSingleStep(step)
     s.setKeyboardTracking(False)
     return s
+
+
+# ======================================================================= custom size
+#: the largest custom scan (pixels per side)
+MAX_CUSTOM_PX = 16384
+
+
+class CustomSizeDialog(QtWidgets.QDialog):
+    """A scan size of its own (e.g. an ultra-high-resolution capture): width × height in pixels,
+    with the frame time at a scan speed and the memory the image takes."""
+
+    def __init__(self, nx: int, ny: int, frame_time=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom size")
+        self.frame_time = frame_time  # (nx, ny) -> s, or None
+        self.w = QtWidgets.QSpinBox()
+        self.h = QtWidgets.QSpinBox()
+        for b, v in ((self.w, nx), (self.h, ny)):
+            b.setRange(16, MAX_CUSTOM_PX)
+            b.setSingleStep(256)
+            b.setValue(int(v))
+            b.setSuffix(" px")
+            b.setKeyboardTracking(False)
+        self.square = QtWidgets.QCheckBox("square")
+        self.square.setChecked(nx == ny)
+        self.w.valueChanged.connect(self._w_changed)
+        self.h.valueChanged.connect(self._update)
+        self.square.toggled.connect(self._w_changed)
+        presets = QtWidgets.QHBoxLayout()
+        for n in (4096, 5000, 8000, 10000):
+            b = QtWidgets.QPushButton(f"{n}²")
+            b.clicked.connect(lambda _=False, n=n: self.set_size(n, n))
+            presets.addWidget(b)
+        self.info = QtWidgets.QLabel()
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet("color:#9aa")
+        f = QtWidgets.QFormLayout(self)
+        f.addRow("width", self.w)
+        f.addRow("height", self.h)
+        f.addRow("", self.square)
+        f.addRow("presets", presets)
+        f.addRow(self.info)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        f.addRow(bb)
+        self._update()
+
+    def set_size(self, nx: int, ny: int) -> None:
+        self.square.setChecked(nx == ny)
+        self.w.setValue(int(nx))
+        self.h.setValue(int(ny))
+        self._update()
+
+    def _w_changed(self, *_):
+        if self.square.isChecked() and self.h.value() != self.w.value():
+            self.h.setValue(self.w.value())
+        self._update()
+
+    def value(self) -> tuple:
+        return (int(self.w.value()), int(self.h.value()))
+
+    def _update(self, *_):
+        nx, ny = self.value()
+        mb = nx * ny * 4 / 1e6
+        txt = f"{nx * ny / 1e6:.3g} Mpixel · image {mb:.0f} MB"
+        if self.frame_time is not None:
+            try:
+                t = float(self.frame_time(nx, ny))
+                txt += f" · frame ≈ {t:.3g} s" if t < 120 else f" · frame ≈ {t / 60:.3g} min"
+            except Exception:  # noqa: BLE001
+                pass
+        self.info.setText(txt)
+
+
+def _custom_item(combo: QtWidgets.QComboBox, nx: int, ny: int) -> int:
+    """Select (adding it if needed) the custom size *nx* × *ny* in a size combo (before 'Custom…')."""
+    key = f"{nx}x{ny}"
+    i = combo.findData(key)
+    if i < 0:
+        i = combo.count() - 1  # before the 'Custom…' entry
+        combo.insertItem(i, f"{nx} × {ny} (custom)", key)
+    combo.setCurrentIndex(i)
+    return i
 
 
 # ======================================================================= scan
@@ -92,7 +176,8 @@ class ScanPanel(QtWidgets.QGroupBox):
         self.res = QtWidgets.QComboBox()
         for w, h in RESOLUTIONS:
             self.res.addItem(f"{w} × {h}", f"{w}x{h}")
-        self.res.addItem("Custom", None)
+        self.res.addItem("Custom…", None)
+        self.res.setToolTip("scan pixels; Custom… for any size up to 16384 × 16384 (ultra-high resolution)")
         self.res.activated.connect(self._res_chosen)
         lay.addWidget(self.res, 2, 1, 1, 2)
 
@@ -126,16 +211,32 @@ class ScanPanel(QtWidgets.QGroupBox):
 
     def _res_chosen(self, i):
         d = self.res.itemData(i)
-        if d is not None:
+        if d is None:  # Custom…: any size
+            c = self.engine.config
+            dlg = CustomSizeDialog(c.nx, c.ny, self._frame_time, self)
+            self._custom_dialog = dlg
+            if dlg.exec() != QtWidgets.QDialog.Accepted:
+                self.sync()
+                return
+            nx, ny = dlg.value()
+            self._do(self.engine.set_resolution, nx, ny)
+        else:
             self._do(self.engine.set_resolution, *(int(v) for v in d.split("x")))
         self.sync()
+
+    def _frame_time(self, nx: int, ny: int) -> float:
+        c = self.engine.config
+        return ny * (nx * c.actual_dwell_s + c.preline_s + c.flyback_s) + c.frame_settle_s
 
     def sync(self):
         cfg = self.engine.config
         i = _speed_index(cfg)
         self.speed.setCurrentIndex(i if i >= 0 else self.speed.count() - 1)
         j = self.res.findData(f"{cfg.nx}x{cfg.ny}")
-        self.res.setCurrentIndex(j if j >= 0 else self.res.count() - 1)
+        if j >= 0:
+            self.res.setCurrentIndex(j)
+        else:
+            _custom_item(self.res, cfg.nx, cfg.ny)
         try:
             ft = self.engine.frame_time_s()
         except Exception:  # noqa: BLE001
@@ -170,7 +271,11 @@ class CapturePanel(QtWidgets.QGroupBox):
         self.res = QtWidgets.QComboBox()
         for w, h in RESOLUTIONS:
             self.res.addItem(f"{w} × {h}", f"{w}x{h}")
+        self.res.addItem("Custom…", None)
+        self.res.setToolTip("capture pixels; Custom… for any size up to 16384 × 16384 (ultra-high resolution)")
         self.res.setCurrentIndex(2)  # 1280 × 960
+        self._last_res = 2
+        self.res.activated.connect(self._res_chosen)
         lay.addWidget(self.res, 0, 1, 1, 2)
         lay.addWidget(QtWidgets.QLabel("Speed"), 1, 0)
         self.speed = QtWidgets.QComboBox()
@@ -198,6 +303,23 @@ class CapturePanel(QtWidgets.QGroupBox):
         self.progress.setMaximumHeight(8)
         self.progress.setVisible(False)
         lay.addWidget(self.progress, 4, 0, 1, 3)
+
+    def _res_chosen(self, i):
+        if self.res.itemData(i) is not None:
+            self._last_res = i
+            return
+        w, h = (int(v) for v in self.res.itemData(self._last_res).split("x"))
+        dlg = CustomSizeDialog(w, h, self._frame_time, self)
+        self._custom_dialog = dlg
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            self.res.setCurrentIndex(self._last_res)
+            return
+        self._last_res = _custom_item(self.res, *dlg.value())
+
+    def _frame_time(self, nx: int, ny: int) -> float:
+        sp = speed_by_name(self.speed.currentData())
+        f = sp.fields()
+        return ny * (nx * f["dwell_s"] + f.get("preline_s", 0.0) + f.get("flyback_s", 0.0))
 
     def request(self):
         w, h = (int(v) for v in self.res.currentData().split("x"))
