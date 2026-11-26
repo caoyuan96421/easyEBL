@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import functools
+import math
 import threading
 import time
 from typing import Callable, Iterable, Sequence
@@ -211,6 +212,9 @@ class SimParams:
     # the sample repeats with that period, so it is there at any stage position
     stage_offset: Callable | None = None
     sample_period_um: float = 0.0
+    # the beam's blur on the sample: ``beam_blur()`` → (σ_a, σ_b µm, angle rad) of an elliptical
+    # Gaussian (defocus / astigmatism, e.g. from the simulated SEM's focus and stigmator; None: sharp)
+    beam_blur: Callable | None = None
 
 
 # --------------------------------------------------------------------- backend
@@ -438,6 +442,46 @@ class SimulatedBackend(DAQBackend):
         lim = self.config.ai_range_v if ai_range_v is None else ai_range_v
         return np.clip(out, -lim, lim)
 
+    def _blurred_sample(self):
+        """The sample seen through the beam's blur (``params.beam_blur``): an elliptical Gaussian
+        applied in Fourier space to an :class:`ImageSample` (periodic, like the repeated demo
+        sample), cached per blur (rounded to 2 % / 0.01 µm)."""
+        p = self.params
+        if p.beam_blur is None or not isinstance(self.sample, ImageSample):
+            return self.sample
+        try:
+            sa, sb, ang = (float(v) for v in p.beam_blur())
+        except Exception:  # noqa: BLE001 - a broken coupling must not stop the stream
+            return self.sample
+
+        def q(v):
+            v = abs(v)
+            return 0.0 if v < 0.01 else round(math.log(v) / 0.02) * 0.02
+
+        key = (q(sa), q(sb), round(ang % math.pi, 2))
+        cache = self.__dict__.setdefault("_blur_cache", {})
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        img = self.sample.image
+        x0, x1, y0, y1 = self.sample.extent
+        ny, nx = img.shape
+        spec = self.__dict__.get("_blur_spec")
+        if spec is None or spec[0] is not img:
+            spec = (img, np.fft.rfft2(img))
+            self._blur_spec = spec
+        fy = np.fft.fftfreq(ny, d=(y1 - y0) / ny)[:, None]  # cycles / µm (rows run downwards: sign irrelevant)
+        fx = np.fft.rfftfreq(nx, d=(x1 - x0) / nx)[None, :]
+        ca, sn = math.cos(ang), math.sin(ang)
+        u = fx * ca + fy * sn
+        v = -fx * sn + fy * ca
+        g = np.exp(-2.0 * math.pi ** 2 * ((sa * u) ** 2 + (sb * v) ** 2))
+        out = ImageSample(np.fft.irfft2(spec[1] * g, s=img.shape), self.sample.extent, self.sample.background)
+        if len(cache) > 16:
+            cache.clear()
+        cache[key] = out
+        return out
+
     def _sample_at(self, x, y):
         """Sample intensity under beam positions (µm), with the stage offset / periodic sample."""
         p = self.params
@@ -451,7 +495,7 @@ class SimulatedBackend(DAQBackend):
             h = p.sample_period_um / 2.0
             x = (x + h) % p.sample_period_um - h
             y = (y + h) % p.sample_period_um - h
-        return self.sample.intensity(x, y)
+        return self._blurred_sample().intensity(x, y)
 
     def _float_offset(self, n: int, rate: float) -> np.ndarray:
         """Offset of a floating AI− (DIFF mode only); zero when wired correctly."""

@@ -116,6 +116,15 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.image = ImagePanel(engine, self.cb, self.notify)
         self.fov = FieldOfViewPanel(engine, self.notify)
         self.column = ColumnPanel(self.mic, self.notify)
+        # auto focus / stigmation: the backend's (shared with lithography), else one of our own
+        self.autotune = getattr(microscope_bundle, "autotune", None)
+        self._own_autotune = False
+        if self.autotune is None and all(hasattr(self.mic, a) for a in ("set_focus", "set_stigmator", "state")):
+            from ..autotune import AutoTuner
+
+            self.autotune = AutoTuner(engine, self.mic)
+            self._own_autotune = True
+        self.column.set_autotune(self.autotune)
         side = QtWidgets.QWidget()
         sl = QtWidgets.QVBoxLayout(side)
         sl.setContentsMargins(4, 4, 4, 4)
@@ -630,7 +639,7 @@ class SEMWindow(QtWidgets.QMainWindow):
     def open_advanced(self):
         if self._adv is None:
             self._adv = AdvancedDialog(self.engine, self.save_settings, self, field_scale=self.field_scale,
-                                       measured=self.measured_line_um)
+                                       measured=self.measured_line_um, autotune=self.autotune)
             self._adv.applied.connect(self._after_advanced)
             self._adv.calibrated.connect(self._calibrated)
         self._adv.load()
@@ -644,8 +653,24 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.image.sync()
 
     # ------------------------------------------------------------------ close
+    # ------------------------------------------------------------- auto focus / stigmation
+    def auto_focus(self, mode: str = "auto"):
+        """Our auto focus (``"auto"``, ``"fine"``, ``"coarse"``) with progress in the Column panel;
+        returns a future of :class:`~easyebl.imaging.autotune.AutoTuneResult` (None if not started)."""
+        return self.column.start_tune(mode)
+
+    def auto_stigmate(self):
+        return self.column.start_tune("stig")
+
+    def focus_and_stigmate(self):
+        return self.column.start_tune("both")
+
     def closeEvent(self, ev):  # noqa: N802
         self.cancel_pick()
+        tuner = self.autotune
+        self.column.set_autotune(None)
+        if tuner is not None and self._own_autotune:
+            tuner.close()
         if self._own_scale:
             self.field_scale.close()
         self.timer.stop()

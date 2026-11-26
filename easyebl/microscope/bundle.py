@@ -23,6 +23,9 @@ class MicroscopeBundle:
         self.settings = settings or MicroscopeSettings()
         #: the global field calibration (field = K / magnification), see :meth:`tie_field`
         self.field_scale = None
+        #: auto focus / stigmation (:class:`~easyebl.imaging.autotune.AutoTuner`), set by the backend
+        #: when it has both the imaging engine and the microscope
+        self.autotune = None
         #: ``opener()`` shows the microscope window (set by the easyEBL app, which manages the windows)
         self.opener = None
         self._window = None
@@ -74,6 +77,8 @@ class MicroscopeBundle:
         return w
 
     def close(self) -> None:
+        if self.autotune is not None:
+            self.autotune.close()
         if self.field_scale is not None:
             self.field_scale.close()
         if self._window is not None:

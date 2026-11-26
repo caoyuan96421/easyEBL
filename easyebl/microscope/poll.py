@@ -23,6 +23,7 @@ Settings and moves (higher link priorities) wait at most for the read in progres
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import threading
 import time
 from dataclasses import dataclass, field
@@ -73,6 +74,7 @@ class Poller:
         self._tasks: list[PollTask] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._held = 0  # > 0: no reads are started (see held())
         self.reads = 0
         self._thread = threading.Thread(target=self._loop, name="easyebl-microscope-poll", daemon=True)
         self._thread.start()
@@ -85,6 +87,21 @@ class Poller:
         with self._lock:
             self._tasks = [x for x in self._tasks if x.name != name] + [t]
         return t
+
+    @contextlib.contextmanager
+    def held(self):
+        """No background reads are started while held (nests); a read in progress finishes."""
+        with self._lock:
+            self._held += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._held -= 1
+
+    @property
+    def is_held(self) -> bool:
+        return self._held > 0
 
     def remove(self, owner) -> None:
         with self._lock:
@@ -120,9 +137,9 @@ class Poller:
     def _loop(self) -> None:
         while not self._stop.is_set():
             # nothing is queued behind an exclusive job (a stage move): its result could wait for minutes
-            t = self._next() if self.link.connected and not self.link.exclusive else None
+            t = self._next() if self.link.connected and not self.link.exclusive and not self._held else None
             if t is None:
-                self._stop.wait(0.25)
+                self._stop.wait(0.05 if self._held else 0.25)
                 continue
             box = {}
 

@@ -208,14 +208,6 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         f.addWidget(self.focus_c, 1, 1)
         f.addWidget(QtWidgets.QLabel("Focus fine"), 2, 0)
         f.addWidget(self.focus_f, 2, 1)
-        r = QtWidgets.QHBoxLayout()
-        for text, coarse in (("Auto focus (coarse)", True), ("Auto focus (fine)", False)):
-            b = QtWidgets.QPushButton(text)
-            b.clicked.connect(lambda _=False, c=coarse: self._confirmed(
-                "Run the SEM's automatic focus? It takes the port for up to a few minutes.",
-                lambda: sem.auto_focus(coarse=c), "auto focus"))
-            r.addWidget(b)
-        f.addLayout(r, 3, 0, 1, 2)
         lay.addWidget(g)
 
         # --- stigmator
@@ -229,10 +221,6 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         f.addWidget(self.stig_x, 0, 1)
         f.addWidget(QtWidgets.QLabel("Y"), 1, 0)
         f.addWidget(self.stig_y, 1, 1)
-        b = QtWidgets.QPushButton("Auto stigma")
-        b.clicked.connect(lambda: self._confirmed("Run the SEM's automatic stigmation?", sem.auto_stigma,
-                                                  "auto stigma"))
-        f.addWidget(b, 2, 0, 1, 2)
         lay.addWidget(g)
 
         # --- beam current (condenser)
@@ -316,9 +304,10 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
         st = self.stage
+        lay.setSpacing(4)
         self.b_stop = QtWidgets.QPushButton("STOP ALL AXES")
-        self.b_stop.setMinimumHeight(48)
-        self.b_stop.setStyleSheet("QPushButton{background:#c62828;color:white;font-size:18px;font-weight:bold}"
+        self.b_stop.setMinimumHeight(32)
+        self.b_stop.setStyleSheet("QPushButton{background:#c62828;color:white;font-size:15px;font-weight:bold}"
                                   "QPushButton:pressed{background:#8e0000}")
         self.b_stop.setToolTip("S0 to every axis at once – also while a SEM command holds the port (Esc)")
         self.b_stop.clicked.connect(self.stop_all)
@@ -327,7 +316,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
         # --- who has the stage: the SEM PC, except during an easyEBL move (#STAGE ON … #STAGE OFF)
         self.l_move = QtWidgets.QLabel()
-        self.l_move.setMinimumHeight(32)
+        self.l_move.setMinimumHeight(20)
         self.l_move.setAlignment(QtCore.Qt.AlignCenter)
         self.l_move.setToolTip("Between moves the SEM PC has the stage (#STAGE OFF: its trackball works and it\n"
                                "decides about motor power).  A move switches #STAGE ON, moves, waits until every\n"
@@ -335,22 +324,24 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         lay.addWidget(self.l_move)
 
         # --- DRO
-        g = QtWidgets.QGroupBox("Position  (double-click an axis to move it)")
+        g = QtWidgets.QGroupBox("Position")
+        g.setToolTip("double-click an axis to move it")
         grid = QtWidgets.QGridLayout(g)
+        grid.setContentsMargins(6, 4, 6, 4)
+        grid.setVerticalSpacing(2)
         self.dro, self.dro_state = {}, {}
         for i, a in enumerate(AXES):
-            big = a != "T"
             name = QtWidgets.QLabel(a)
-            name.setStyleSheet(f"font-size:{30 if big else 16}px;font-weight:bold;color:#9cf")
+            name.setStyleSheet("font-size:15px;font-weight:bold;color:#9cf")
             val = DROLabel("—")
             val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            val.setFont(QtGui.QFont("Consolas", 30 if big else 15, QtGui.QFont.Bold))
-            val.setStyleSheet("background:#111;color:#7f7;border:1px solid #333;padding:2px 8px")
-            val.setMinimumWidth(300 if big else 200)
+            val.setFont(QtGui.QFont("Consolas", 14, QtGui.QFont.Bold))
+            val.setStyleSheet("background:#111;color:#7f7;border:1px solid #333;padding:0px 6px")
+            val.setMinimumWidth(140)
             val.setToolTip(f"double-click: move {a}")
             val.double_clicked.connect(lambda a=a: self.open_move_dialog(a))
             state = QtWidgets.QLabel("—")
-            state.setStyleSheet("color:#bbb")
+            state.setStyleSheet("color:#bbb;font-size:11px")
             grid.addWidget(name, i, 0)
             grid.addWidget(val, i, 1)
             grid.addWidget(QtWidgets.QLabel(st.unit(a)), i, 2)
@@ -377,6 +368,8 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         # --- jog
         self.g_jog = QtWidgets.QGroupBox("Jog")
         f = QtWidgets.QGridLayout(self.g_jog)
+        f.setContentsMargins(6, 4, 6, 4)
+        f.setSpacing(3)
         self.jog_um = _dspin(0.1, 10000, 1, self.settings.jog_step_um, 10, " µm")
         self.jog_deg = _dspin(0.01, 90, 2, self.settings.jog_step_deg, 0.5, " °")
         self.jog_um.valueChanged.connect(lambda v_: setattr(self.settings, "jog_step_um", v_))
@@ -388,8 +381,8 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
         def jb(text, axis, sign, tip):
             b = QtWidgets.QToolButton(text=text)
-            b.setFixedSize(48, 40)
-            b.setStyleSheet("font-size:16px")
+            b.setFixedSize(32, 26)
+            b.setStyleSheet("font-size:12px")
             b.setToolTip(tip)
             b.clicked.connect(lambda _=False: self.jog(axis, sign))
             return b
@@ -404,18 +397,19 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         f.addWidget(jb("R⟳", "R", +1, "rotate + (degree step)"), 0, 6)
         f.addWidget(jb("T−", "T", -1, "tilt − (degree step)"), 2, 5)
         f.addWidget(jb("T+", "T", +1, "tilt + (degree step)"), 2, 6)
-        f.addWidget(QtWidgets.QLabel("Step"), 3, 0)
-        f.addWidget(self.jog_um, 3, 1, 1, 3)
-        f.addWidget(self.jog_deg, 3, 4, 1, 3)
-        f.addWidget(QtWidgets.QLabel("X/Y approach"), 4, 0)
-        f.addWidget(self.backlash, 4, 1, 1, 3)
+        f.setColumnMinimumWidth(3, 10)
+        steps = QtWidgets.QFormLayout()
+        steps.setContentsMargins(0, 0, 0, 0)
+        steps.setVerticalSpacing(2)
+        steps.addRow("Step", self.jog_um)
+        steps.addRow("Step °", self.jog_deg)
+        steps.addRow("X/Y approach", self.backlash)
+        f.addLayout(steps, 0, 7, 3, 1)
+        f.setColumnStretch(8, 1)
+        self.g_jog.setToolTip("During a move the port carries nothing else (SEM settings wait until it ends) "
+                              "and a second move is refused; STOP never waits.  The stage has no homing or "
+                              "collision model – watch the chamber camera when moving Z, R or T.")
         lay.addWidget(self.g_jog)
-        note = QtWidgets.QLabel("During a move the port carries nothing else (SEM settings wait until it ends) "
-                                "and a second move is refused; STOP never waits.  The stage has no homing or "
-                                "collision model – watch the chamber camera when moving Z, R or T.")
-        note.setWordWrap(True)
-        note.setStyleSheet(_NOTE)
-        lay.addWidget(note)
         lay.addStretch(1)
         self._show_move_state()
         return w
@@ -521,7 +515,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         busy = self.stage.busy
         self.l_move.setText("STAGE MOVING – easyEBL has the stage (#STAGE ON)" if busy else
                             "STAGE: SEM PC (trackball) – a move takes it for its duration")
-        self.l_move.setStyleSheet("font-size:15px;font-weight:bold;"
+        self.l_move.setStyleSheet("font-size:12px;font-weight:bold;"
                                   + ("background:#ef6c00;color:white" if busy else "background:#455a64;color:#ddd"))
         self.g_jog.setEnabled(not busy)
 

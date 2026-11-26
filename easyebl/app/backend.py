@@ -168,6 +168,14 @@ class SystemBackend:
             self.microscope.tie_field(targets, sim_backend=sim_be, persist=not self.config.daq.simulated)
         if sim_be is not None and self.microscope.stage is not None and self.microscope.link.simulated:
             couple_sim_stage(sim_be, self.microscope.stage)
+            from ..microscope.sim_optics import couple_sim_optics
+
+            couple_sim_optics(sim_be, self.microscope.link)  # the image blurs with focus / stigmator
+        if self.engine is not None and self.microscope.link is not None:
+            from ..imaging.autotune import AutoTuner
+
+            # auto focus / stigmation: shared by the SEM window, lithography and scripts
+            self.microscope.autotune = AutoTuner(self.engine, self.microscope.sem)
 
     def close(self) -> None:
         """Stop and disconnect everything (the end of the easyEBL session)."""

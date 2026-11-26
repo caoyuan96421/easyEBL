@@ -137,6 +137,16 @@ class LithoHardware:
     def ask(self, text: str) -> bool:
         return False
 
+    def auto_focus(self, mode: str = "auto"):
+        """Auto focus at the present scan field (:mod:`easyebl.imaging.autotune`; ``mode`` auto /
+        fine / coarse).  Returns its :class:`~easyebl.imaging.autotune.AutoTuneResult` (``ok`` False:
+        the start values were set again)."""
+        raise NotImplementedError
+
+    def auto_stigmate(self):
+        """Auto stigmation at the present scan field (see :meth:`auto_focus`)."""
+        raise NotImplementedError
+
     def expose(self, pattern, params: ExposureParameters, transform, settings: VectorScanSettings) -> object:
         """Write *pattern* (FCS) through *transform* (``apply``: FCS → XCS)."""
         raise NotImplementedError

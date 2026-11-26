@@ -533,9 +533,9 @@ def test_beam_presets(mic, tmp_path):
     n0 = len(sim.received)
     assert sem.apply_preset(preset).result(10)["beam_coarse"] == 60
     sent = [c for c in sim.received[n0:] if not c.startswith("R ")]  # (the stigmator is read back)
-    # each stigmator value is written twice: a single one-step write drifts on the S-3000
-    assert sent == ["BEAM C 60", "BEAM F 10", "STG X 2000", "STG X 2000", "STG Y 2050", "STG Y 2050",
-                    "CONT 1800", "BRT 1900"]
+    # more than one stigmator step from the value read: written once (a single one-step write
+    # drifts on the S-3000, those are written twice)
+    assert sent == ["BEAM C 60", "BEAM F 10", "STG X 2000", "STG Y 2050", "CONT 1800", "BRT 1900"]
     assert {k: sem.state[k] for k in PRESET_KEYS} == {k: preset[k] for k in PRESET_KEYS}
     # a bad or incomplete preset is refused before anything is sent
     n0 = len(sim.received)
@@ -549,3 +549,47 @@ def test_beam_presets(mic, tmp_path):
     s.beam_presets.append(preset)
     s.save()
     assert MicroscopeSettings.load(str(tmp_path / "m.json")).beam_presets == [preset]
+
+
+def test_focus_is_confirmed_by_readback_and_stigmator_written_once_for_large_steps(mic):
+    """One write + one readback per setting; the stigmator is written twice only for a one-step
+    change (the S-3000 misapplies a single one-step write, measured 2026-11-25)."""
+    link, sem, _stage = mic
+    sim = link.session.simulator
+    n0 = len(sim.received)
+    assert sem.set_focus("F", 1500).result(10) == 1500
+    assert sim.received[n0:] == ["FOCUS F 1500", "R FOCUS F"]
+    n0 = len(sim.received)
+    assert sem.set_focus("C", 10000).result(10) == 10000
+    assert sim.received[n0:] == ["FOCUS C 10000", "R FOCUS C"]
+    n0 = len(sim.received)
+    assert sem.set_stigmator("X", 2048 + 256).result(10) == 2048 + 256
+    assert sim.received[n0:] == ["STG X 2304", "R STG X"]
+    n0 = len(sim.received)
+    sem.set_stigmator("X", 2304 + 16).result(10)
+    assert sim.received[n0:] == ["STG X 2320", "STG X 2320", "R STG X"]
+
+
+def test_a_focus_readback_that_disagrees_is_written_again_then_reported(mic, monkeypatch):
+    link, sem, _stage = mic
+    real = link.session.sem.read
+    monkeypatch.setattr(link.session.sem, "read", lambda item: "1234" if item == "FOCUS F" else real(item))
+    with pytest.raises(RuntimeError, match="reads back 1234"):
+        sem.set_focus("F", 1600).result(10)
+    assert sem.state["focus_fine"] == 1234  # what the SEM says
+
+
+def test_holding_the_poller_stops_background_reads():
+    link = MicroscopeLink.simulated(command_delay_s=0.01)
+    try:
+        sem = SEMControl(link, polling=True)
+        time.sleep(0.3)
+        with sem.hold_polling():
+            time.sleep(0.1)  # a read in progress ends
+            n = link.poller.reads
+            time.sleep(0.4)
+            assert link.poller.reads == n and link.poller.is_held
+        time.sleep(0.4)
+        assert link.poller.reads > n and not link.poller.is_held
+    finally:
+        link.close()

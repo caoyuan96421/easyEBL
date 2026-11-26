@@ -145,6 +145,42 @@ Open → *SEM imaging*.  The window looks and works like a commercial SEM screen
 * **Magnification, focus/WD, stigmation, gun alignment** go to the SEM over RS-232 (the Column group); the
   field follows the column magnification (see *Field calibration* below).  The data bar shows the SEM's kV and WD, and captures
   store the column and stage readbacks in their metadata.  **Microscope…** opens the stage window.
+* **Auto focus / Auto stigma / Focus + stig** (Column group) are easyEBL's own searches
+  (`easyebl/imaging/autotune.py`; the SEM's AFC / ASF are not used).  They use small test images
+  of the scan field as it is (by default Slow 1 at 256², ≈ 0.35 s; speed and size for each search
+  in *Advanced… → Auto focus / stigma*) and a gradient-based sharpness measure.  It is Tenengrad
+  (squared Sobel gradients) on a lightly de-noised image, taken in four directions with the
+  detector noise's share taken off: the noise is measured in each image.  The harmonic mean of
+  the four directions is used, dominated by the most blurred direction, so a line focus scores
+  below the round spot.  It is divided by the gross contrast so brightness and contrast cancel.  Each step is
+  one `SEMControl` setting confirmed by its readback (≈ 0.5 s on the S-3000) plus one image, and
+  background reads are held meanwhile.  The SEM is switched to external scan once for the whole
+  run (`ImagingEngine.hold_external_scan()`), not at every test image.
+  - **Focus** moves one knob at a time.
+    - **Fine** (FOCUS F) searches its whole range 0–4095: first a grid at 512 counts, then halves
+      the step around the sharpest value, two images per halving, down to 1 count, so the result
+      is tested to the last digit.  At high magnification the first grid is finer, so it cannot
+      step over the focus: at most 4 focus steps, where one step blurs the test image by
+      ≈ 2 pixels (e.g. 128 counts at ×10k).  It takes ≈ 27 images, ≈ 23 s up to ≈ ×5k.
+    - **Coarse** (FOCUS C) is only for when the fine focus cannot find the focus, and has no time
+      limit.  It moves at most 0.1 mm of WD per setting (also on the way back and when restoring)
+      and never beyond ±1 mm of WD from its start.  It sweeps one way until the sharpness has
+      clearly fallen past its peak, the other way if needed, then fits the peak.
+    - **Auto** runs fine; if the whole FOCUS F range shows no clear optimum, or its peak is at an
+      end, it sets FOCUS F back, runs the coarse sweep, then fine again.
+  - **Stigmation** is a full-range golden-section search on X, then on Y, ending with a parabola.
+    It takes ≈ 9–10 steps per axis, ≈ 16 s for both with the default images.
+  - **Falling back to the start values:** a result is kept only when it is sharper than the
+    start.  Otherwise the start values are set again, as they are on cancel, on an error, on a
+    readback that disagrees, with no clear optimum (no structure), or with a peak at the end of
+    the range.
+  - **Progress** shows under the buttons, with *Cancel*, and the result goes to Messages.
+  - **Hooks for other subsystems:** the backend's `AutoTuner` (`bundle.autotune`, shared with
+    the SEM window), `SEMWindow.auto_focus()` / `auto_stigmate()` / `focus_and_stigmate()`, and
+    the lithography hardware's `auto_focus()` / `auto_stigmate()`.  Each returns an
+    `AutoTuneResult`, or a future of one.
+  - **Simulators:** the simulated image blurs with the simulated focus and stigmator
+    (`microscope/sim_optics.py`).
 * **External scan is automatic**: scanning switches the SEM to the DAQ's X/Y, stopping (freeze, single
   frame done, stop) gives the scan back to the SEM.  The status bar shows *EXT SCAN* while it is claimed.
 * **Deflection range**: the full field of view is ±`scan_limit_v`; every waveform sample – pre-line
@@ -279,7 +315,13 @@ S-3000. On top of it:
   distance (never read from the SEM: computed from the coarse and fine focus through the S-3000's
   focus table, µm resolution; setting a WD, any value in 4–60 mm, sends the table's `FOCUS C` and
   `FOCUS F`), coarse/fine focus, stigmator, condenser coarse/fine (raw 0–99), SEM display contrast /
-  brightness / scan mode / freeze, detector, AFC / ASF / ABC / AGA.  Readbacks are cached (instant for
+  brightness / scan mode / freeze, detector, AFC / ASF / ABC / AGA (AFC / ASF are no longer in the
+  GUIs: easyEBL's own auto focus / stigma replace them).  A focus setting is confirmed by one
+  readback (written again once if the SEM reports something else, then an error).  A stigmator
+  change of more than one step is written once; a one-step change is written twice, because the
+  S-3000 misapplies a single one-step write.  Either way it is read back.  On the S-3000 every
+  transaction takes ≈ 0.25 s and the readback shows the new value at once (measured 2026-11-25).
+  `hold_polling()` pauses the background reads for a sequence of settings.  Readbacks are cached (instant for
   the GUIs), refreshed after each setting and by the background reads so changes
   on the SEM panel are seen.  Repeated settings coalesce: ten wheel steps during one transaction
   become one `MAG` with the final value.
@@ -304,13 +346,17 @@ S-3000. On top of it:
   (`microscope/coupling.py`) keeps the DAQ field at `K / magnification` (the global field calibration,
   see the SEM window); zooming keeps the scan's share of the field.  EDS takes the
   SEM's kV as the nominal beam energy, and spectra and images carry the column and stage readbacks.
-* The window: HV, magnification, focus / WD, stigmator, condenser and SEM display on the left; on
-  the right a big **STOP ALL** (also *Esc*), the **Enable / Disable** button (easyEBL or the SEM PC
-  drives the stage), a digital readout of X, Y, Z, R (and T) – double-click a value to move that
-  axis to / by a value – the X/Y/Z/R/T jogs, and the raw TX/RX log.  On the
-  real instrument, HV switching, automatic routines and moves ask for confirmation.  Automatic
-  routines: auto focus (coarse / fine), auto stigma, ABC and **Auto gun alignment** (`AGA ON`, in the
-  beam current group).  The SEM's own scan mode is read back (`R SCAN`: answered by the S-3000
+* The window: HV, magnification, focus / WD, stigmator, condenser and SEM display on the left.  On
+  the right is a compact stage panel:
+  - **STOP ALL** (also *Esc*);
+  - the line showing who drives the stage;
+  - a digital readout of X, Y, Z, R and T (double-click a value to move that axis to / by a value);
+  - the X/Y/Z/R/T jogs, with the step sizes and the X/Y approach beside them;
+  - the raw TX/RX log.
+
+  On the real instrument, HV switching, the automatic routines and moves ask for confirmation.  The
+  SEM's own routines left in the window are ABC and **Auto gun alignment** (`AGA ON`, in the beam
+  current group).  Auto focus and stigma are in the SEM imaging window.  The SEM's own scan mode is read back (`R SCAN`: answered by the S-3000
   although its manual does not list it) and shown in the display group.
 * **Beam presets** (*Beam presets…* in the toolbar or *Presets…* in the beam group): any number of
   named settings of beam 1 coarse / fine, stigmator X / Y and contrast / brightness.  *Save current…*
@@ -468,14 +514,16 @@ compares the fitted transform with the deliberately misplaced specimen.
 easyebl/
   core/       AffineTransform, FieldCalibration (µm ↔ V), OutputChunk streams
   hal/        DAQConfig, DAQBackend (abstract), DAQManager + DAQHandle, SimulatedBackend, NIDAQBackend
-  imaging/    RasterConfig → RasterPlan (waveforms) → RasterImager (+ LineAssembler for AI)
+  imaging/    RasterConfig → RasterPlan (waveforms) → RasterImager (+ LineAssembler for AI);
+              autotune.py: auto focus / stigmation (AutoTuner, sharpness)
     engine/   threaded ImagingEngine: settings, source, program, assembler, frames, core
     sem/      SEM GUI: window, view (data bar), panels (column via easyebl.microscope), advanced dialog
     cli.py    text commands (ImagingShell); export.py  TIFF/PNG/JSON writers
   hal/dp5/    vendored Amptek DP5 USB driver (+ mock device); hal/mca.py pulse-processor HAL
   hal/devlock.py  process lock on the NI device
   microscope/ Hitachi S-3000 RS-232: link (shared port, priorities), sem (column HAL), stage (stage HAL),
-              coupling (field ↔ magnification), gui; s3000/ vendored driver + simulator
+              coupling (field ↔ magnification), sim_optics (simulated focus / stigmator blur),
+              gui; s3000/ vendored driver + simulator
   xray/       X-ray lines/edges/attenuation (xraydb tables) and the generation model
 tools/        gen_xray_data.py: regenerates easyebl/xray/data/xray_data.npz (needs xraydb)
 tests/        unit/, system/ (simulator pipelines), gui/ (offscreen Qt); data/ real DP5 spectra

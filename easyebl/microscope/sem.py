@@ -184,6 +184,11 @@ class SEMControl(MicroscopeControl):
         """Background read of the SEM settings (see :mod:`~easyebl.microscope.poll`) on / off."""
         self._polling = bool(on)
 
+    def hold_polling(self):
+        """Context manager: no background reads (SEM or stage) while it is held, so a sequence of
+        settings never waits behind one (e.g. auto focus: ≈ 0.25 s saved per step)."""
+        return self.link.poller.held()
+
     def close(self) -> None:
         self.link.poller.remove(self)
 
@@ -273,19 +278,38 @@ class SEMControl(MicroscopeControl):
         return self.link.submit(job, SEM_SET, "HV OFF")
 
     # beam current, focus, stigmator, contrast ------------------------------------
+    #: settings confirmed by a readback after the write (item read back)
+    VERIFIED = {"focus_coarse": "FOCUS C", "focus_fine": "FOCUS F"}
+
     def _set_int(self, state_key: str, value: int, text_fn, what: str) -> concurrent.futures.Future:
+        """Queue a raw integer setting.  Focus values are read back (one ``R FOCUS`` after the
+        write, ≈ 0.25 s on the S-3000) and written once more if the SEM reports something else;
+        the future resolves to the value read back."""
         lo, hi = _LIMITS[state_key]
         v = int(round(value))
         if not lo <= v <= hi:
             raise ValueError(f"{what} must be {lo}…{hi}")
         text = text_fn(v)  # validated by the command builder too
+        item = self.VERIFIED.get(state_key)
 
         def send(session, t):
-            session.sem.command(t)
             n = int(t.rsplit(" ", 1)[1])
             if state_key == "focus_coarse":
                 n = max(n, COARSE_MIN)  # the SEM holds the coarse focus there
-            self._update({state_key: n})
+            if item is None:
+                session.sem.command(t)
+                self._update({state_key: n})
+                return n
+            got = None
+            for _ in range(2):
+                session.sem.command(t)
+                got = _parse(item, session.sem.read(item)).get(state_key)
+                if got == n:
+                    break
+            self._update({state_key: got if got is not None else n})
+            if got is not None and got != n:
+                raise RuntimeError(f"{item}: set {n}, the SEM reads back {got}")
+            return got if got is not None else n
 
         return self._set_latest(state_key, text, send, text)
 
@@ -324,7 +348,9 @@ class SEMControl(MicroscopeControl):
         part moves the other way – and stays there.  The same value written twice holds (seen
         stable for 3 s), so every value is written twice, read back, and written again if the SEM
         reports something else (values off the 16-step grid are rounded by the SEM: a readback
-        within one step is accepted)."""
+        within one step is accepted).  A change of more than one step from the value last read is
+        applied correctly by a single write (measured 2026-11-25), so it is written once – one
+        transaction (≈ 0.25 s) saved; the future resolves to the value read back."""
         axis = axis.upper()
         key = "stig_x" if axis == "X" else "stig_y"
         item = f"STG {axis}"
@@ -336,13 +362,18 @@ class SEMControl(MicroscopeControl):
 
         def send(session, t):
             want = int(t.rsplit(" ", 1)[1])
-            for _ in range(1 + self.STIG_RETRIES):
+            for k in range(1 + self.STIG_RETRIES):
+                cur = self.state.get(key)
                 session.sem.command(t)
-                session.sem.command(t)  # a single one-step write drifts by ±240 (see above)
+                if k > 0 or not isinstance(cur, int) or abs(want - cur) <= 16:
+                    session.sem.command(t)  # a single one-step write drifts by ±240 (see above)
                 got = _parse(item, session.sem.read(item)).get(key)
+                if got is not None:
+                    self._update({key: got})
                 if got is None or abs(got - want) < 16:  # the SEM's stigmator step
                     break
             self._update({key: got if got is not None else want})
+            return got if got is not None else want
 
         return self._set_latest(key, text, send, text)
 

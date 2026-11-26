@@ -44,6 +44,7 @@ Robustness
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 from dataclasses import dataclass, field, replace
 import itertools
 import math
@@ -242,6 +243,7 @@ class ImagingEngine:
         self.daq_config = self.handle.config
         self._cal = calibration or FieldCalibration(100.0, self.daq_config.full_scale_v)
         self._external_on: bool | None = False  # the external-scan switch, as this engine set it
+        self._ext_hold = 0  # > 0: the switch stays claimed between scans (hold_external_scan)
         opts = options or EngineOptions()
         opts.validate()
         self._opts = opts
@@ -763,6 +765,24 @@ class ImagingEngine:
         self.events.emit("settings", f"video input mode {mode}", ai_terminal=mode)
         return mode
 
+    @contextlib.contextmanager
+    def hold_external_scan(self):
+        """Keep the SEM on external scan between scans while held (nests): e.g. a sequence of test
+        images (auto focus) claims the SEM once instead of at every image.  Released – when the
+        engine is not scanning – as the last hold ends."""
+        with self._lock:
+            self._ext_hold += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._ext_hold -= 1
+                self._wake()
+
+    @property
+    def external_scan_held(self) -> bool:
+        return self._ext_hold > 0
+
     def capture(
         self,
         frames: int = 1,
@@ -867,13 +887,18 @@ class ImagingEngine:
         while True:
             with self._cv:
                 idle = self._mode == "idle"
-            if idle or self._closing:
+                held = self._ext_hold > 0
+            if (idle and not held) or self._closing:
                 self._external_scan(False)  # stopped: the SEM gets its own scan back
             with self._cv:
                 while not self._closing and self._mode == "idle":
+                    if not self._ext_hold and self._external_on:
+                        break  # a hold ended while stopped: release the switch (top of the loop)
                     self._cv.wait(0.5)
                 if self._closing:
                     break
+                if self._mode == "idle":
+                    continue
             if self._lease_blocked():
                 self._wait_for_lease()
                 continue

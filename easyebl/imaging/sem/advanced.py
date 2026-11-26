@@ -1,4 +1,5 @@
-"""'Advanced…' dialog: hardware, scan waveform, field calibration and saving settings.
+"""'Advanced…' dialog: hardware, scan waveform, field calibration, auto focus / stigma and saving
+settings.
 
 The scan *size, position and rotation* are in the main window (Field of view); the pixel
 dwell and the line / frame timing come with the speed preset (shown in the status bar).
@@ -8,7 +9,7 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
-from ..engine import ImagingEngine, valid_rates
+from ..engine import SCAN_SPEEDS, ImagingEngine, valid_rates
 from .display import format_length
 
 __all__ = ["AdvancedDialog", "SaveSettings"]
@@ -43,17 +44,20 @@ class AdvancedDialog(QtWidgets.QDialog):
     applied = QtCore.Signal()
     calibrated = QtCore.Signal(float)  # K was scaled by this ratio (true / measured length)
 
-    def __init__(self, engine: ImagingEngine, save: SaveSettings, parent=None, field_scale=None, measured=None):
+    def __init__(self, engine: ImagingEngine, save: SaveSettings, parent=None, field_scale=None, measured=None,
+                 autotune=None):
         super().__init__(parent)
         self.setWindowTitle("Advanced settings")
         self.engine = engine
         self.save = save
         self.fs = field_scale
         self.measured = measured
+        self.autotune = autotune  # easyebl.imaging.autotune.AutoTuner (None: no remote control)
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(self._hw_tab(), "Hardware")
         tabs.addTab(self._scan_tab(), "Scan waveform")
         tabs.addTab(self._cal_tab(), "Calibration")
+        tabs.addTab(self._tune_tab(), "Auto focus / stigma")
         tabs.addTab(self._save_tab(), "Saving")
         self.msg = QtWidgets.QLabel()
         self.msg.setWordWrap(True)
@@ -240,6 +244,59 @@ class AdvancedDialog(QtWidgets.QDialog):
         self.calibrated.emit(r)
         self._refresh_cal()
 
+    def _tune_tab(self):
+        """Test images of the auto focus and auto stigma searches: a scan speed and a size each."""
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        self.tune = {}
+        for which, title in (("focus", "Auto focus test image"), ("stig", "Auto stigma test image")):
+            g = QtWidgets.QGroupBox(title)
+            f = QtWidgets.QFormLayout(g)
+            speed = QtWidgets.QComboBox()
+            for sp in SCAN_SPEEDS:
+                speed.addItem(f"{sp.name}  ({sp.dwell_s * 1e6:g} µs)", sp.name)
+            speed.setToolTip("scan speed of each test image: slower = less noise, more time per step")
+            px = QtWidgets.QSpinBox()
+            px.setRange(32, 4096)
+            px.setSingleStep(64)
+            px.setSuffix(" px")
+            px.setKeyboardTracking(False)
+            px.setToolTip("test image size (square) over the present scan field: more pixels = a finer "
+                          "focus step, more time per step")
+            info = QtWidgets.QLabel()
+            info.setStyleSheet("color:#9aa")
+            f.addRow("Speed", speed)
+            f.addRow("Size", px)
+            f.addRow(info)
+            speed.currentIndexChanged.connect(self._tune_info)
+            px.valueChanged.connect(self._tune_info)
+            self.tune[which] = (speed, px, info)
+            lay.addWidget(g)
+        note = QtWidgets.QLabel("Each search step is one setting confirmed by the SEM (≈ 0.5 s on the S-3000) "
+                                "plus one test image of the present scan field.  Auto focus takes ≈ 8–9 steps "
+                                "per focus knob, auto stigma ≈ 9–10 steps per axis.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#9aa")
+        lay.addWidget(note)
+        lay.addStretch(1)
+        if self.autotune is None:
+            for gb in w.findChildren(QtWidgets.QGroupBox):
+                gb.setEnabled(False)
+            note.setText("Auto focus / stigma need the microscope's remote control.")
+        return w
+
+    def _tune_info(self, *_):
+        from ..autotune import image_time_s
+
+        for which, (speed, px, info) in getattr(self, "tune", {}).items():
+            try:
+                t = image_time_s(speed.currentData(), px.value(), float(self.engine.rate))
+                steps = 9 if which == "focus" else 20
+                info.setText(f"{t:.2f} s per image · ≈ {steps * (0.5 + t):.0f} s per "
+                             + ("focus knob" if which == "focus" else "auto stigma (X and Y)"))
+            except Exception as e:  # noqa: BLE001
+                info.setText(str(e))
+
     def _save_tab(self):
         w = QtWidgets.QWidget()
         f = QtWidgets.QFormLayout(w)
@@ -294,6 +351,12 @@ class AdvancedDialog(QtWidgets.QDialog):
         for cb, k in ((self.f_tif, "tif"), (self.f_png, "png"), (self.f_npy, "npy"), (self.f_json, "json")):
             cb.setChecked(k in s.formats)
         self.data_bar.setChecked(s.data_bar)
+        if self.autotune is not None:
+            o = self.autotune.options
+            for which, (speed, px, _info) in self.tune.items():
+                speed.setCurrentIndex(max(0, speed.findData(getattr(o, f"{which}_speed"))))
+                px.setValue(int(getattr(o, f"{which}_px")))
+        self._tune_info()
         self.msg.setText("")
 
     def apply(self):
@@ -330,6 +393,9 @@ class AdvancedDialog(QtWidgets.QDialog):
             s.formats = tuple(k for cb, k in ((self.f_tif, "tif"), (self.f_png, "png"), (self.f_npy, "npy"),
                                               (self.f_json, "json")) if cb.isChecked())
             s.data_bar = self.data_bar.isChecked()
+            if self.autotune is not None:
+                self.autotune.set_options(**{f"{w}_{k}": (sp.currentData() if k == "speed" else px.value())
+                                             for w, (sp, px, _i) in self.tune.items() for k in ("speed", "px")})
             self.msg.setStyleSheet("color:#7c7")
             self.msg.setText("Applied.")
             self.applied.emit()

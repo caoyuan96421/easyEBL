@@ -83,6 +83,21 @@ class BackendHardware(LithoHardware):
         self.move_dialog = None  # the "Stage moving" dialog while a programmed move runs
         self.move_dialogs = 0  # how many were shown
 
+    # ---------------------------------------------------------------- column
+    def _autotune(self):
+        t = getattr(self.bundle, "autotune", None) if self.bundle is not None else None
+        if t is None:
+            raise RuntimeError("auto focus / stigmation needs the microscope and the imaging engine")
+        return t
+
+    def auto_focus(self, mode: str = "auto"):
+        self.status(f"auto focus ({mode})")
+        return self._autotune().run_focus(mode)
+
+    def auto_stigmate(self):
+        self.status("auto stigmation")
+        return self._autotune().run_stigmate()
+
     # ---------------------------------------------------------------- stage
     @property
     def stage(self):

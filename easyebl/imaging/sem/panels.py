@@ -527,12 +527,15 @@ class ColumnPanel(QtWidgets.QGroupBox):
     back through :attr:`failed` on the GUI thread."""
 
     failed = QtCore.Signal(str)
+    tuneEvent = QtCore.Signal(object)  # AutoTuner events, handed to the GUI thread
 
     def __init__(self, microscope: MicroscopeControl, notify: Notify, parent=None):
         super().__init__("Column", parent)
         self.mic = microscope
         self.notify = notify
+        self.autotune = None  # easyebl.imaging.autotune.AutoTuner (set_autotune)
         self.failed.connect(notify)
+        self.tuneEvent.connect(self._tune_event)
         lay = QtWidgets.QGridLayout(self)
         lay.setContentsMargins(8, 10, 8, 8)
 
@@ -562,24 +565,103 @@ class ColumnPanel(QtWidgets.QGroupBox):
         lay.addWidget(btn("−", lambda: self.mic.stigmate(0, -1)), 3, 2)
         lay.addWidget(btn("+", lambda: self.mic.stigmate(0, +1)), 3, 3)
 
+        # our own auto focus / stigmation (easyebl.imaging.autotune): test images of this scan field
         row = QtWidgets.QHBoxLayout()
-        b_af = QtWidgets.QPushButton("Auto focus")
-        b_af.clicked.connect(lambda: self._call(self.mic.auto_focus))
-        b_as = QtWidgets.QPushButton("Auto stigma")
-        b_as.clicked.connect(lambda: self._call(self.mic.auto_stigma))
-        b_al = QtWidgets.QPushButton("Alignment ▾")
+        self.b_af = QtWidgets.QToolButton(text="Auto focus")
+        self.b_af.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+        self.b_af.setToolTip("search the objective focus with test images of the present scan field; the step "
+                             "follows the magnification (coarse focus first only when needed).  Falls back to "
+                             "the start values when no clear optimum is found")
+        self.b_af.clicked.connect(lambda: self.start_tune("auto"))
+        m = QtWidgets.QMenu(self.b_af)
+        m.addAction("Fine focus only (FOCUS F)", lambda: self.start_tune("fine"))
+        m.addAction("Coarse focus only (FOCUS C)", lambda: self.start_tune("coarse"))
+        self.b_af.setMenu(m)
+        self.b_as = QtWidgets.QToolButton(text="Auto stigma")
+        self.b_as.setToolTip("full-range search of stigmator X, then Y, with test images; falls back to the "
+                             "start values when no clear optimum is found")
+        self.b_as.clicked.connect(lambda: self.start_tune("stig"))
+        self.b_fs = QtWidgets.QToolButton(text="Focus + stig")
+        self.b_fs.setToolTip("auto focus, auto stigma, then fine focus again")
+        self.b_fs.clicked.connect(lambda: self.start_tune("both"))
+        self.b_tune_cancel = QtWidgets.QToolButton(text="Cancel")
+        self.b_tune_cancel.setToolTip("stop the search and set the start values again")
+        self.b_tune_cancel.clicked.connect(self.cancel_tune)
+        self.b_tune_cancel.setVisible(False)
+        b_al = QtWidgets.QToolButton(text="Alignment")
+        b_al.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         menu = QtWidgets.QMenu(b_al)
         for kind in ("Gun", "Aperture", "Stigma X", "Stigma Y"):
             menu.addAction(f"{kind} alignment", lambda k=kind: self._call(lambda: self.mic.alignment(k)))
         b_al.setMenu(menu)
-        for b in (b_af, b_as, b_al):
+        for b in (self.b_af, self.b_as, self.b_fs, self.b_tune_cancel, b_al):
             row.addWidget(b)
+        row.addStretch(1)
         lay.addLayout(row, 4, 0, 1, 4)
+        self.l_tune = QtWidgets.QLabel("")
+        self.l_tune.setStyleSheet("color:#9aa")
+        self.l_tune.setWordWrap(True)
+        self.l_tune.setVisible(False)
+        lay.addWidget(self.l_tune, 6, 0, 1, 4)
+        self.set_autotune(None)
         self.l_note = QtWidgets.QLabel(f"Microscope: {microscope.name}" + (
             "" if microscope.connected else " – no remote control: set the column on the SEM"))
         self.l_note.setStyleSheet("color:#9aa")
         self.l_note.setWordWrap(True)
         lay.addWidget(self.l_note, 5, 0, 1, 4)
+
+    # ------------------------------------------------------------ auto focus / stigmation
+    def set_autotune(self, tuner) -> None:
+        if self.autotune is not None:
+            self.autotune.remove_listener(self.tuneEvent.emit)
+        self.autotune = tuner
+        if tuner is not None:
+            tuner.add_listener(self.tuneEvent.emit)
+        self._tune_buttons(busy=bool(tuner is not None and tuner.busy))
+
+    def _tune_buttons(self, busy: bool) -> None:
+        ok = self.autotune is not None and self.autotune.available
+        for b in (self.b_af, self.b_as, self.b_fs):
+            b.setEnabled(ok and not busy)
+            if not ok:
+                b.setToolTip("needs the microscope's remote control and the imaging engine")
+        self.b_tune_cancel.setVisible(busy)
+
+    def start_tune(self, what: str):
+        """*what*: "auto" / "fine" / "coarse" focus, "stig", or "both".  Returns the future (or None)."""
+        t = self.autotune
+        if t is None:
+            self.notify("auto focus / stigmation needs the microscope (remote control) and the imaging engine")
+            return None
+        try:
+            if what == "stig":
+                fut = t.auto_stigmate()
+            elif what == "both":
+                fut = t.focus_and_stigmate()
+            else:
+                fut = t.auto_focus(what)
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"auto focus / stigmation: {e}")
+            return None
+        self._tune_buttons(busy=True)
+        return fut
+
+    def cancel_tune(self) -> None:
+        if self.autotune is not None:
+            self.autotune.cancel()
+
+    def _tune_event(self, ev: dict) -> None:
+        typ = ev.get("type")
+        if typ == "start":
+            self._tune_buttons(busy=True)
+            self.l_tune.setVisible(True)
+            self.l_tune.setText(ev.get("text", ""))
+        elif typ == "progress":
+            self.l_tune.setText(ev.get("text", ""))
+        elif typ == "done":
+            self._tune_buttons(busy=False)
+            self.l_tune.setText(ev.get("text", ""))
+            self.notify(ev.get("text", ""))
 
     def _call(self, fn):
         try:
