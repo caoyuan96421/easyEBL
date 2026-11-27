@@ -155,11 +155,8 @@ def test_sem_window_with_microscope(qtbot, bundle, tmp_path):
         meta = json.loads((tmp_path / "cap.json").read_text(encoding="utf-8"))
         assert meta["microscope"]["mag"] == 1200 and meta["microscope"]["hv_kv"] == 20.0
         assert "stage_x" in meta["microscope"]
-        # the microscope window opens from the toolbar
-        act = [a for a in w.findChildren(type(w.menuBar().addAction("x"))) if a.text() == "Microscope…"]
-        assert act
-        act[0].trigger()
-        assert bundle.window().isVisible()
+        # no separate microscope window from the SEM (the main window has the column in its side bar)
+        assert not [a for a in w.findChildren(type(w.menuBar().addAction("x"))) if a.text() == "Microscope…"]
     finally:
         w.close()
         mgr.close()

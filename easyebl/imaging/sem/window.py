@@ -253,11 +253,6 @@ class SEMWindow(QtWidgets.QMainWindow):
                                 lambda: self.showNormal() if self.isFullScreen() else self.showFullScreen(),
                                 "this window full screen")
         self.a_fullscreen.setObjectName("full_screen")
-        self.a_mic = None
-        if self.bundle is not None and self.bundle.connected:  # (the main window has it in its side bar)
-            self.a_mic = act("column", "Microscope…", self.bundle.show_window,
-                             "SEM column settings and stage control (RS-232)")
-            self.a_mic.setObjectName("microscope_window")
         self.tune_actions = (self.a_af, self.a_as)
 
     def _busy(self, title: str, text: str, **kw):

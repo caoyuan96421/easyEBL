@@ -797,13 +797,14 @@ def ui(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(QtWidgets.QApplication, "quit", lambda *a: None)
     cfg = SystemConfig()
     cfg.path = str(tmp_path / "system.json")
-    app = EasyEBLApp(cfg, eds_settings_path=str(tmp_path / "eds.json"), microscope_delay_s=0.01, use_tray=False,
+    app = EasyEBLApp(cfg, eds_settings_path=str(tmp_path / "eds.json"), microscope_delay_s=0.01,
                      confirm=lambda title, text: True)
     app.start()
     yield app
-    for w in list(app.windows.values()):
-        if hasattr(w, "ask_on_close"):
-            w.ask_on_close = False
+    lw = app.main.litho
+    if lw is not None:
+        lw.ask_on_close = False
+        lw.modified = False
     if not app.closing:
         app.shutdown(ask=False)
     qapp.setQuitOnLastWindowClosed(True)
@@ -812,7 +813,6 @@ def ui(qtbot, tmp_path, monkeypatch):
 def test_litho_in_the_program_marks_are_clicked_in_the_sem_window(ui, qtbot):
     from easyebl.litho.module.hardware import BackendHardware
 
-    assert "Lithography" in [a.text() for a in ui.menu.m_open.actions()]
     w = ui.open("litho")
     w.ask_on_close = False
     assert type(w).__name__ == "LithoWindow" and isinstance(w.hw, BackendHardware)
@@ -830,11 +830,11 @@ def test_litho_in_the_program_marks_are_clicked_in_the_sem_window(ui, qtbot):
     req = MarkRequest("mark 1", (3.0, -2.0), (1003.0, 998.0), (3.0, -2.0), 10.0)
     out = {}
     threading.Thread(target=lambda: out.setdefault("xy", w.hw.measure_marks([req])), daemon=True).start()
-    qtbot.waitUntil(lambda: "sem" in ui.windows and ui.windows["sem"].view.pick_mode, timeout=10000)
-    sem = ui.windows["sem"]
+    sem = ui.main.sem  # the SEM tab
+    qtbot.waitUntil(lambda: sem.view.pick_mode, timeout=10000)
     cfg = ui.backend.engine.config
     assert cfg.width_um == pytest.approx(10.0) and cfg.center_um == pytest.approx((3.0, -2.0))  # zoomed on the mark
-    assert sem.view._pick_targets == [(3.0, -2.0)] and sem.view._pick_centre_cross and sem.pick_bar.isVisible()
+    assert sem.view._pick_targets == [(3.0, -2.0)] and sem.view._pick_centre_cross and sem.pick_bar.isVisibleTo(sem)
     assert w.hw.scan_area()[:2] == (pytest.approx((3.0, -2.0)), pytest.approx(10.0))
     w.hw.bundle.stage.refresh(("X", "Y")).result(30)
     w._tick()
@@ -995,7 +995,7 @@ def test_focus_prompt_in_the_program(ui, qtbot):
         threading.Thread(target=lambda: out.setdefault("ok", w.hw.ask_focus("focus here")), daemon=True).start()
         qtbot.waitUntil(lambda: w.hw.focus_prompt is not None and w.hw.focus_prompt.isVisible(), timeout=10000)
         d = w.hw.focus_prompt
-        assert not d.isModal() and "focus here" in d.text.text() and "sem" in ui.windows
+        assert not d.isModal() and "focus here" in d.text.text()
         qtbot.waitUntil(lambda: eng.is_scanning, timeout=10000)
         (d.b_continue if answer else d.b_abort).click()
         qtbot.waitUntil(lambda: "ok" in out, timeout=10000)

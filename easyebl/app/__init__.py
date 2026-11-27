@@ -2,20 +2,18 @@
 
     easyebl                  # the instrument configuration saved in Hardware → Configure…
     easyebl --sim            # this session on simulators only (nothing saved)
-    easyebl --open sem,eds   # also open these windows (sem, eds, microscope, litho, …)
+    easyebl --open litho     # bring these forward: sem, eds, microscope, litho
     python -m easyebl        # the same
 
 Starting it opens the main window - SEM, EDS and Lithography tabs, the microscope
-on the left, the active subsystem's settings on the right, data at the bottom
-(``--classic``: the small menu window and one window per subsystem instead) - and
-puts an icon in the system tray.  Closing the main window shuts easyEBL down (it asks
-first); with ``--background`` (or ``--tray``) it keeps running in the tray instead, the
-hardware connected, until *Shut down easyEBL* in the tray menu.  A second start only
-brings the running program's window forward.
+on the left, the active subsystem's settings on the right, data at the bottom.  It
+runs in the foreground: closing the window shuts easyEBL down and disconnects the
+hardware (it asks first).  A second start only brings the running program's window
+forward.
 
 * :mod:`.config`  – :class:`SystemConfig` (``%APPDATA%\\easyEBL\\system.json``)
 * :mod:`.backend` – :class:`SystemBackend`: DAQ + imaging engine, DP5 + EDS controller, microscope port
-* :mod:`.gui`     – :class:`EasyEBLApp`: menu window, tray icon, subsystem windows
+* :mod:`.gui`     – :class:`EasyEBLApp`: the backend and the main window; the hardware dialog
 """
 from __future__ import annotations
 
@@ -45,12 +43,6 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None, help="hardware configuration JSON (default: per-user file)")
     p.add_argument("--open", default="", metavar="LIST",
                    help="open these subsystems at start, comma separated: " + ", ".join(SUBSYSTEM_KEYS))
-    p.add_argument("--tray", action="store_true", help="start in the tray (no window; implies --background)")
-    p.add_argument("--background", action="store_true",
-                   help="keep running in the tray when the main window is closed (default: closing it shuts "
-                        "easyEBL down)")
-    p.add_argument("--classic", action="store_true",
-                   help="the small menu window and one window per subsystem instead of the main window")
     return p
 
 
@@ -125,7 +117,7 @@ def main(argv=None) -> int:
     name = instance_name()
     # one easyEBL per user: the DAQ, the DP5 and the serial port can be opened by one process only
     if _send_to_running(name, "open " + ",".join(opens) if opens else "show"):
-        print("easyEBL is already running – its menu was brought to the front.")
+        print("easyEBL is already running – its window was brought to the front.")
         return 0
 
     from ..imaging.sem.window import apply_dark_theme
@@ -145,10 +137,9 @@ def main(argv=None) -> int:
     from .config import default_config_path
 
     layout = os.path.join(os.path.dirname(args.config or default_config_path()), "mainwindow.ini")
-    ui = EasyEBLApp(config, persistent=not args.sim, main_window=not args.classic, layout_path=layout,
-                    background=args.background or args.tray)
+    ui = EasyEBLApp(config, persistent=not args.sim, layout_path=layout)
     server = _listen(name, ui)
-    ui.start(show_menu=not args.tray)
+    ui.start()
     for k in opens:
         ui.open(k)
     try:

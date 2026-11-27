@@ -1,4 +1,4 @@
-"""The easyEBL program: menu window, subsystem windows, hardware dialog, single instance (offscreen Qt)."""
+"""The easyEBL program: the backend and its one window, hardware dialog, single instance (offscreen Qt)."""
 import uuid
 
 import pytest
@@ -26,67 +26,34 @@ def ui(qtbot, tmp_path, monkeypatch):
     cfg = SystemConfig()
     cfg.path = str(tmp_path / "system.json")
     asked = []
-    app = EasyEBLApp(cfg, eds_settings_path=str(tmp_path / "eds.json"), microscope_delay_s=0.01, use_tray=False,
+    app = EasyEBLApp(cfg, eds_settings_path=str(tmp_path / "eds.json"), microscope_delay_s=0.01,
                      confirm=lambda title, text: asked.append(text) or True)
     app.asked = asked
     app.start()
     yield app
+    if app.main.litho is not None:
+        app.main.litho.modified = False
     if not app.closing:
         app.shutdown(ask=False)
     qapp.setQuitOnLastWindowClosed(True)
 
 
-def test_menu_shows_the_hardware(ui):
-    assert ui.menu.isVisible()
-    texts = {k: t.text() for k, (_dot, t) in ui.menu.rows.items()}
-    assert texts == {"daq": "simulator", "eds": "DP5 mock device", "microscope": "S-3000 simulator"}
-    assert not QtWidgets.QApplication.instance().quitOnLastWindowClosed()  # the backend outlives windows
-    titles = [a.text() for a in ui.menu.m_open.actions()]
-    assert titles[:3] == ["SEM imaging", "EDS", "Microscope (column && stage)"]
-    assert all(a.isEnabled() for a in ui._open_actions)
+def test_the_window_shows_the_hardware(ui):
+    mw = ui.main
+    assert mw.isVisible()
+    assert {k: l.property("state") for k, l in mw.status_lights.items()} == {"daq": "sim", "eds": "sim",
+                                                                               "microscope": "sim"}
+    assert not QtWidgets.QApplication.instance().quitOnLastWindowClosed()  # the program ends with shutdown()
 
 
-def test_subsystem_windows_share_the_backend(ui, qtbot):
-    app = QtWidgets.QApplication.instance()
-    sem = ui.open("sem")
-    eds = ui.open("eds")
-    mic = ui.open("microscope")
-    assert type(sem).__name__ == "SEMWindow" and sem.engine is ui.backend.engine
-    assert eds.ctrl is ui.backend.eds and mic.link is ui.backend.microscope.link
-    assert ui.open("sem") is sem  # one window per subsystem
-    # SEM window's "Microscope…" goes to the app's microscope window
-    act = [a for a in sem.findChildren(QtGui.QAction) if a.text() == "Microscope…"]
-    act[0].trigger()
-    assert ui.windows["microscope"] is mic
-    # closing windows leaves the hardware connected; opening again makes a new window
-    for w in (sem, eds, mic):
-        w.close()
-    _flush(app)
-    assert ui.windows == {}
-    assert ui.backend.manager.is_open and ui.backend.microscope.link.state == "connected"
-    sem2 = ui.open("sem")
-    assert sem2 is not None and sem2 is not sem
-    sem2.scan.b_run.click()
-    qtbot.waitUntil(lambda: sem2.view.frame() is not None, timeout=15000)
-    sem2.close()
-    _flush(app)
-
-
-def test_closing_the_menu_keeps_the_system_running(ui):
-    ui.menu.close()
-    assert not ui.closing and ui.backend.started and ui.backend.manager.is_open
-    ui.show_menu()
-    assert ui.menu.isVisible()
-
-
-def test_tray_menu(ui):
-    m = QtWidgets.QMenu()
-    ui._fill_tray_menu(m)
-    texts = [a.text() for a in m.actions() if a.text()]
-    assert texts[0] == "Show easyEBL menu" and "SEM imaging" in texts and "EDS" in texts
-    assert texts[-1] == "Shut down easyEBL…" and "Hardware…" in texts
-    assert not [a for a in m.actions() if a.menu() is not None]  # no Tools submenu any more
-    assert "Lithography" in texts
+def test_the_subsystems_share_the_backend(ui, qtbot):
+    mw = ui.main
+    sem, eds = ui.open("sem"), ui.open("eds")
+    assert sem is mw.sem and type(sem).__name__ == "SEMWindow" and sem.engine is ui.backend.engine
+    assert eds is mw.eds and eds.ctrl is ui.backend.eds and mw.mic.link is ui.backend.microscope.link
+    sem.scan.b_run.click()
+    qtbot.waitUntil(lambda: sem.view.frame() is not None, timeout=15000)
+    sem.engine.stop()
 
 
 def test_reconfigure_reconnects(ui, tmp_path):
@@ -96,24 +63,23 @@ def test_reconfigure_reconnects(ui, tmp_path):
     new.path = ui.config.path
     new.microscope.port = "none"
     new.eds.mca = "none"
+    old = ui.main.sem
     assert ui.restart_backend(new)
     _flush(app)
-    assert ui.asked and ui.windows == {}  # asked first, windows closed
+    assert ui.asked and ui.main.sem is not old  # asked first, the subsystems built again
     st = ui.backend.status()
     assert st["microscope"].state == "off" and st["eds"].state == "off" and st["daq"].state == "sim"
     assert SystemConfig.load(new.path).microscope.port == "none"  # saved
     ok, why = ui.available("eds")
     assert not ok and "not used" in why
-    eds_action = [a for a in ui._open_actions if a.data() == "eds"][0]
     ui.refresh_status()
-    assert not eds_action.isEnabled()
+    assert ui.main.eds is None and ui.main.status_lights["eds"].property("state") == "off"
 
 
 def test_shutdown_disconnects_everything(ui):
-    ui.open("microscope")
     link = ui.backend.microscope.link
     assert ui.shutdown()
-    assert ui.closing and not ui.backend.started and link.state == "closed" and ui.windows == {}
+    assert ui.closing and not ui.backend.started and link.state == "closed" and not ui.main.isVisible()
 
 
 def test_hardware_dialog_roundtrip(qtbot):
@@ -233,13 +199,13 @@ def test_single_instance(qtbot):
         server.close()
 
 
-def test_scan_monitor_in_the_menu(ui, qtbot):
+def test_scan_monitor_in_the_window(ui, qtbot):
     import numpy as np
 
     from easyebl.core import OutputChunk
 
-    mon = ui.menu.monitor
-    assert ui.menu.monitor_box.isVisible() and mon.worker.running and ui.scan_tap.enabled
+    mon = ui.main.monitor
+    assert ui.main.monitor_box.isVisible() and mon.worker.running and ui.scan_tap.enabled
     assert ui.backend.manager.backend.output_tap is ui.scan_tap
     mon.retention.setValue(0)  # keep everything: the test must not race the persistence
     # unblanked at (+5 V, +5 V), blanked at (−5 V, −5 V)
@@ -279,12 +245,6 @@ def test_scan_monitor_in_the_menu(ui, qtbot):
     saved = SystemConfig.load(ui.config.path).monitor
     assert (saved.resolution, saved.retention_s) == (128, 3.5)
     qtbot.waitUntil(lambda: mon.screen.image.width() == 128, timeout=5000)
-    # View → Scan monitor hides it, stops the worker and remembers that
-    ui.menu.a_monitor.trigger()
-    assert not ui.menu.monitor_box.isVisible() and not mon.worker.running and not ui.scan_tap.enabled
-    assert SystemConfig.load(ui.config.path).monitor.visible is False
-    ui.menu.a_monitor.trigger()
-    assert mon.worker.running
 
 
 def test_scan_monitor_follows_the_scan_orientation(ui):
@@ -292,7 +252,7 @@ def test_scan_monitor_follows_the_scan_orientation(ui):
     new.path = ui.config.path
     new.daq.invert_x, new.daq.swap_xy = True, True
     assert ui.restart_backend(new, ask=False)
-    mon = ui.menu.monitor
+    mon = ui.main.monitor
     mon.worker.step()  # the worker applies the setting
     assert mon.worker.acc.orientation == (True, False, True)
     assert ui.backend.engine.calibration.swap_xy and ui.backend.engine.calibration.invert_x

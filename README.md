@@ -47,14 +47,12 @@ There is one program:
 ```bash
 easyebl                  # the hardware configured in Hardware → Configure… (saved per user)
 easyebl --sim            # this session on simulators only (the saved configuration is kept)
-easyebl --open sem,eds   # also show these: sem, eds, microscope, litho (tabs), vector, gds, dose,
-                         # alignment, raster, hal (windows)
-easyebl --classic        # the small menu window and one window per subsystem (the former layout)
+easyebl --open litho     # bring this forward: sem, eds, litho (tabs) or microscope (side bar)
 python -m easyebl        # the same as easyebl
 ```
 
-It opens the **main window** (laid out for a 1920 × 1080 screen, one font size throughout) and puts
-an **icon in the system tray**:
+It opens the **main window** (laid out for a 1920 × 1080 screen, one font size throughout) – the one
+window of the program, which runs in the foreground:
 
 * **Centre – tabs SEM, EDS, Lithography**: the SEM image, the EDS electron image and spectrum,
   the lithography stage plot – each with its tools at the top (icon, text under it):
@@ -77,31 +75,27 @@ an **icon in the system tray**:
   Auto C/B; drag = beam shift, wheel = zoom, a click answers a marker pick; its data bar shows the
   total magnification and the scale bar.  A marker pick asked by the lithography brings it forward,
   outlined in magenta – click, Confirm or Cancel here or in the SEM tab); the **EDS live spectrum**.
-* **Menus**: *easyEBL*, *Hardware*, *Panels* (show / hide the side bars, reset the layout), *Windows*
-  (a separate SEM or Microscope window) – and the active tab's own menus.  A tab's keyboard
-  shortcuts (F5, Ctrl+S, …) work only while it is shown.
+* **Menus**: *File* (the active tab's file actions, e.g. the EDS's Open / Save; **Shut down easyEBL**,
+  Ctrl+Q) · *Hardware* (Configure…, Reconnect all) · the active tab's own menus (e.g. the
+  Lithography's Schedule, Step, Calibration, View, Stage) · *Panels* (show / hide the side bars, reset
+  the layout) · *Help* (About easyEBL).  A tab's keyboard shortcuts (F5, Ctrl+S, …) work only while it
+  is shown.
 * **Esc stops everything**: every stage axis, a running exposure schedule (and a marker pick), EDS
   acquisitions, a running auto function and the SEM scan.
 * The side bars can be moved, floated and resized; the layout is saved in
-  `%APPDATA%\easyEBL\mainwindow.ini`.  **Closing the main window shuts easyEBL down** (it asks first;
-  the hardware is disconnected).  With `easyebl --background` (or `--tray`) closing hides it to the tray
-  instead and easyEBL keeps running; *easyEBL → Hide to tray* always just hides it.
+  `%APPDATA%\easyEBL\mainwindow.ini`.  **Closing the window shuts easyEBL down** (it asks first;
+  the hardware is disconnected).
 * The status bar has a light for the scan DAQ, the EDS pulse processor and the microscope:
   connected (green), simulated (blue), waiting or needing attention (orange) or failed (red; the
   tooltip says why).
 
-The **classic menu window** (*easyEBL → Classic menu window*, the tray menu, or `--classic`) shows
-the same status, one line per device, and opens each subsystem in a window of its own:
-
-* **Open** starts a subsystem: SEM imaging, EDS, Microscope (column & stage) and Lithography.
-  A subsystem whose hardware is missing is greyed out (the tooltip says why).
 * **Hardware → Configure…** chooses each device and its address: NI-DAQmx device name or the
   simulator, wiring preset or a DAQConfig JSON, scan orientation (invert / swap X/Y), sample clock,
   buffer latency, video input mode; DP5 (USB), its mock device or none; the microscope's serial port (listed), the
   simulator or none, and the baud rate.  *Apply & reconnect* saves it to
   `%APPDATA%\easyEBL\system.json` and reconnects; *All simulators* fills in the simulators.
   **Reconnect all** reopens everything with the same settings.
-* **Scan monitor** (*View → Scan monitor*): the X/Y deflection as an oscilloscope in XY mode with
+* **Beam monitor** (the left side bar): the X/Y deflection as an oscilloscope in XY mode with
   persistence, over the full ±10 V field, in the same image coordinates as the other windows (the
   scan orientation's invert X/Y and swap X/Y are undone).  A bright dot always marks where the beam
   is now (solid: beam on, hollow ring: blanked), following the samples the DAQ has actually generated
@@ -109,16 +103,10 @@ the same status, one line per device, and opens each subsystem in a window of it
   blanked samples are not plotted.  Resolution (default 256²) and persistence time (∞ = until
   *Clear*) are saved in `system.json`.  The stream hands samples off through a lock-free ring buffer
   (decimated or skipped when full, never waited for); binning and drawing run in their own thread.
-* **The hardware stays connected in the background.**  All subsystems share the one backend (one
-  DAQ manager, one DP5, one serial port), so SEM and EDS share the DAQ through the HAL lease.
-  Closing a subsystem window, or the classic menu window, does not disconnect anything (the main
-  window does, unless `--background`).
-* **Tray icon:** click it to bring the window back; right-click it for the menu, any subsystem,
-  *Hardware…* and **Shut down easyEBL**, which closes every window and disconnects all hardware.
-  The icon shows a coloured dot when a device needs attention.
+* All subsystems share the one backend (one DAQ manager, one DP5, one serial port), so SEM and
+  EDS share the DAQ through the HAL lease.
 * Only one easyEBL runs per user: starting it again brings the running window to the front (and
-  shows what `--open` names).  EDS and Lithography exist once (the tabs); the SEM and the
-  microscope can also have a window of their own (*Windows* menu).
+  shows what `--open` names).
 
 In VS Code select the `.venv` interpreter (*Python: Select Interpreter*) and pick *easyEBL* or
 *easyEBL (simulators)* in *Run and Debug* (F5).
@@ -667,7 +655,7 @@ tests/        unit/, system/ (simulator pipelines), gui/ (offscreen Qt); data/ r
   litho/      dose maths, geometry, fills, VectorScanCompiler, LithoWriter, GDS import;
               coords (SCS/WCS/BCS), schedule, fracture (importer), runner, settings, demo; module/ (window)
   gui/        the DAQ output (scan) monitor widget
-  app/        the easyEBL program: SystemConfig, SystemBackend (all hardware), main window, menu window + tray
+  app/        the easyEBL program: SystemConfig, SystemBackend (all hardware), main window, hardware dialog
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the design rationale (timing model,

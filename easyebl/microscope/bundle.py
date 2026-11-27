@@ -26,9 +26,6 @@ class MicroscopeBundle:
         #: auto focus / stigmation (:class:`~easyebl.imaging.autotune.AutoTuner`), set by the backend
         #: when it has both the imaging engine and the microscope
         self.autotune = None
-        #: ``opener()`` shows the microscope window (set by the easyEBL app, which manages the windows)
-        self.opener = None
-        self._window = None
 
     @property
     def connected(self) -> bool:
@@ -55,34 +52,11 @@ class MicroscopeBundle:
                                       sim_backend=sim_backend, notify=notify)
         return self.field_scale
 
-    def window(self, parent=None):
-        """A microscope window of its own (when no app manages the windows)."""
-        if self.link is None:
-            return None
-        if self._window is None:
-            from .gui import MicroscopeWindow
-
-            self._window = MicroscopeWindow(self.link, self.sem, self.stage, self.settings, owns_link=False)
-            self._window.resize(1200, 860)
-        return self._window
-
-    def show_window(self):
-        if self.opener is not None:
-            return self.opener()
-        w = self.window()
-        if w is not None:
-            w.show()
-            w.raise_()
-            w.activateWindow()
-        return w
-
     def close(self) -> None:
         if self.autotune is not None:
             self.autotune.close()
         if self.field_scale is not None:
             self.field_scale.close()
-        if self._window is not None:
-            self._window.close()
         if self.link is not None:
             try:
                 self.settings.save()

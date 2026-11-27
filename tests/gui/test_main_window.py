@@ -17,12 +17,12 @@ def ui(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(QtWidgets.QApplication, "quit", lambda *a: None)
     cfg = SystemConfig()
     cfg.path = str(tmp_path / "system.json")
-    app = EasyEBLApp(cfg, eds_settings_path=str(tmp_path / "eds.json"), microscope_delay_s=0.01, use_tray=False,
-                     confirm=lambda title, text: True, main_window=True, layout_path=str(tmp_path / "main.ini"))
+    app = EasyEBLApp(cfg, eds_settings_path=str(tmp_path / "eds.json"), microscope_delay_s=0.01,
+                     confirm=lambda title, text: True, layout_path=str(tmp_path / "main.ini"))
     app.start()
     yield app
     if not app.closing:
-        lw = app.main.litho if app.main is not None else None
+        lw = app.main.litho
         if lw is not None:
             lw.modified = False  # no "discard changes?" question at the end
         app.shutdown(ask=False)
@@ -35,7 +35,7 @@ def _keys(action):
 
 def test_the_main_window_holds_every_subsystem(ui):
     mw = ui.main
-    assert mw.isVisible() and not ui.menu.isVisible()  # the main window replaces the menu window
+    assert mw.isVisible() and not hasattr(ui, "menu") and not hasattr(ui, "tray")  # the one window
     assert [mw.tabs.tabText(i) for i in range(mw.tabs.count())] == ["SEM", "EDS", "Lithography"]
     assert mw.sem is not None and mw.eds is not None and mw.litho is not None and mw.mic is not None
     assert [mw.left_tabs.tabText(i) for i in range(mw.left_tabs.count())] == ["Column", "Stage"]
@@ -66,14 +66,17 @@ def test_the_right_bar_menus_and_shortcuts_follow_the_tab(ui):
     visible = lambda: [a.text().replace("&", "") for a in mw.menuBar().actions() if a.isVisible()]  # noqa: E731
     mw.show_tab("litho")
     assert mw.right_stack.currentWidget() is mw.hosts["litho"].right
-    assert "Schedule" in visible() and "File" not in visible()
+    assert "Schedule" in visible() and visible().count("File") == 1
     assert _keys(lw.a_save) == ["Ctrl+S"] and _keys(lw.a_run) == ["F5"]
     eds_save = next(a for m in mw.hosts["eds"].menus for a in m.actions() if a.text().startswith("Save selected"))
     assert eds_save.shortcuts() == []  # Ctrl+S is the lithography's while its tab is shown
     sem_f5 = [s for s in mw.hosts["sem"].shortcuts if s.key().toString() == "F5"]
     assert sem_f5 and not sem_f5[0].isEnabled()
+    file_texts = lambda: [a.text() for a in mw.m_file.actions() if a.isVisible() and a.text()]  # noqa: E731
+    assert not any(t.startswith("Save selected") for t in file_texts())
     mw.show_tab("eds")
-    assert "File" in visible() and "Schedule" not in visible()
+    assert "Schedule" not in visible() and visible().count("File") == 1  # its File items: in the program's
+    assert any(t.startswith("Save selected") for t in file_texts()) and file_texts()[-1] == "Shut down easyEBL…"
     assert eds_save.shortcuts() and lw.a_save.shortcuts() == [] and lw.a_run.shortcuts() == []
     mw.show_tab("sem")
     assert sem_f5[0].isEnabled() and lw.a_run.shortcuts() == []
@@ -104,18 +107,25 @@ def test_esc_stops_everything(ui, qtbot):
     assert "STOP (Esc): stage, lithography, EDS, SEM scan" in mw.log.toPlainText()
 
 
-def test_open_shows_tabs_and_separate_windows_stay_available(ui):
+def test_open_shows_tabs_and_the_menu_bar(ui):
     mw = ui.main
     assert ui.open("eds") is mw.eds and mw.tabs.currentIndex() == 1
     assert ui.open("litho") is mw.litho and mw.tabs.currentIndex() == 2
     assert ui.open("microscope") is mw.mic
-    sem2 = ui.open_window("sem")  # the SEM can also have a window of its own
-    assert sem2 is not None and sem2 is not mw.sem and ui.windows["sem"] is sem2
-    titles = [a.text() for a in mw.m_windows.actions()]
-    assert "SEM imaging (separate window)" in titles and not any(t.startswith("EDS") for t in titles)
-    sem2.close()
-    ui.show_classic_menu()
-    assert ui.menu.isVisible()
+    for gone in ("open_window", "windows", "show_classic_menu", "menu", "tray"):
+        assert not hasattr(ui, gone), gone
+    # File · Hardware · [the tab's menus] · Panels · Help
+    bar = [a.text().replace("&", "") for a in mw.menuBar().actions() if a.isVisible()]
+    assert bar[:2] == ["File", "Hardware"] and bar[-2:] == ["Panels", "Help"]
+    assert bar[2:-2] == ["Schedule", "Step", "Calibration", "View", "Stage"]  # the Lithography tab's
+    mw.show_tab("sem")
+    bar = [a.text().replace("&", "") for a in mw.menuBar().actions() if a.isVisible()]
+    assert "Windows" not in bar and "easyEBL" not in bar
+    assert mw.a_shutdown.shortcut().toString() == "Ctrl+Q"
+    assert "easyEBL" in mw.about_text() and "Scan DAQ" in mw.about_text()
+    # no separate windows from inside the tabs either
+    texts = [a.text() for a in mw.findChildren(QtGui.QAction)]
+    assert "Microscope…" not in texts and not hasattr(ui.backend.microscope, "show_window")
 
 
 def test_marker_picks_in_the_small_sem_view(ui):
@@ -265,19 +275,10 @@ def test_reconnect_rebuilds_the_subsystems(ui):
     assert sum(1 for a in mw.menuBar().actions() if a.text() == "&Schedule") == 1
 
 
-def test_closing_shuts_down_unless_in_the_background(ui, qtbot):
-    """By default closing the main window shuts easyEBL down (it asks first: declined, the window
-    stays); with background=True (--background) it hides and easyEBL keeps running in the tray."""
+def test_closing_the_window_shuts_easyebl_down(ui, qtbot):
+    """easyEBL runs in the foreground: closing the window shuts it down (it asks first: declined,
+    the window stays)."""
     mw = ui.main
-    ui.background = True
-    mw.close()
-    assert (not mw.isVisible() or mw.isMinimized()) and not ui.closing
-    ui.show_menu()
-    assert mw.isVisible()
-    mw.hide_to_tray()  # the easyEBL menu's Hide to tray: always just hides
-    assert not ui.closing
-    ui.show_menu()
-    ui.background = False
     ui.confirm = lambda title, text: False  # "Shut down easyEBL?" – no
     mw.close()
     qtbot.wait(100)
@@ -285,6 +286,7 @@ def test_closing_shuts_down_unless_in_the_background(ui, qtbot):
     ui.confirm = lambda title, text: True
     mw.close()
     qtbot.waitUntil(lambda: ui.closing, timeout=5000)
+    assert not ui.backend.started
 
 
 def test_auto_cb_is_the_sems_abc_with_the_scan_handed_back(ui, qtbot):

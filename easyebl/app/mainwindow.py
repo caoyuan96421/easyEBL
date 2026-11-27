@@ -14,14 +14,17 @@
   live spectrum.
 * **Status bar** – a light per piece of hardware (green connected, blue simulator, orange waiting
   or check, red failed).
-* **Menus** – the active subsystem's appear next to the program's own; its keyboard shortcuts work
-  only while its tab is shown.  **Esc stops everything**: the stage (every axis), a running
+* **Menus** – *File*, *Hardware*, the active subsystem's menus (its *File* items in the program's
+  *File*), *Panels*, *Help*; a subsystem's keyboard shortcuts work only while its tab is shown.  **Esc stops everything**: the stage (every axis), a running
   exposure schedule, EDS acquisitions, the auto functions and the SEM scan.
 
 The subsystem windows are built as before (:class:`~easyebl.imaging.sem.window.SEMWindow`,
 :class:`~easyebl.eds.gui.window.EDSWindow`, :class:`~easyebl.litho.module.LithoWindow`,
 :class:`~easyebl.microscope.gui.MicroscopeWindow`) and their panels moved in here: they keep their
-logic, and the separate windows stay available (*Windows* menu, the classic menu window).
+logic.  The program runs in the foreground: closing this window shuts easyEBL down.
+
+Menu bar: *File* (the active tab's file actions, then Shut down) · *Hardware* · the active tab's
+own menus · *Panels* · *Help*.
 """
 from __future__ import annotations
 
@@ -107,6 +110,7 @@ class ModuleHost:
         self.shortcuts: list = []  # window-wide QShortcut
         self.action_keys: dict = {}  # QAction -> [QKeySequence]
         self.moved: list = []  # widgets moved into the main window (deleted with the host)
+        self.file_actions: list = []  # its File menu's actions, in the program's File menu
 
     def take_menus(self) -> None:
         mb = self.window.menuBar()
@@ -151,6 +155,8 @@ class ModuleHost:
     def set_active(self, on: bool) -> None:
         for m in self.menus:
             m.menuAction().setVisible(on)
+        for a in self.file_actions:
+            a.setVisible(on)
         for s in self.shortcuts:
             s.setEnabled(on)
         for a, keys in self.action_keys.items():
@@ -499,7 +505,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mic = None  # MicroscopeWindow (its panels are in the left dock)
         self.sem_mini: SEMMiniView | None = None
         self.live_spectrum = None
-        self._hint_shown = False
         self._restored = False
 
         # --- centre: one tab per subsystem (each with its own tools at the top)
@@ -579,31 +584,41 @@ class MainWindow(QtWidgets.QMainWindow):
         return d
 
     def _build_menus(self):
+        """File · Hardware · [the active tab's menus] · Panels · Help."""
         mb = self.menuBar()
-        m = mb.addMenu("&easyEBL")
-        m.addAction("Hide to tray", self.hide_to_tray)
-        m.addAction("Classic menu window", self.app.show_classic_menu)
-        m.addSeparator()
-        m.addAction("Shut down easyEBL…", self.app.shutdown)
+        self.m_file = mb.addMenu("&File")
+        self._file_end = self.m_file.addSeparator()  # the active tab's file actions go above
+        a = self.m_file.addAction("Shut down easyEBL…", self.app.shutdown)
+        a.setShortcut(QtGui.QKeySequence("Ctrl+Q"))
+        self.a_shutdown = a
         m = mb.addMenu("&Hardware")
         m.addAction("Configure…", self.app.configure)
         m.addAction("Reconnect all", self.app.reconnect)
+        self.m_hardware = m
         self.m_panels = mb.addMenu("&Panels")
         for d in (self.left_dock, self.right_dock, self.bottom_dock):
             self.m_panels.addAction(d.toggleViewAction())
         self.m_panels.addSeparator()
         self.m_panels.addAction("Reset the layout", self.reset_layout)
-        self.m_windows = mb.addMenu("&Windows")
-        self.m_windows.setToolTipsVisible(True)
-        self._window_actions = []
-        from .gui import SUBSYSTEMS
+        self.m_help = mb.addMenu("&Help")
+        self.m_help.addAction("About easyEBL", self.about)
 
-        for sub in SUBSYSTEMS:
-            if sub.key in ("eds", "litho"):
-                continue  # once only: they are the tabs
-            a = self.m_windows.addAction(sub.title + " (separate window)", lambda k=sub.key: self.app.open_window(k))
-            a.setData(sub.key)
-            self._window_actions.append(a)
+    def about_text(self) -> str:
+        from .backend import COMPONENTS
+
+        try:
+            from importlib.metadata import version
+
+            ver = version("easyebl")
+        except Exception:  # noqa: BLE001
+            ver = "?"
+        st = self.app.backend.status()
+        rows = "".join(f"<br>{COMPONENTS[k]}: {s.text}" for k, s in st.items())
+        return (f"<b>easyEBL {ver}</b><br>SEM imaging, EDS, microscope control and e-beam lithography."
+                f"<br><br>Configuration: {self.app.config.path or '(not saved)'}{rows}")
+
+    def about(self) -> None:
+        QtWidgets.QMessageBox.about(self, "About easyEBL", self.about_text())
 
     def _build_status(self):
         sb = self.statusBar()
@@ -634,10 +649,6 @@ class MainWindow(QtWidgets.QMainWindow):
             light.setProperty("state", s.state)
             for w in (lab, light):
                 w.setToolTip(f"{COMPONENTS[key]}: {s.text}")
-        for a in self._window_actions:
-            ok, why = self.app.available(a.data(), status)
-            a.setEnabled(ok)
-            a.setToolTip(why)
 
     @staticmethod
     def _light_style(state: str) -> str:
@@ -710,6 +721,15 @@ class MainWindow(QtWidgets.QMainWindow):
         host.collect_shortcuts()
         before = self.m_panels.menuAction()
         for m in host.menus:
+            if m.title().replace("&", "") == "File":  # into the program's File menu
+                host.file_actions = [a for a in m.actions() if a.isVisible()]
+                for a in host.file_actions:
+                    self.m_file.insertAction(self._file_end, a)
+                sep = QtGui.QAction(self.m_file)
+                sep.setSeparator(True)
+                self.m_file.insertAction(self._file_end, sep)
+                host.file_actions.append(sep)
+                continue
             self.menuBar().insertAction(before, m.menuAction())
         if host.right is None:
             host.right = _placeholder("")
@@ -730,9 +750,7 @@ class MainWindow(QtWidgets.QMainWindow):
         w = host.window
         host.right = _take_dock(w, "controls")
         host.log = _take_dock(w, "messages")
-        for a in (w.a_fullscreen, getattr(w, "a_mic", None)):  # a tab is not full screen; the column is here
-            if a is not None:
-                a.setVisible(False)
+        w.a_fullscreen.setVisible(False)  # a tab is not full screen
 
     def _take_eds(self, host: ModuleHost) -> None:
         w = host.window
@@ -880,6 +898,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for h in self.hosts.values():
             for m in h.menus:
                 self.menuBar().removeAction(m.menuAction())
+            for a in h.file_actions:
+                self.m_file.removeAction(a)
             for w in h.moved:
                 w.deleteLater()
             if h.window is not None:
@@ -1077,24 +1097,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ closing
     def closeEvent(self, ev):  # noqa: N802
-        """Closing shuts easyEBL down (it asks first); with ``background`` (``--background``) it hides
-        the window instead and the backend keeps running in the tray."""
+        """Closing shuts easyEBL down (it asks first; declined: the window stays)."""
         self.save_layout()
         if self.app.closing:
             return super().closeEvent(ev)
         ev.ignore()
-        if not getattr(self.app, "background", False):
-            QtCore.QTimer.singleShot(0, self.app.shutdown)  # asks; declined: the window stays
-            return
-        self.hide_to_tray()
-
-    def hide_to_tray(self) -> None:
-        """Hide the window; easyEBL keeps running in the tray (no tray: minimised)."""
-        if not self.app.has_tray:
-            self.showMinimized()
-            return
-        self.hide()
-        if not self._hint_shown:
-            self._hint_shown = True
-            self.app.tray_message("easyEBL is still running. Click the tray icon to bring the window back, "
-                                  "right-click it to shut down.")
+        QtCore.QTimer.singleShot(0, self.app.shutdown)

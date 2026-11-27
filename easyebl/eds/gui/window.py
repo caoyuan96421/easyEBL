@@ -799,9 +799,6 @@ class EDSWindow(QtWidgets.QMainWindow):
         m = mb.addMenu("&Tools")
         m.addAction("Energy calibration…", self.open_calibration)
         m.addAction("Pulse processor…", self.open_processor)
-        if self.bundle is not None and self.bundle.connected:
-            m.addSeparator()
-            m.addAction("Microscope…", self.bundle.show_window)
 
     def _make_status(self):
         sb = self.statusBar()
