@@ -231,7 +231,8 @@ class SEMWindow(QtWidgets.QMainWindow):
             b.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
         self.a_as = act("stig", "Auto stigmation", self.auto_stigmate, "our auto stigmation: stigmator X, then Y")
         self.a_aga = act("gun", "Auto gun align", self.auto_gun_alignment,
-                         "the SEM's automatic gun alignment (asks first; holds the port until it ends)")
+                         "the SEM's automatic gun alignment (AGA): the scan goes back to the SEM while it runs, "
+                         "then the live scan resumes")
         self.a_acb = act("acb", "Auto C/B", self.auto_contrast_brightness,
                          "the SEM's own auto brightness / contrast (ABC): the scan goes back to the SEM "
                          "while it runs, then the live scan resumes")
@@ -259,10 +260,6 @@ class SEMWindow(QtWidgets.QMainWindow):
             self.a_mic.setObjectName("microscope_window")
         self.tune_actions = (self.a_af, self.a_as)
 
-    #: the Auto gun alignment question (tests: replaced)
-    def confirm(self, text: str) -> bool:
-        return QtWidgets.QMessageBox.question(self, "easyEBL SEM", text) == QtWidgets.QMessageBox.Yes
-
     def _busy(self, title: str, text: str, **kw):
         """The modal window of an automatic function (the program waits until it closes)."""
         from ...gui.busy import BusyDialog
@@ -278,43 +275,32 @@ class SEMWindow(QtWidgets.QMainWindow):
             self.busy = None
 
     def auto_gun_alignment(self):
-        """The SEM's automatic gun alignment (asks first): a modal window until the SEM has finished
-        (it answers ``AGA ON`` then; it cannot be interrupted).  Returns the future (None: not started)."""
-        if not self.confirm("Run the SEM's automatic gun alignment? It holds the port until the SEM has finished."):
-            return None
-        try:
-            fut = self.mic.alignment("gun")
-        except Exception as e:  # noqa: BLE001
-            self.notify(f"auto gun alignment: {e}")
-            return None
-        self.notify("auto gun alignment started")
-        self._busy("Auto gun alignment", "The SEM's automatic gun alignment is running – easyEBL waits until "
-                   "the SEM has finished (it cannot be interrupted).")
-        if hasattr(fut, "add_done_callback"):
-            fut.add_done_callback(lambda f: self.autoFinished.emit(
-                "aga", "auto gun alignment: " + ("cancelled" if f.cancelled() else "done" if f.exception() is None
-                                                 else f"failed – {f.exception()}"),
-                not f.cancelled() and f.exception() is None))
-        return fut
+        """The SEM's automatic gun alignment (``AGA ON``), like Auto C/B: our scan stops (the SEM gets
+        its scan back), AGA runs until the SEM answers, then a live scan resumes.  Returns the
+        thread (None: not started)."""
+        return self._sem_routine(
+            "aga", "Auto gun alignment", lambda: self.mic.alignment("gun"),
+            "The SEM's automatic gun alignment is running on the SEM's own scan – easyEBL waits until the SEM "
+            "has finished.", "Esc: the scan stays stopped afterwards")
 
     def _auto_finished(self, kind: str, msg: str, ok: bool) -> None:
         """GUI thread: an automatic function of the SEM ended."""
         self._end_busy(ok)
         self.notify(msg)
-        if kind == "abc":
+        if kind in ("abc", "aga"):  # the SEM's own routine ended: our scan again
             st = self._abc or {}
             self._abc = None
             if st.get("resume"):
                 try:
                     self.engine.run()
                 except Exception as e:  # noqa: BLE001
-                    self.notify(f"Auto C/B: the live scan did not restart: {e}")
-            elif ok and not st.get("esc"):
+                    self.notify(f"{st.get('title', kind)}: the live scan did not restart: {e}")
+            elif kind == "abc" and ok and not st.get("esc"):
                 try:
                     self.engine.single()  # an image for Auto levels
                 except Exception as e:  # noqa: BLE001
                     self.notify(f"Auto C/B: no image for Auto levels: {e}")
-            if ok and not st.get("esc"):
+            if kind == "abc" and ok and not st.get("esc"):
                 self._acb_pending = True  # Auto levels (the Image group) on the next image
 
     def _tune_busy(self, ev: dict) -> None:
@@ -340,7 +326,7 @@ class SEMWindow(QtWidgets.QMainWindow):
         ok = t is not None and t.available and not t.busy
         for x in self.tune_actions:
             x.setEnabled(ok)
-        self.a_aga.setEnabled(bool(getattr(self.mic, "connected", False)))
+        self.a_aga.setEnabled(self.abc_available)
         self.a_acb.setEnabled(self.abc_available)
 
     def _make_status(self):
@@ -435,56 +421,62 @@ class SEMWindow(QtWidgets.QMainWindow):
     def levels(self):
         return self.cb.levels()
 
-    # ------------------------------------------------------------- the SEM's ABC
+    # ------------------------------------------------------------- the SEM's ABC and AGA
     @property
     def abc_available(self) -> bool:
-        return bool(getattr(self.mic, "connected", False)) and hasattr(self.mic, "auto_brightness_contrast") \
-            and self._abc is None
+        """A routine of the SEM's own (ABC, AGA) can start: the microscope connected, none running."""
+        return bool(getattr(self.mic, "connected", False)) and self._abc is None
 
     @property
     def abc_running(self) -> bool:
+        """A routine of the SEM's own (ABC or AGA) is running."""
         return self._abc is not None
 
     def auto_contrast_brightness(self):
-        """The SEM's own auto brightness / contrast (``ABC ON``).  The SEM needs its own scan for it:
-        our scan stops (the engine gives the scan back to the SEM), ABC runs – the S-3000 answers
-        ``ABC ON`` when it has finished, which ends the request – CONT / BRT are read back, and a
-        live scan resumes (unless stopped meanwhile, e.g. Esc).  Returns the thread (None: not
-        started)."""
+        """The SEM's own auto brightness / contrast (``ABC ON``), then Auto levels (the Image group).
+        Returns the thread (None: not started); see :meth:`_sem_routine`."""
+        return self._sem_routine(
+            "abc", "Auto C/B", lambda: self.mic.auto_brightness_contrast(),
+            "The SEM's auto brightness / contrast (ABC) is running on the SEM's own scan – easyEBL waits until "
+            "the SEM has finished, then Auto levels.", "Esc: the scan stays stopped after ABC (no Auto levels)")
+
+    def _sem_routine(self, kind: str, title: str, request, text: str, esc_text: str):
+        """A routine of the SEM's own needs the SEM's scan: our scan stops (the engine gives the scan
+        back to the SEM), *request* is sent – the S-3000 answers it when the routine has finished,
+        which ends the request (at most 240 s) – and a live scan resumes (unless Esc meanwhile).  A
+        modal window meanwhile; the SEM's routine cannot be interrupted."""
         import threading
 
         if not self.abc_available:
-            self.notify("Auto C/B (ABC) needs the microscope's remote control" if self._abc is None
-                        else "Auto C/B is already running")
+            self.notify(f"{title} needs the microscope's remote control" if self._abc is None
+                        else f"{title}: the SEM's {self._abc.get('title', 'routine')} is still running")
             return None
         st = self.engine.state
-        self._abc = {"resume": st in (EngineState.LIVE, EngineState.STARTING, EngineState.FREEZING), "esc": False}
-        self.notify("Auto C/B: the SEM's ABC – the scan goes back to the SEM until it has finished")
-        self._busy("Auto C/B", "The SEM's auto brightness / contrast (ABC) is running on the SEM's own scan – "
-                   "easyEBL waits until the SEM has finished, then Auto levels.",
-                   esc=self.cancel_abc_resume, esc_text="Esc: the scan stays stopped after ABC (no Auto levels)")
+        self._abc = {"kind": kind, "title": title, "esc": False,
+                     "resume": st in (EngineState.LIVE, EngineState.STARTING, EngineState.FREEZING)}
+        self.notify(f"{title}: the scan goes back to the SEM until it has finished")
+        self._busy(title, text, esc=self.cancel_abc_resume, esc_text=esc_text)
 
         def job():
-            msg, ok = "Auto C/B: done", True
+            msg, ok = f"{title}: done", True
             try:
                 self.engine.stop()
                 if hasattr(self.engine, "wait_idle"):
                     self.engine.wait_idle(10.0)
-                fut = self.mic.auto_brightness_contrast()
-                got = fut.result(240.0)
+                got = request().result(240.0)
                 if isinstance(got, dict) and got:
                     msg += " – " + ", ".join(f"{k} {v}" for k, v in got.items())
             except Exception as e:  # noqa: BLE001
-                msg, ok = f"Auto C/B failed: {e}", False
-            self.autoFinished.emit("abc", msg, ok)
+                msg, ok = f"{title} failed: {e}", False
+            self.autoFinished.emit(kind, msg, ok)
 
-        t = threading.Thread(target=job, name="easyebl-sem-abc", daemon=True)
+        t = threading.Thread(target=job, name=f"easyebl-sem-{kind}", daemon=True)
         self._abc_thread = t
         t.start()
         return t
 
     def cancel_abc_resume(self) -> None:
-        """Esc during ABC: the SEM finishes its ABC, but our live scan does not restart."""
+        """Esc during ABC / AGA: the SEM finishes its routine, but our live scan does not restart."""
         if self._abc is not None:
             self._abc["resume"] = False
             self._abc["esc"] = True

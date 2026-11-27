@@ -59,7 +59,7 @@ an **icon in the system tray**:
 * **Centre – tabs SEM, EDS, Lithography**: the SEM image, the EDS electron image and spectrum,
   the lithography stage plot – each with its tools at the top (icon, text under it):
   - *SEM*: Run / Stop, Single, Capture, Full FoV, Autofocus (fine / coarse / with stigmation in its
-    menu), Auto stigmation, Auto gun align (asks first), **Auto C/B** (the SEM's ABC), Crosshair, Scan
+    menu), Auto stigmation, Auto gun align (the SEM's AGA), **Auto C/B** (the SEM's ABC), Crosshair, Scan
     line, Field inset, Advanced…, Full screen;
   - *EDS*: the electron-image tools Pan, Point, Rectangle, Ellipse, Line, Map area;
   - *Lithography*: Zoom to pattern, Move pattern, Move stage, Color by Field, Color by Dose,
@@ -174,6 +174,9 @@ Open → *SEM imaging*.  The window looks and works like a commercial SEM screen
   then contrast / brightness are read back, a live scan resumes (else one Single scan is taken) and **Auto
   levels** (the Image group) runs on the first image.  Esc meanwhile: the SEM finishes its ABC, our scan
   stays stopped and Auto levels is skipped.
+* **Auto gun align** runs the SEM's AGA the same way (no question first): our scan stops, the SEM has its scan
+  until it answers `AGA ON`, then a live scan resumes (no Auto levels).  The column panel's *Auto gun
+  alignment* button does the same in the main window.
 * **Auto C/B, Auto gun align, Autofocus and Auto stigmation wait in a modal window**: the program is blocked
   until they end, the window shows the progress and closes by itself.  Our autofocus / stigmation have
   *Cancel* (also Esc: the start values are set again); the SEM's own routines (ABC, AGA) cannot be

@@ -326,12 +326,22 @@ def test_auto_cb_is_the_sems_abc_with_the_scan_handed_back(ui, qtbot):
 
 def test_auto_gun_alignment_and_auto_focus_wait_in_a_modal_window(ui, qtbot):
     sem = ui.main.sem
-    sem.confirm = lambda text: True
-    fut = sem.auto_gun_alignment()
+    eng, mic = sem.engine, sem.mic
+    calls = []
+    real = mic.alignment
+    mic.alignment = lambda kind: (calls.append((kind, eng.state.value)), real(kind))[1]
+    eng.run()
+    qtbot.waitUntil(lambda: eng.state.value == "live", timeout=10000)
+    t = ui.main.mic.b_aga  # the column's button: the same routine (no question)
+    t.click()
     dlg = sem.busy
-    assert fut is not None and dlg.isModal() and dlg.b_cancel is None
+    assert dlg is not None and dlg.isModal() and dlg.b_cancel is None and sem.abc_running
+    assert not sem.abc_available  # one SEM routine at a time (ABC waits)
     qtbot.waitUntil(lambda: dlg.is_done, timeout=30000)
-    assert sem.busy is None and "auto gun alignment: done" in sem.log.toPlainText()
+    assert calls and calls[0][0] == "gun" and calls[0][1] in ("idle", "frozen")  # the SEM had its scan
+    assert sem.busy is None and "Auto gun alignment: done" in sem.log.toPlainText()
+    qtbot.waitUntil(lambda: eng.state.value == "live", timeout=10000)  # our scan again
+    eng.stop()
     # our auto focus: progress, Cancel (the start values again)
     qtbot.waitUntil(lambda: sem.autotune is not None and sem.autotune.available, timeout=10000)
     fut = sem.auto_focus("fine")

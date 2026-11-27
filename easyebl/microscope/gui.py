@@ -253,7 +253,9 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         b.clicked.connect(self.open_presets)
         self.b_aga = QtWidgets.QPushButton("Auto gun alignment")
         self.b_aga.setToolTip("AGA ON: the SEM's automatic gun alignment (holds the port until it ends)")
-        self.b_aga.clicked.connect(lambda: self._confirmed(
+        #: what the button runs instead (the main window: the SEM tab's, which hands the scan to the SEM)
+        self.aga_handler = None
+        self.b_aga.clicked.connect(lambda: self.aga_handler() if self.aga_handler is not None else self._confirmed(
             "Run the SEM's automatic gun alignment? It takes the port until the SEM has finished.",
             lambda: sem.alignment("gun"), "auto gun alignment"))
         f.addWidget(QtWidgets.QLabel("Coarse"), 0, 0)

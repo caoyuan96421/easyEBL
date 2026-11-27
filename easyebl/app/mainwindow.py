@@ -664,6 +664,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._install(key, title, win, why)
         self._install_microscope(st)
         self._install_monitor()
+        if self.mic is not None and self.sem is not None:  # the column's AGA: the SEM tab's (scan handed back)
+            self.mic.aga_handler = self.sem.auto_gun_alignment
         if self.hosts.get("sem") and self.hosts["sem"].window is not None:
             self.sem_mini = SEMMiniView(self.hosts["sem"].window)
             self.sem_mini.on_pick = self._pick_started
