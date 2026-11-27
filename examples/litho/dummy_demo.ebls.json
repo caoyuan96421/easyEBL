@@ -1,8 +1,7 @@
 {
  "format": "easyebl-schedule",
- "version": 4,
+ "version": 5,
  "name": "dummy demo",
- "wd_mm": 15.0,
  "settings": {
   "fill_direction": "x",
   "serpentine": false,
@@ -21,8 +20,9 @@
    "note": "",
    "height": {
     "mode": "none",
-    "value_um": null,
-    "points": []
+    "wd_mm": null,
+    "points": [],
+    "z_um": null
    }
   }
  ],
@@ -32,7 +32,7 @@
    "label": "",
    "enabled": true,
    "preset": "",
-   "magnification": 1000,
+   "field_size": "250 \u00b5m",
    "current_pa": 100.0
   },
   {
@@ -44,31 +44,12 @@
     "pixels": 5000,
     "frames": 1,
     "max_rms_um": 0.05,
-    "position": "Calibration grid",
+    "position": "",
     "filter_periods": 3.0,
     "manual_focus": true,
     "focus_magnification": 10000
    },
    "reuse": false
-  },
-  {
-   "type": "field_correction",
-   "label": "",
-   "enabled": true,
-   "config": {
-    "position": "Faraday cup",
-    "pattern": "grid",
-    "step_fraction": 0.3,
-    "image_fraction": 0.8,
-    "image_px": 256,
-    "frames": 1,
-    "settle_s": 0.5,
-    "max_residual_px": 1.5,
-    "denoise_px": 2.5,
-    "background_fraction": 0.125,
-    "whitening": 0.5
-   },
-   "notes": ""
   },
   {
    "type": "exposure",
@@ -102,7 +83,8 @@
    "global_markers": [],
    "local_align": false,
    "local_markers": [],
-   "view_um": 10.0
+   "view_um": 10.0,
+   "align_tolerance_um": 0.5
   },
   {
    "type": "exposure",
@@ -140,7 +122,8 @@
    ],
    "local_align": false,
    "local_markers": [],
-   "view_um": 10.0
+   "view_um": 10.0,
+   "align_tolerance_um": 0.5
   }
  ]
 }

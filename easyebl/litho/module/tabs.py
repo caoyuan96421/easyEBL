@@ -5,9 +5,8 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..height import height_um
-from ..schedule import (KEEP_AS_IS, MAGNIFICATIONS, ORDERS, BeamCalibrationStep, ColumnSetting, Exposure,
-                        FieldCorrection, Operation, dose_readout)
+from ..schedule import (KEEP_AS_IS, MAGNIFICATIONS, ORDERS, BeamCalibrationStep, ColumnSetting, Exposure, Operation,
+                        dose_readout)
 
 __all__ = ["StagePositionsTab", "PositionsHub", "ChipsTab", "HeightDialog", "ScheduleTab", "OpEditor"]
 
@@ -72,23 +71,22 @@ class PositionsHub(QtCore.QObject):
         return cls._instance
 
 
-def _here(stage_position, stage_z, wd):
-    """(x, y, h) of the stage now (in focus: h = WD − Z), or an error text."""
-    pos, z, w = stage_position(), stage_z(), wd()
+def _here(stage_position, stage_z):
+    """(x, y, z) of the stage now, or an error text."""
+    pos, z = stage_position(), stage_z()
     if pos is None or z is None:
         return "the stage position is not known (microscope not connected?)"
-    if w is None:
-        return "the working distance is not known (microscope not connected?)"
-    return float(pos[0]), float(pos[1]), height_um(w, z)
+    return float(pos[0]), float(pos[1]), float(z)
 
 
 class StagePositionsTab(QtWidgets.QWidget):
-    """Named stage positions of fixed objects (calibration samples, Faraday cup …): X, Y and the
-    height H = WD − Z (µm), recorded with the object in focus; a move to one sets Z so that it is in
-    focus at the column's present WD.  Saved at once; every tab on the same settings follows."""
+    """Named stage positions: X, Y and ΔZ (µm, relative to the calibration sample's Z; positive
+    away from the gun).  The *Calibration sample* (its Z_cal and WD1: *Record WD*) and the *Faraday
+    cup* are always there (replaced, not deleted).  *Go to* moves to X, Y, Z_cal + ΔZ and sets the
+    focus to WD1.  Saved at once; every tab on the same settings follows."""
 
     changed = QtCore.Signal()
-    gotoRequested = QtCore.Signal(float, float, object)  # SCS µm, Z µm (None: keep Z)
+    gotoRequested = QtCore.Signal(float, float, object, object)  # SCS µm, Z µm (None: keep Z), WD mm (None: keep)
 
     def __init__(self, settings, stage_position=None, stage_z=None, wd=None, parent=None):
         super().__init__(parent)
@@ -96,27 +94,34 @@ class StagePositionsTab(QtWidgets.QWidget):
         self.stage_position = stage_position or (lambda: None)  # () -> (x, y) | None
         self.stage_z = stage_z or (lambda: None)  # () -> z µm | None
         self.wd = wd or (lambda: None)  # () -> the column's WD (mm) | None
-        self.table = _table(["Name", "X (µm)", "Y (µm)", "H = WD − Z (µm)", "Note"])
+        self.table = _table(["Name", "X (µm)", "Y (µm)", "ΔZ (µm)", "Note"])
         self.table.itemChanged.connect(self._edited)
         self.table.itemSelectionChanged.connect(self._sync_buttons)
+        self.l_cal = QtWidgets.QLabel()
+        self.l_cal.setWordWrap(True)
         self.msg = QtWidgets.QLabel()
         self.msg.setWordWrap(True)
         b_cur = QtWidgets.QPushButton("Add current stage")
-        b_cur.setToolTip("a new position at the stage's X, Y; its height from the stage Z and the WD now – focus "
-                         "on the object first")
+        b_cur.setToolTip("a new position at the stage's X, Y; ΔZ from the stage Z against the calibration sample's")
         b_cur.clicked.connect(self.add_current)
         b_add = QtWidgets.QPushButton("Add…")
         b_add.clicked.connect(self.add_manual)
         self.b_replace = QtWidgets.QPushButton("Replace with current")
-        self.b_replace.setToolTip("the selected position becomes the stage's X, Y and height now (in focus)")
+        self.b_replace.setToolTip("the selected position becomes the stage's X, Y, Z now (the calibration sample: "
+                                  "its Z becomes Z_cal, every other ΔZ follows so their Z stays)")
         self.b_replace.clicked.connect(self.replace_selected)
+        self.b_record = QtWidgets.QPushButton("Record WD")
+        self.b_record.setToolTip("WD1 and Z_cal of the selected field size: the WD in focus on the calibration sample "
+                                 "now and the stage Z – focus and stigmate on it at a high magnification first; no "
+                                 "other ΔZ changes")
+        self.b_record.clicked.connect(self.record_wd)
         self.b_del = QtWidgets.QPushButton("Delete")
         self.b_del.clicked.connect(self.delete_selected)
-        self.b_go = QtWidgets.QPushButton("Go to (in focus)")
-        self.b_go.setToolTip("move the stage to the selected X, Y and to the Z that has it in focus at the WD now")
+        self.b_go = QtWidgets.QPushButton("Go to XYZ")
+        self.b_go.setToolTip("move the stage to the selected X, Y and Z_cal + ΔZ; the focus to WD1")
         self.b_go.clicked.connect(lambda: self._goto(True))
         self.b_go_xy = QtWidgets.QPushButton("Go to XY")
-        self.b_go_xy.setToolTip("move the stage to the selected X, Y; Z stays")
+        self.b_go_xy.setToolTip("move the stage to the selected X, Y; Z and the focus stay")
         self.b_go_xy.clicked.connect(lambda: self._goto(False))
         g = QtWidgets.QGridLayout()
         g.addWidget(b_cur, 0, 0)
@@ -125,8 +130,10 @@ class StagePositionsTab(QtWidgets.QWidget):
         g.addWidget(self.b_go, 1, 0)
         g.addWidget(self.b_go_xy, 1, 1)
         g.addWidget(self.b_del, 1, 2)
+        g.addWidget(self.b_record, 2, 0)
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(self.table, 1)
+        lay.addWidget(self.l_cal)
         lay.addLayout(g)
         lay.addWidget(self.msg)
         PositionsHub.instance().changed.connect(self._hub_changed)
@@ -145,22 +152,41 @@ class StagePositionsTab(QtWidgets.QWidget):
         try:
             self.table.setRowCount(len(self.settings.stage_positions))
             for r, p in enumerate(self.settings.stage_positions):
-                vals = (p.name, f"{p.x:.2f}", f"{p.y:.2f}", "" if p.h is None else f"{p.h:.1f}", p.note)
+                dz = "0 (reference)" if p.role == "calibration" else ("" if p.dz is None else f"{p.dz:+.1f}")
+                vals = (p.name, f"{p.x:.2f}", f"{p.y:.2f}", dz, p.note)
                 for c, v in enumerate(vals):
                     it = QtWidgets.QTableWidgetItem(v)
-                    if c == 3 and p.h is None:
+                    if p.fixed and c == 0:
+                        f = it.font()
+                        f.setBold(True)
+                        it.setFont(f)
+                        it.setToolTip("always kept (Replace with current, not deleted)")
+                    if c == 3 and p.role == "calibration":
+                        it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                    elif c == 3 and p.dz is None:
                         it.setBackground(QtGui.QColor("#622"))
-                        it.setToolTip("no height: Replace with current (with the object in focus)")
+                        it.setToolTip("no ΔZ: Replace with current")
                     self.table.setItem(r, c, it)
         finally:
             self.table.blockSignals(False)
+        cal = self.settings.calibration
+        fs = self.settings.field_size or "no field size selected"
+        if cal.z_um is None or cal.wd_mm is None:
+            self.l_cal.setText(f"{cal.name} ({fs}): " + ("Z_cal not recorded" if cal.z_um is None else
+                                                         f"Z_cal {cal.z_um:.1f} µm")
+                               + ", WD1 not recorded – focus on it, then Record WD")
+            self.l_cal.setStyleSheet("color:#fb4")
+        else:
+            self.l_cal.setText(f"{cal.name} ({fs}): Z_cal {cal.z_um:.1f} µm, WD1 {cal.wd_mm:.4f} mm")
+            self.l_cal.setStyleSheet("")
         self._sync_buttons()
 
     def _sync_buttons(self) -> None:
         p = self._selected()
-        for b in (self.b_replace, self.b_del, self.b_go_xy):
+        for b in (self.b_replace, self.b_go_xy):
             b.setEnabled(p is not None)
-        self.b_go.setEnabled(p is not None and p.h is not None)
+        self.b_del.setEnabled(p is not None and not p.fixed)
+        self.b_go.setEnabled(p is not None and self.settings.z_of(p) is not None)
 
     def _selected(self):
         r = _selected_row(self.table)
@@ -198,7 +224,8 @@ class StagePositionsTab(QtWidgets.QWidget):
                 else:
                     p.y = v
             elif c == 3:
-                p.h = float(txt) if txt else None
+                if p.role != "calibration":
+                    p.dz = float(txt) if txt else None
             else:
                 p.note = txt
         except ValueError as e:
@@ -206,16 +233,16 @@ class StagePositionsTab(QtWidgets.QWidget):
             return self._error(str(e))
         self._save("saved")
 
-    def add(self, name: str, x: float, y: float, h: float | None = None) -> None:
+    def add(self, name: str, x: float, y: float, dz: float | None = None) -> None:
         try:
-            self.settings.add_position(name, x, y, h)
+            self.settings.add_position(name, x, y, dz)
         except ValueError as e:
             return self._error(str(e))
         self._save(f"added {name!r}")
         self.table.selectRow(len(self.settings.stage_positions) - 1)
 
     def add_current(self, name: str | None = None) -> None:
-        here = _here(self.stage_position, self.stage_z, self.wd)
+        here = _here(self.stage_position, self.stage_z)
         if isinstance(here, str):
             return self._error(here)
         if name is None:
@@ -223,25 +250,54 @@ class StagePositionsTab(QtWidgets.QWidget):
                                                       text=self.settings.unique_name())
             if not ok:
                 return
-        self.add(name, *here)
+        x, y, z = here
+        self.add(name, x, y, self.settings.dz_here(z))
 
     def replace_selected(self, confirm: bool = True) -> None:
         p = self._selected()
         if p is None:
             return
-        here = _here(self.stage_position, self.stage_z, self.wd)
+        here = _here(self.stage_position, self.stage_z)
         if isinstance(here, str):
             return self._error(here)
-        x, y, h = here
+        x, y, z = here
+        cal = p.role == "calibration"
+        if cal:
+            what = (f"Z_cal {z:.1f} µm; every other ΔZ changes so their Z stays (record the WD again: Record WD)"
+                    if p.z_um is None or abs(z - p.z_um) > 1e-6 else f"Z_cal {z:.1f} µm (unchanged)")
+        else:
+            dz = self.settings.dz_here(z)
+            what = "ΔZ not known (the calibration sample's Z is not recorded)" if dz is None else f"ΔZ {dz:+.1f} µm"
         if confirm and QtWidgets.QMessageBox.question(
-                self, "Stage position", f"Replace {p.name!r} with the stage now: ({x:.2f}, {y:.2f}) µm, "
-                                        f"H {h:.1f} µm?\n\n(The object should be in focus.)") \
+                self, "Stage position", f"Replace {p.name!r} with the stage now: ({x:.2f}, {y:.2f}) µm, {what}?") \
                 != QtWidgets.QMessageBox.Yes:
             return
         r = _selected_row(self.table)
-        p.x, p.y, p.h = x, y, h
-        self._save(f"{p.name!r}: ({x:.2f}, {y:.2f}) µm, H {h:.1f} µm")
+        self.settings.replace_position(p.name, x, y, z)
+        self._save(f"{p.name!r}: ({x:.2f}, {y:.2f}) µm, {what}")
         self.table.selectRow(r)
+
+    def record_wd(self, confirm: bool = True) -> bool:
+        """WD1 and Z_cal from the column and the stage now (no other ΔZ changes)."""
+        cal = self.settings.calibration
+        wd, z = self.wd(), self.stage_z()
+        if wd is None:
+            self._error("the working distance is not known (microscope not connected?)")
+            return False
+        if z is None:
+            self._error("the stage Z is not known (microscope not connected?)")
+            return False
+        if confirm and QtWidgets.QMessageBox.question(
+                self, "Record WD", f"WD1 = {wd:.4f} mm at Z {z:.1f} µm for {cal.name!r}?\n\n(Focused and stigmated "
+                                   "on it at a high magnification?  The chip heights must be recorded at this Z.)") \
+                != QtWidgets.QMessageBox.Yes:
+            return False
+        r = _selected_row(self.table)
+        self.settings.record_wd(wd, z)
+        self._save(f"{cal.name!r}: WD1 {wd:.4f} mm at Z_cal {z:.1f} µm")
+        if r >= 0:
+            self.table.selectRow(r)
+        return True
 
     def add_manual(self) -> None:
         d = QtWidgets.QDialog(self)
@@ -249,45 +305,47 @@ class StagePositionsTab(QtWidgets.QWidget):
         f = QtWidgets.QFormLayout(d)
         name = QtWidgets.QLineEdit(self.settings.unique_name())
         x, y = _spin(0, 0, 1e6, 2), _spin(0, 0, 1e6, 2)
-        h = _spin(0, -1e6, 1e6, 1)
-        h.setToolTip("WD − Z in µm with the object in focus (WD in mm × 1000)")
+        dz = _spin(0, -1e6, 1e6, 1)
+        dz.setToolTip("its Z relative to the calibration sample's (µm, positive away from the gun)")
         f.addRow("name", name)
         f.addRow("X", x)
         f.addRow("Y", y)
-        f.addRow("H = WD − Z", h)
+        f.addRow("ΔZ", dz)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         bb.accepted.connect(d.accept)
         bb.rejected.connect(d.reject)
         f.addRow(bb)
         if d.exec() == QtWidgets.QDialog.Accepted:
-            self.add(name.text(), x.value(), y.value(), h.value())
+            self.add(name.text(), x.value(), y.value(), dz.value())
 
     def delete_selected(self) -> None:
-        r = _selected_row(self.table)
-        if r < 0:
-            return
-        name = self.settings.stage_positions[r].name
-        del self.settings.stage_positions[r]
-        self._save(f"deleted {name!r}")
-
-    def _goto(self, in_focus: bool) -> None:
         p = self._selected()
         if p is None:
             return
-        z = None
-        if in_focus:
-            if p.h is None:
-                return self._error(f"{p.name!r} has no height: Go to XY, focus, then Replace with current")
-            z = p.z_at(self.wd())
+        try:
+            self.settings.delete_position(p.name)
+        except ValueError as e:
+            return self._error(str(e))
+        self._save(f"deleted {p.name!r}")
+
+    def _goto(self, xyz: bool) -> None:
+        p = self._selected()
+        if p is None:
+            return
+        z = wd = None
+        if xyz:
+            z = self.settings.z_of(p)
             if z is None:
-                return self._error("the working distance is not known: cannot compute the Z")
-        self.gotoRequested.emit(p.x, p.y, z)
+                return self._error(f"{p.name!r}: Z not known (" + ("Record WD on the calibration sample"
+                                   if self.settings.calibration.z_um is None else "no ΔZ: Replace with current") + ")")
+            wd = self.settings.calibration.wd_mm
+        self.gotoRequested.emit(p.x, p.y, z, wd)
 
 
 # ====================================================================== chips
 class ChipsTab(QtWidgets.QWidget):
     """The schedule's chips: name, the nominal stage position of the CCS origin, the alignment, the
-    height (H = WD − Z: none, constant or a height map)."""
+    height (the WD in focus at Z_cal: none, constant WD2 or a map of WD2x)."""
 
     changed = QtCore.Signal()
     resetRequested = QtCore.Signal(str)  # forget the chip's Global Align
@@ -300,6 +358,7 @@ class ChipsTab(QtWidgets.QWidget):
         self.schedule = None
         self.stage_position = lambda: None
         self.alignment = lambda name: ""  # () -> status text of a chip's CCS → SCS map
+        self.z_cal = lambda: None  # () -> the calibration sample's Z (µm) | None
         self.table = _table(["Name", "Origin X (µm)", "Origin Y (µm)", "Alignment", "Height", "Note"])
         self.table.itemChanged.connect(self._edited)
         self.table.itemSelectionChanged.connect(lambda: self.selectionChanged.emit(self.selected()))
@@ -307,8 +366,9 @@ class ChipsTab(QtWidgets.QWidget):
         self.msg.setWordWrap(True)
         info = QtWidgets.QLabel("A chip has its own coordinates (CCS, the GDS top level of its Exposures + their "
                                 "offsets).  The origin is where CCS (0, 0) nominally is on the stage; a Global Align "
-                                "measures the real map, used by every later Exposure on the chip.  Its height "
-                                "(H = WD − Z) brings it into focus with the stage Z alone, at the schedule's WD.")
+                                "measures the real map, used by every later Exposure on the chip.  Its height is "
+                                "the WD in focus on it with the stage at the calibration sample's Z (WD2): the "
+                                "focus follows it during the run, Z stays.")
         info.setWordWrap(True)
         info.setStyleSheet("color:#9aa")
         b_add = QtWidgets.QPushButton("Add chip")
@@ -325,8 +385,8 @@ class ChipsTab(QtWidgets.QWidget):
         self.b_reset.setToolTip("forget the selected chip's Global Align (back to the nominal origin)")
         self.b_reset.clicked.connect(lambda: self.selected() and self.resetRequested.emit(self.selected()))
         self.b_height = QtWidgets.QPushButton("Height…")
-        self.b_height.setToolTip("the chip's height: kept Z, one height (focus on a feature), or a height map "
-                                 "(≥ 3 points)")
+        self.b_height.setToolTip("the chip's height: the focus kept, one WD2 (focus on a feature at Z_cal), or a "
+                                 "WD map (≥ 3 points)")
         self.b_height.clicked.connect(lambda: self.selected() and self.heightRequested.emit(self.selected()))
         g = QtWidgets.QGridLayout()
         g.addWidget(b_add, 0, 0)
@@ -359,8 +419,9 @@ class ChipsTab(QtWidgets.QWidget):
                     it = QtWidgets.QTableWidgetItem(v)
                     if k in (3, 4):
                         it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
-                    if k == 4 and (c.height.mode == "none" or c.height.problem()):
+                    if k == 4 and (c.height.mode == "none" or c.height.problem(self.z_cal(), check_z=True)):
                         it.setForeground(QtGui.QBrush(QtGui.QColor("#fb4")))
+                        it.setToolTip(c.height.problem(self.z_cal(), check_z=True) or "the focus is kept")
                     self.table.setItem(r, k, it)
         finally:
             self.table.blockSignals(False)
@@ -440,14 +501,17 @@ class ChipsTab(QtWidgets.QWidget):
 
 
 class HeightDialog(QtWidgets.QDialog):
-    """A chip's height (H = WD − Z, µm): Z kept, one height, or a height map of ≥ 3 points (CCS) with
-    a least-squares plane.  *Record here* takes the stage now – focus on the chip first – and
-    converts its X, Y to CCS through the chip's present map (*to_ccs*); *Go to* moves to a point in
-    focus at the WD now (*goto(x, y, z)*, the point through *to_scs*).  :meth:`value` is the edited
-    :class:`~easyebl.litho.height.ChipHeight`; *fields_ccs*: the chip's field centres (for the Z range)."""
+    """A chip's height as the WD in focus on it, with the stage at the calibration sample's Z
+    (*z_cal*): the focus kept, one WD2, or a map of WD2x at ≥ 3 points (CCS) with a least-squares
+    plane.  *Record here* takes the WD and the stage now – focus on the chip first, the stage Z at
+    Z_cal (refused at another Z) – and converts its X, Y to CCS through the chip's present map
+    (*to_ccs*); *Go to* moves to a point (*goto(x, y, z, wd)*, the point through *to_scs*, Z_cal,
+    its WD).  :meth:`value` is the edited :class:`~easyebl.litho.height.ChipHeight`; *fields_ccs*:
+    the chip's field centres (for the WD range); *nominal_wd*: the field size's (the value to start
+    with); *wd1*: the calibration sample's (a WD2 more than 1 mm from it is warned about)."""
 
     def __init__(self, chip, stage_position, stage_z, wd, to_ccs, to_scs, goto=None, fields_ccs=(),
-                 schedule_wd=None, parent=None):
+                 z_cal=None, nominal_wd=None, wd1=None, parent=None):
         super().__init__(parent)
         from ..height import ChipHeight
 
@@ -456,43 +520,44 @@ class HeightDialog(QtWidgets.QDialog):
         self.stage_position, self.stage_z, self.wd = stage_position, stage_z, wd
         self.to_ccs, self.to_scs, self.goto = to_ccs, to_scs, goto
         self.fields_ccs = list(fields_ccs)
-        self.schedule_wd = schedule_wd
+        self.z_cal, self.nominal_wd, self.wd1 = z_cal, nominal_wd, wd1
         intro = QtWidgets.QLabel(
-            "H = WD − Z (µm) of the chip surface, recorded with it in focus.  After the beam calibration the "
-            "column is not touched: the stage's Z brings the chip into focus, Z = 1000·WD − H.")
+            "The WD in focus on the chip (WD2), with the stage Z left at the calibration sample's Z_cal"
+            + (f" ({z_cal:.1f} µm)" if z_cal is not None else " (not recorded: Stage positions → Record WD)")
+            + ".  During the run Z stays at Z_cal and the focus is set to the chip's WD at each field.")
         intro.setWordWrap(True)
         intro.setStyleSheet("color:#9aa")
         self.mode = QtWidgets.QComboBox()
-        for k, t in (("none", "none: keep the stage's Z"), ("constant", "constant: one height"),
-                     ("map", "height map: a plane through ≥ 3 points")):
+        for k, t in (("none", "none: keep the focus"), ("constant", "constant: one WD2"),
+                     ("map", "map: a plane through WD2 at ≥ 3 points")):
             self.mode.addItem(t, k)
         self.mode.setCurrentIndex(max(0, self.mode.findData(self.h.mode)))
         self.mode.currentIndexChanged.connect(self._mode)
         # constant
         self.g_const = QtWidgets.QGroupBox("Constant")
         fc = QtWidgets.QFormLayout(self.g_const)
-        self.h_value = _spin(self.h.value_um or 0.0, -1e6, 1e6, 1, " µm", 1)
-        self.h_value.valueChanged.connect(lambda v: setattr(self.h, "value_um", float(v)))
+        self.wd_value = _spin(self.h.wd_mm or wd1 or nominal_wd or 15.0, 4, 60, 4, " mm", 0.01)
+        self.wd_value.valueChanged.connect(self._typed)
         b_rec = QtWidgets.QPushButton("Record here")
-        b_rec.setToolTip("the height of the stage now (focus on a feature of the chip first)")
+        b_rec.setToolTip("the WD in focus now (focus on a feature of the chip first, the stage Z at Z_cal)")
         b_rec.clicked.connect(self.record_constant)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.h_value, 1)
+        row.addWidget(self.wd_value, 1)
         row.addWidget(b_rec)
-        fc.addRow("H", row)
+        fc.addRow("WD2", row)
         # map
-        self.g_map = QtWidgets.QGroupBox("Height map (chip coordinates)")
+        self.g_map = QtWidgets.QGroupBox("WD map (chip coordinates)")
         vm = QtWidgets.QVBoxLayout(self.g_map)
-        self.table = _table(["X (µm)", "Y (µm)", "H (µm)"])
+        self.table = _table(["X (µm)", "Y (µm)", "WD (mm)"])
         self.table.setMinimumHeight(130)
         self.table.itemChanged.connect(self._points_edited)
         vm.addWidget(self.table)
         hb = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("Record here")
-        b_add.setToolTip("a point at the stage now (focus on the chip there first)")
+        b_add.setToolTip("a point at the stage now, the WD in focus (focus on the chip there first, Z at Z_cal)")
         b_add.clicked.connect(self.record_point)
         b_go = QtWidgets.QPushButton("Go to")
-        b_go.setToolTip("move to the selected point, in focus at the WD now")
+        b_go.setToolTip("move to the selected point (Z_cal), the focus to its WD")
         b_go.clicked.connect(self._goto_point)
         b_go.setEnabled(goto is not None)
         b_del = QtWidgets.QPushButton("Delete")
@@ -522,10 +587,16 @@ class HeightDialog(QtWidgets.QDialog):
         self._mode()
         self.resize(520, 520)
 
+    def _typed(self, v):
+        self.h.wd_mm = float(v)
+        if self.h.z_um is None:  # typed: taken as focused at Z_cal
+            self.h.z_um = self.z_cal
+        self._info()
+
     def _mode(self, *_):
         self.h.mode = self.mode.currentData()
-        if self.h.mode == "constant" and self.h.value_um is None:
-            self.h.value_um = float(self.h_value.value())
+        if self.h.mode == "constant" and self.h.wd_mm is None:
+            self._typed(self.wd_value.value())
         self.g_const.setVisible(self.h.mode == "constant")
         self.g_map.setVisible(self.h.mode == "map")
         self._info()
@@ -535,40 +606,61 @@ class HeightDialog(QtWidgets.QDialog):
         self.table.setRowCount(len(self.h.points))
         for r, pt in enumerate(self.h.points):
             for c, v in enumerate(pt):
-                self.table.setItem(r, c, QtWidgets.QTableWidgetItem(f"{v:.2f}" if c < 2 else f"{v:.1f}"))
+                self.table.setItem(r, c, QtWidgets.QTableWidgetItem(f"{v:.2f}" if c < 2 else f"{v:.4f}"))
         self.table.blockSignals(False)
         self._info()
 
     def _info(self):
+        from ..schedule import wd_far_problem
+
         txt = self.h.describe()
-        if self.h.mode != "none" and self.fields_ccs and self.schedule_wd is not None:
-            hs = [self.h.at(c) for c in self.fields_ccs]
-            hs = [v for v in hs if v is not None]
-            if hs:
-                zs = [1000.0 * self.schedule_wd - v for v in hs]
-                txt += (f" · Z over the {len(zs)} field(s) at WD {self.schedule_wd:g} mm: {min(zs):.1f} … "
-                        f"{max(zs):.1f} µm")
-        self.info.setText(txt)
+        warn = []
+        if self.h.mode != "none":
+            if self.fields_ccs:
+                wds = [w for w in (self.h.wd_at(c) for c in self.fields_ccs) if w is not None]
+                if wds:
+                    txt += f" · WD over the {len(wds)} field(s): {min(wds):.4f} … {max(wds):.4f} mm"
+            p = self.h.problem(self.z_cal, check_z=True)
+            if p:
+                warn.append(p)
+            w = wd_far_problem(self.h, self.wd1)
+            if w:
+                warn.append(w)
+        self.info.setText(txt + ("".join(f"\n⚠ {w}" for w in warn)))
+        self.info.setStyleSheet("color:#fb4" if warn else "")
 
     def _here(self):
-        here = _here(self.stage_position, self.stage_z, self.wd)
-        if isinstance(here, str):
-            self.msg.setText(here)
+        """(x, y, z, wd) now – the stage at Z_cal – or None (the reason in the message)."""
+        from ..height import z_problem
+
+        pos, z, wd = self.stage_position(), self.stage_z(), self.wd()
+        if pos is None or z is None:
+            self.msg.setText("the stage position is not known (microscope not connected?)")
+            return None
+        if wd is None:
+            self.msg.setText("the working distance is not known (microscope not connected?)")
+            return None
+        p = z_problem(z, self.z_cal, "the stage")
+        if p:
+            self.msg.setText(p.replace("was recorded", "is") if self.z_cal is not None else p)
             return None
         self.msg.clear()
-        return here
+        return float(pos[0]), float(pos[1]), float(z), float(wd)
 
     def record_constant(self):
         here = self._here()
         if here is not None:
-            self.h_value.setValue(here[2])
+            self.h.z_um = here[2]
+            self.wd_value.setValue(round(here[3], 4))
+            self._typed(round(here[3], 4))
 
     def record_point(self):
         here = self._here()
         if here is None:
             return
         c = self.to_ccs((here[0], here[1]))
-        self.h.points.append((float(c[0]), float(c[1]), float(here[2])))
+        self.h.z_um = here[2]
+        self.h.points.append((float(c[0]), float(c[1]), round(here[3], 4)))
         self._fill()
         self.table.selectRow(len(self.h.points) - 1)
 
@@ -578,10 +670,12 @@ class HeightDialog(QtWidgets.QDialog):
             for r in range(self.table.rowCount()):
                 out.append(tuple(float(self.table.item(r, c).text()) for c in range(3)))
         except (ValueError, AttributeError):
-            self.msg.setText("a point is X, Y, H in µm")
+            self.msg.setText("a point is X, Y in µm and the WD in mm")
             return
         self.msg.clear()
         self.h.points = out
+        if self.h.z_um is None:
+            self.h.z_um = self.z_cal
         self._info()
 
     def _delete_point(self):
@@ -594,13 +688,9 @@ class HeightDialog(QtWidgets.QDialog):
         r = _selected_row(self.table)
         if not 0 <= r < len(self.h.points) or self.goto is None:
             return
-        x, y, h = self.h.points[r]
-        wd = self.wd()
-        if wd is None:
-            self.msg.setText("the working distance is not known: cannot compute the Z")
-            return
+        x, y, wd = self.h.points[r]
         scs = self.to_scs((x, y))
-        self.goto(float(scs[0]), float(scs[1]), 1000.0 * wd - h)
+        self.goto(float(scs[0]), float(scs[1]), self.z_cal, wd)
 
     def value(self):
         return self.h
@@ -652,16 +742,19 @@ class OpEditor(QtWidgets.QWidget):
     The window sets the providers: ``presets()`` (beam preset names | None), ``positions()``
     ({name: StagePosition}), ``chips()`` (chip names), ``top_cells(path)``, ``current_for(op)``
     (nominal current at that step | None), ``fields_info(op)`` (text about the Exposure's fields
-    and markers), ``field_centres(op)`` (CCS centres of its fields) and ``current_wd()`` (the
-    column's WD from the focus, mm | None)."""
+    and markers), ``field_centres(op)`` (CCS centres of its fields), ``field_sizes()``
+    ([FieldSize]) and ``stored_beamcal()`` (the beam calibration stored for the schedule's field
+    size | None)."""
 
     changed = QtCore.Signal()
     pickGdsRequested = QtCore.Signal()
+    #: pick markers on the plot: ("global", k) one Global marker, ("global_all", -1) all in turn, ("local", -1)
+    pickMarkersRequested = QtCore.Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.op: Operation | None = None
-        self.schedule = None  # the schedule of the op (its WD, which steps are fixed)
+        self.schedule = None  # the schedule of the op (which steps are fixed)
         self.presets = lambda: None
         self.positions = lambda: {}
         self.chips = lambda: []
@@ -669,7 +762,8 @@ class OpEditor(QtWidgets.QWidget):
         self.current_for = lambda op: None
         self.fields_info = lambda op: ""
         self.field_centres = lambda op: []
-        self.current_wd = lambda: None
+        self.field_sizes = lambda: []
+        self.stored_beamcal = lambda: None
         self.readout = None
         self.info = None
         self.lay = QtWidgets.QVBoxLayout(self)
@@ -739,8 +833,6 @@ class OpEditor(QtWidgets.QWidget):
             self._column(top, first=idx == 0)
         elif isinstance(op, BeamCalibrationStep):
             self._beamcal(top)
-        elif isinstance(op, FieldCorrection):
-            self._fieldcal(top)
         elif isinstance(op, Exposure):
             self._exposure(v)
 
@@ -768,44 +860,25 @@ class OpEditor(QtWidgets.QWidget):
         form.addRow(label, s)
         return s
 
-    def _position_combo(self, form, label) -> QtWidgets.QComboBox:
-        """The named stage positions, with their height (one without: marked)."""
-        op = self.op
-        pos = QtWidgets.QComboBox()
-        pos.addItem("(choose a stage position)", "")
-        for n, p in self.positions().items():
-            h = getattr(p, "h", None)
-            pos.addItem(f"{n}  ({p.x:.1f}, {p.y:.1f}, " + (f"H {h:.1f})" if h is not None else "NO HEIGHT)"), n)
-        if op.position and pos.findData(op.position) < 0:
-            pos.addItem(f"{op.position} (unknown)", op.position)
-        pos.setCurrentIndex(max(0, pos.findData(op.position)))
-        pos.setToolTip("a named stage position (Stage Positions tab): its X, Y and height H – the stage Z is set "
-                       "to have it in focus at the schedule's WD")
-        pos.currentIndexChanged.connect(lambda _: self._cfg("position", pos.currentData() or ""))
-        form.addRow(label, pos)
-        return pos
-
     def _beamcal(self, f) -> None:
         op = self.op
         info = QtWidgets.QLabel(
-            "One image of a calibration sample with a square grid over the whole field of view, at ≤ 0.1 µm "
-            "pixels (5000 × 5000 for a 500 µm field).  The fit gives the beam's X / Y scale, shear and pincushion "
-            "distortion; valid for the magnification and WD it was measured at.")
+            "On the calibration sample (Stage positions; the stage at Z_cal, the focus at WD1): one image of its "
+            "square grid over the whole field of view, at ≤ 0.1 µm pixels (5000 × 5000 for a 500 µm field).  The "
+            "fit gives the beam's X / Y scale, shear and pincushion distortion; valid for the field size, at any WD.")
         info.setWordWrap(True)
         info.setStyleSheet("color:#9aa")
         f.addRow(info)
-        self._position_combo(f, "grid sample at")
         self._int_spin(f, "image", "pixels", 200, 20000, 500, " px across")
         self._cfg_spin(f, "grid pitch", "pitch_um", lo=0.05, hi=100, decimals=3, suffix=" µm", step=0.1)
         self._int_spin(f, "frames averaged", "frames", 1, 64)
         self._cfg_spin(f, "refuse a fit worse than", "max_rms_um", 1e3, lo=1, hi=5000, decimals=0, suffix=" nm",
                        step=10)
         self._cfg_spin(f, "low-pass", "filter_periods", lo=0.5, hi=20, decimals=1, suffix=" periods", step=0.5)
-        mf = QtWidgets.QCheckBox("focus and stigmate by hand first, at")
+        mf = QtWidgets.QCheckBox("confirm the focus by hand first, at")
         mf.setChecked(bool(op.config.manual_focus))
-        mf.setToolTip("before the image: zoom in at the grid and wait for you to focus and stigmate (the focus may "
-                      "change the WD: the WD then is the schedule's for the rest of the run, and the grid "
-                      "position's height is recorded again)")
+        mf.setToolTip("before the image: zoom in on the grid (the focus at WD1 – it should be very close) and wait for "
+                      "you to focus and stigmate; the WD then is WD1 from there on")
         mm = mag_combo(op.config.focus_magnification, lambda m: self._cfg("focus_magnification", int(m)))
         mm.setEnabled(mf.isChecked())
         mf.toggled.connect(lambda on: (self._cfg("manual_focus", bool(on)), mm.setEnabled(on)))
@@ -813,88 +886,52 @@ class OpEditor(QtWidgets.QWidget):
         row.addWidget(mf)
         row.addWidget(mm, 1)
         f.addRow(row)
-        ru = QtWidgets.QCheckBox("use a stored calibration of the same magnification and WD (else measure)")
+        ru = QtWidgets.QCheckBox("use a stored calibration of the field size (else measure)")
         ru.setChecked(op.reuse)
-        ru.toggled.connect(lambda on: self._set("reuse", bool(on)))
+        ru.setToolTip("beam calibrations are stored per field size (litho.json, every accepted one); with this on "
+                      "the step uses the stored one of the schedule's field size and measures nothing – it "
+                      "measures when none is stored")
+        ru.toggled.connect(lambda on: (self._set("reuse", bool(on)), self._stored_text()))
         f.addRow(ru)
+        self.stored = QtWidgets.QLabel()
+        self.stored.setWordWrap(True)
+        f.addRow(self.stored)
+        self._stored_text()
 
-    def _fieldcal(self, f) -> None:
-        op = self.op
-        info = QtWidgets.QLabel(
-            "At a feature with structure (a Faraday cup, a calibration sample) images at known stage shifts give "
-            "the stage → beam rotation, through the beam calibration of the condition; valid for the "
-            "magnification, beam preset and WD it was measured at.")
-        info.setWordWrap(True)
-        info.setStyleSheet("color:#9aa")
-        f.addRow(info)
-        self._position_combo(f, "at")
-        cfg = op.config
-        pat = QtWidgets.QComboBox()
-        pat.addItem("3 × 3 grid (9 images)", "grid")
-        pat.addItem("cross (5 images)", "cross")
-        pat.setCurrentIndex(max(0, pat.findData(cfg.pattern)))
-        pat.currentIndexChanged.connect(lambda _: self._cfg("pattern", pat.currentData()))
-        f.addRow("stage shifts", pat)
-        self._cfg_spin(f, "shift", "step_fraction", 100.0, lo=1, hi=45, decimals=1, suffix=" % of the field", step=5)
-        self._cfg_spin(f, "image width", "image_fraction", 100.0, lo=10, hi=100, decimals=0, suffix=" % of the field",
-                       step=5)
-        px = QtWidgets.QComboBox()
-        for n in (128, 256, 512, 1024):
-            px.addItem(f"{n} × {n}", n)
-        px.setCurrentIndex(max(0, px.findData(cfg.image_px)))
-        px.currentIndexChanged.connect(lambda _: self._cfg("image_px", int(px.currentData())))
-        f.addRow("image", px)
-        self._int_spin(f, "frames averaged", "frames", 1, 64)
-        self._cfg_spin(f, "settle after a move", "settle_s", lo=0, hi=60, decimals=2, suffix=" s", step=0.1)
-        self._cfg_spin(f, "refuse a fit worse than", "max_residual_px", lo=0.1, hi=50, decimals=1, suffix=" px",
-                       step=0.5)
-        dn = self._cfg_spin(f, "de-noise", "denoise_px", lo=0, hi=20, decimals=1, suffix=" px", step=0.5)
-        dn.setSpecialValueText("off")
-        dn.setToolTip("Gaussian low-pass (σ) before matching: about the size of the feature's detail; more for "
-                      "noisier images")
-        bg = self._cfg_spin(f, "flatten (background)", "background_fraction", 100.0, lo=0, hi=50, decimals=1,
-                            suffix=" % of the image", step=2.5)
-        bg.setSpecialValueText("off")
-        bg.setToolTip("a blur this wide (σ) is subtracted: brightness gradients and charging do not match")
-        wh = self._cfg_spin(f, "whitening", "whitening", lo=0, hi=1, decimals=2, suffix="", step=0.1)
-        wh.setToolTip("1: pure phase correlation (sharp, but noise counts as much as the feature); lower is more "
-                      "robust on noisy, low-contrast images")
-        ru = QtWidgets.QCheckBox("keep the field calibration in force when it applies (same magnification, beam "
-                                 "preset, WD and beam calibration; else measure)")
-        ru.setChecked(op.reuse)
-        ru.toggled.connect(lambda on: self._set("reuse", bool(on)))
-        f.addRow(ru)
-        notes = QtWidgets.QLineEdit(op.notes)
-        notes.editingFinished.connect(lambda: self._set("notes", notes.text()))
-        f.addRow("notes", notes)
-
-    def set_wd_to_current(self, spin=None) -> bool:
-        """The schedule's WD := the column's WD now (from the focus, to 0.001 mm)."""
-        try:
-            wd = self.current_wd()
-        except Exception:  # noqa: BLE001
-            wd = None
-        if wd is None:
-            self.msg.setText("the working distance cannot be read (microscope not connected?)")
-            return False
-        wd = round(float(wd), 3)
-        if not 4.0 <= wd <= 60.0:
-            self.msg.setText(f"the column's WD {wd:g} mm is outside 4–60 mm")
-            return False
-        self.msg.clear()
-        if spin is not None:
-            spin.setValue(wd)  # → _set_wd
+    def _stored_text(self) -> None:
+        """What is stored for the schedule's field size (and what the step will do)."""
+        lab = getattr(self, "stored", None)
+        if lab is None or not isinstance(self.op, BeamCalibrationStep):
+            return
+        fs = self.schedule.field_size if self.schedule is not None else ""
+        bc = self.stored_beamcal()
+        if not fs:
+            text, col = "no field size chosen (the first Column setting)", "#fb4"
+        elif bc is None:
+            text, col = f"none stored for field size {fs}: the step measures", "#9aa"
         else:
-            self._set_wd(wd)
-        return True
-
-    def _set_wd(self, v: float) -> None:
-        if self.schedule is not None and self.schedule.wd_mm != float(v):
-            self.schedule.wd_mm = float(v)
-            self.changed.emit()
+            text = (f"stored for field size {fs} ({bc.created.replace('T', ' ')}): {bc.describe()}"
+                    + (" – used, nothing measured" if self.op.reuse else " – not used: the step measures a new one"))
+            col = "#5d5" if self.op.reuse else "#9aa"
+        lab.setText(text)
+        lab.setStyleSheet(f"color:{col}")
 
     def _column(self, f, first: bool = False) -> None:
         op = self.op
+        if first:
+            fs = QtWidgets.QComboBox()
+            for s in self.field_sizes() or []:
+                fs.addItem(s.describe(), s.name)
+            if op.field_size and fs.findData(op.field_size) < 0:
+                fs.addItem(f"{op.field_size} (unknown)", op.field_size)
+            if not op.field_size:
+                fs.insertItem(0, "(choose a field size)", "")
+            fs.setCurrentIndex(max(0, fs.findData(op.field_size)))
+            fs.setToolTip("the schedule's field size (Calibration → Field sizes…): sets the magnification; the focus "
+                          "goes to WD1.  The Microscope window must be at the same field size to run")
+            fs.currentIndexChanged.connect(lambda _: self._set("field_size", fs.currentData() or ""))
+            f.addRow("field size", fs)
+            self.field_size_combo = fs
         pr = QtWidgets.QComboBox()
         pr.addItem("Keep as is", KEEP_AS_IS)
         for n in self.presets() or []:
@@ -905,23 +942,15 @@ class OpEditor(QtWidgets.QWidget):
         pr.setToolTip("a beam preset of the microscope module (Microscope → Beam presets…)")
         pr.currentIndexChanged.connect(lambda _: self._set("preset", pr.currentData()))
         f.addRow("beam", pr)
-        f.addRow("magnification", mag_combo(op.magnification, lambda m: self._set("magnification", m)))
         cs = _spin(op.current_pa or 0.0, 0, 1e6, 2, " pA", 10)
         cs.setSpecialValueText("unknown")
         cs.setToolTip("nominal beam current: only for the dose readout of the fields")
         cs.valueChanged.connect(lambda val: self._set("current_pa", float(val) or None))
         f.addRow("nominal current", cs)
-        if first and self.schedule is not None:
-            wd = _spin(self.schedule.wd_mm, 4, 60, 3, " mm", 0.1)
-            wd.setToolTip("the working distance of the whole schedule: this step sets the focus to it; nothing "
-                          "changes the focus after that – the stage Z brings each sample into focus (Z = 1000·WD − H)")
-            wd.valueChanged.connect(self._set_wd)
-            f.addRow("working distance", wd)
-            b = QtWidgets.QPushButton("Set to current WD")
-            b.setToolTip("the column's working distance now (from the focus)")
-            b.clicked.connect(lambda: self.set_wd_to_current(wd))
-            self.b_wd_current = b
-            f.addRow("", b)
+        if not first:
+            note = QtWidgets.QLabel("The field size is the schedule's (the first Column setting).")
+            note.setStyleSheet("color:#9aa")
+            f.addRow(note)
 
     # ---------------------------------------------------------------- exposure
     def _exposure(self, v) -> None:
@@ -1012,7 +1041,18 @@ class OpEditor(QtWidgets.QWidget):
             n.valueChanged.connect(self._marker_count)
             f.addRow("markers", n)
             for k, mk in enumerate(op.global_markers):
-                f.addRow(f"marker {k + 1}", _pair(*mk, lambda p, k=k: self._set_marker(k, p)))
+                row = QtWidgets.QHBoxLayout()
+                row.addWidget(_pair(*mk, lambda p, k=k: self._set_marker(k, p)), 1)
+                b = QtWidgets.QPushButton("Pick")
+                b.setToolTip("click a polygon corner or centre of the GDS on the plot (any layer)")
+                b.clicked.connect(lambda _=False, k=k: self.pickMarkersRequested.emit("global", k))
+                row.addWidget(b)
+                f.addRow(f"marker {k + 1}", row)
+            b = QtWidgets.QPushButton("Pick all on the plot…")
+            b.setToolTip("marker 1, 2, … in turn: click a polygon corner or centre of the GDS (any layer)")
+            b.clicked.connect(lambda: self.pickMarkersRequested.emit("global_all", -1))
+            self.b_pick_global = b
+            f.addRow(b)
             f.addRow(QtWidgets.QLabel("2 markers: rotation, scale, shift · 3–4: affine (scale and shear too)"))
         v.addWidget(g)
 
@@ -1040,14 +1080,22 @@ class OpEditor(QtWidgets.QWidget):
             b_gen = QtWidgets.QPushButton("One per field…")
             b_gen.setToolTip("a marker at the same place relative to every field centre (replaces the list)")
             b_gen.clicked.connect(self._local_per_field)
-            for w in (b_add, b_del, b_gen):
+            b_pick = QtWidgets.QPushButton("Pick on the plot…")
+            b_pick.setToolTip("each click on a polygon corner or centre of the GDS (any layer) adds a marker; Esc: done")
+            b_pick.clicked.connect(lambda: self.pickMarkersRequested.emit("local", -1))
+            self.b_pick_local = b_pick
+            for w in (b_add, b_del, b_gen, b_pick):
                 h.addWidget(w)
             lv.addLayout(h)
         v.addWidget(g)
+        g = QtWidgets.QFormLayout()
         if op.global_align or op.local_align:
-            g = QtWidgets.QFormLayout()
             self._spin_for(g, "marker view", "view_um", lo=0.01, hi=1e5)
-            v.addLayout(g)
+        if op.global_align:
+            t = self._spin_for(g, "alignment tolerance", "align_tolerance_um", lo=0.001, hi=100, step=0.1)
+            t.setToolTip("the Global Align markers are measured twice (1 → 2 → 1 → 2): the two passes must agree "
+                         "within this, else repeat / continue / abort")
+        v.addLayout(g)
         self.refresh_info()
 
     def _readout(self, *_):
@@ -1149,8 +1197,7 @@ class ScheduleTab(QtWidgets.QWidget):
         add.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         m = QtWidgets.QMenu(add)
         m.addAction(Exposure.TITLE, lambda: self.add_op(self.new_exposure()))
-        m.addAction(ColumnSetting.TITLE, lambda: self.add_op(ColumnSetting(magnification=self._last_mag())))
-        m.addAction(FieldCorrection.TITLE, lambda: self.add_op(self._new_fieldcal()))
+        m.addAction(ColumnSetting.TITLE, lambda: self.add_op(ColumnSetting()))
         m.addAction(BeamCalibrationStep.TITLE, lambda: self.add_op(self._new_beamcal()))
         add.setMenu(m)
         self.add_menu = m
@@ -1297,7 +1344,10 @@ class ScheduleTab(QtWidgets.QWidget):
         p = self.plans[i] if self.plans is not None and i < len(self.plans) else None
         warns = p.warnings if p is not None else []
         nf = f" ({len(p.fields)} fields)" if p is not None and isinstance(op, Exposure) and p.fields else ""
-        title = op.title() + (f", WD {self.schedule.wd_mm:g} mm" if i == 0 else "")
+        if isinstance(op, BeamCalibrationStep) and op.reuse and p is not None:
+            nf = (f" (stored {p.beamcal.created.replace('T', ' ')})" if p.beamcal is not None
+                  else " (none stored: measures)")
+        title = op.title()
         it.setText(f"{i + 1}. {STATE_MARK[st]}{title}{nf}" + ("  ⚠" if warns else "")
                    + (f"  – {message}" if message and st == "running" else ""))
         tip = "\n".join(warns)
@@ -1354,19 +1404,6 @@ class ScheduleTab(QtWidgets.QWidget):
         self.schedule.settings.fill_direction = self.s_fill.currentText()
         self.schedule.settings.max_z_change_um = float(self.s_maxz.value())
         self.changed.emit()
-
-    def _last_mag(self) -> float:
-        i = self.list.currentRow()
-        for op in reversed(self.schedule.operations[:max(1, i + 1)]):
-            if isinstance(op, ColumnSetting):
-                return op.magnification
-        return self.schedule[0].magnification
-
-    def _new_fieldcal(self) -> FieldCorrection:
-        """A Field calibration set up like the fixed one."""
-        from ..fieldcal import FieldCalConfig
-
-        return FieldCorrection(config=FieldCalConfig.from_dict(self.schedule[2].config.to_dict()))
 
     def _new_beamcal(self) -> BeamCalibrationStep:
         from ..beamcal import BeamCalConfig

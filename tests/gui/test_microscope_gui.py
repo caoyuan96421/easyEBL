@@ -285,8 +285,8 @@ def test_auto_gun_alignment_button(qtbot, bundle, monkeypatch):
 
 
 def test_stage_positions_in_the_microscope_window(qtbot, bundle):
-    """The Lithography window's Stage Positions, in the Microscope window: the same list (shared settings), H =
-    WD − Z recorded from the stage and the focus now, Go to (in focus) moves X, Y and Z."""
+    """The Lithography window's Stage Positions, in the Microscope window: the same list (shared settings); ΔZ
+    against the calibration sample, Record WD (WD1 of the field size, Z_cal), Go to XYZ: Z_cal + ΔZ and WD1."""
     from easyebl.litho.module.tabs import StagePositionsTab
     from easyebl.litho.settings import LithoSettings
     from easyebl.microscope.gui import MicroscopeWindow
@@ -298,20 +298,41 @@ def test_stage_positions_in_the_microscope_window(qtbot, bundle):
     assert pt.settings is shared
     litho = StagePositionsTab(shared)  # as in the Lithography window
     qtbot.addWidget(litho)
+    shared.field_size = "250 µm"
     wd = bundle.sem.working_distance_mm()
     x, y, z = (bundle.stage.positions[k] for k in ("X", "Y", "Z"))
+    assert pt.record_wd(confirm=False)  # focused on the calibration sample
+    cal = shared.calibration
+    assert cal.wd_mm == pytest.approx(wd, abs=1e-4) and cal.z_um == pytest.approx(z) and cal.wd1 == {"250 µm": cal.wd_mm}
+    assert "WD1" in litho.l_cal.text() and "not recorded" not in litho.l_cal.text()
     pt.add_current("Cup")
     p = shared.positions()["Cup"]
-    assert (p.x, p.y) == pytest.approx((x, y)) and p.h == pytest.approx(1000.0 * wd - z)
-    assert litho.table.rowCount() == 1 and litho.table.item(0, 0).text() == "Cup"
+    assert (p.x, p.y) == pytest.approx((x, y)) and p.dz == pytest.approx(0.0)
+    assert litho.table.rowCount() == 3 and litho.table.item(2, 0).text() == "Cup"
     assert LithoSettings.load(shared.path).positions()["Cup"] == p  # saved
-    moves = []
-    w.move = lambda targets, relative=False: moves.append((targets, relative))
-    pt.table.selectRow(0)
+    moves, wds = [], []
+    w.move = lambda targets, relative=False: moves.append((targets, relative)) or object()
+    w._call = lambda fn, *a, what="": wds.append((fn.__name__, a))
+    pt.table.selectRow(2)
     pt.b_go.click()
-    assert moves == [({"X": p.x, "Y": p.y, "Z": pytest.approx(1000.0 * wd - p.h)}, False)]
+    assert moves == [({"X": p.x, "Y": p.y, "Z": pytest.approx(z)}, False)]
+    assert wds == [("set_working_distance", (cal.wd_mm,))]
     pt.b_go_xy.click()
-    assert moves[-1] == ({"X": p.x, "Y": p.y}, False)
-    litho.table.selectRow(0)
+    assert moves[-1] == ({"X": p.x, "Y": p.y}, False) and len(wds) == 1
+    litho.table.selectRow(2)
     litho.delete_selected()
-    assert pt.table.rowCount() == 0
+    assert pt.table.rowCount() == 2
+    # the field size selector: the magnification, Z to 1000 × the nominal WD, the focus to its WD1 (else nominal)
+    assert [w.field_size.itemData(i) for i in range(w.field_size.count())] == ["", "100 µm", "250 µm", "500 µm"]
+    assert w.field_size.currentData() == "250 µm"
+    moves.clear()
+    wds.clear()
+    assert w.select_field_size("250 µm")
+    assert ("set_magnification", (500,)) in wds and ("set_working_distance", (cal.wd_mm,)) in wds
+    assert moves == [({"Z": 11000.0}, False)]
+    moves.clear()
+    wds.clear()
+    assert w.select_field_size("500 µm")  # no WD1 recorded for it: the nominal WD
+    assert ("set_working_distance", (24.0,)) in wds and moves == [({"Z": 24000.0}, False)]
+    assert shared.field_size == "500 µm" and cal.wd_mm is None and LithoSettings.load(shared.path).field_size == "500 µm"
+    assert not w.select_field_size("nope")

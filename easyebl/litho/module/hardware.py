@@ -241,6 +241,14 @@ class BackendHardware(LithoHardware):
         done.set_result(True)
 
     # ---------------------------------------------------------------- column
+    def scan_area(self):
+        """The SEM imaging window's scan now (the engine's config): centre (XCS µm), width, height, rotation."""
+        eng = self.engine
+        if eng is None:
+            return None
+        c = eng.config
+        return (tuple(map(float, c.center_um)), float(c.width_um), float(c.height), float(c.rotation_rad))
+
     def magnification(self):
         if self.bundle is None:
             return None
@@ -349,6 +357,32 @@ class BackendHardware(LithoHardware):
             fut.set_result(r == QtWidgets.QMessageBox.Yes)
 
         return bool(self.bridge.call(show))
+
+    def ask_alignment(self, text):
+        """The Global Align passes disagree: Repeat / Continue (anyway) / Abort."""
+        def show(fut):
+            box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Warning, "Global Align", text, parent=self.parent)
+            b_rep = box.addButton("Repeat", QtWidgets.QMessageBox.AcceptRole)
+            b_cont = box.addButton("Continue anyway", QtWidgets.QMessageBox.DestructiveRole)
+            box.addButton("Abort", QtWidgets.QMessageBox.RejectRole)
+            box.setDefaultButton(b_rep)
+            self.alignment_box = box
+
+            def done(*_):
+                self.alignment_box = None
+                c = box.clickedButton()
+                if not fut.done():
+                    fut.set_result("repeat" if c is b_rep else "continue" if c is b_cont else "abort")
+
+            box.finished.connect(done)
+            box.open()  # window-modal, without a nested event loop
+
+        def cancel():
+            box = getattr(self, "alignment_box", None)
+            if box is not None:
+                box.reject()
+
+        return self.bridge.call(show, on_cancel=cancel) or "abort"
 
     def prepare_run(self):
         sem = getattr(self.bundle, "sem", None) if self.bundle is not None else None

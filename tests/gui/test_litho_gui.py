@@ -1,5 +1,6 @@
 """Lithography window (offscreen Qt): tabs, chips, step editor, schedule file, simulated runs, beam and field
-calibration windows, SEM mark picking, the program's backend."""
+calibration windows, field sizes, the calibration sample (Z_cal, WD1), chip heights (WD2), SEM mark picking, the
+program's backend."""
 import math
 import threading
 
@@ -15,15 +16,16 @@ from PySide6 import QtWidgets  # noqa: E402
 from easyebl.app.config import SystemConfig  # noqa: E402
 from easyebl.litho.beamcal import BeamCalConfig, BeamCalibration  # noqa: E402
 from easyebl.litho.coords import S3000_AXES  # noqa: E402
-from easyebl.litho.demo import CUP_POSITION, GRID_POSITION  # noqa: E402
-from easyebl.litho.fieldcal import Condition, FieldCalConfig  # noqa: E402
+from easyebl.litho.fieldcal import Condition  # noqa: E402
 from easyebl.litho.height import ChipHeight  # noqa: E402
 from easyebl.litho.runner import MarkRequest, SimulatedHardware  # noqa: E402
-from easyebl.litho.schedule import Chip, ColumnSetting, Exposure, FieldCorrection, Schedule  # noqa: E402
-from easyebl.litho.settings import LithoSettings, StagePosition  # noqa: E402
+from easyebl.litho.schedule import Chip, ColumnSetting, Exposure, Schedule  # noqa: E402
+from easyebl.litho.settings import FieldSize, LithoSettings, StagePosition  # noqa: E402
 
 ORIGIN = (5000.0, 5000.0)
-H = 4000.0  # the fixture's calibration positions: in focus at Z = 15000 − 4000 at WD 15 mm
+ZC = 11000.0  # the fixture's calibration sample: Z_cal …
+WD1 = 11.0  # … and WD1 (the simulator's Z and WD); the demo's field size "250 µm" is ×500
+CAL_NAME = "Calibration sample"
 
 
 def _rot(deg, s=1.0):
@@ -44,10 +46,12 @@ def win(qtbot, tmp_path):
 
     hw = SimulatedHardware(_rot(0.3, 1.001), stage_noise_um=0.3, pivot=ORIGIN, start=ORIGIN,
                            beam_linear=[[1.002, 0.0], [0.0, 0.999]], beam_k=1e-7, grid_at=((2000.0, 2000.0), 60.0),
-                           start_z=11100.0)
+                           start_z=ZC, magnification=500, wd_mm=WD1)
     settings = LithoSettings.load(str(tmp_path / "litho.json"))
-    settings.add_position(GRID_POSITION, 2000.0, 2000.0, H)  # the demo schedules' Beam / Field calibration
-    settings.add_position(CUP_POSITION, 4700.0, 5000.0, H)
+    settings.field_size = "250 µm"  # as selected in the Microscope window
+    settings.replace_position(CAL_NAME, 2000.0, 2000.0, ZC)  # the grid
+    settings.record_wd(WD1, ZC)  # WD1 of "250 µm"
+    settings.replace_position("Faraday cup", 4700.0, 5000.0, ZC + 20.0)  # a texture there
     w = LithoWindow(hw, settings)
     w.ask_on_close = False
     qtbot.addWidget(w)
@@ -64,10 +68,8 @@ def _calibration_waits(win, qtbot, timeout=30000):
     return _waits(qtbot, lambda: win.fieldcal_window, timeout)
 
 
-def _fast(schedule):
-    """The fixed steps of a demo schedule, quick on the simulator."""
-    schedule[1].config.pixels = 800
-    schedule[2].config.settle_s = 0.0
+def _stored_beamcal(win, mag=500.0, fs="250 µm"):
+    win.settings.set_beamcal(BeamCalibration(condition=Condition(mag, None, WD1, fs)))
 
 
 def test_window_open_edit_save_run(win, tmp_path, demo, qtbot):
@@ -75,61 +77,41 @@ def test_window_open_edit_save_run(win, tmp_path, demo, qtbot):
     assert [win.tabs.tabText(i) for i in range(win.tabs.count())] == ["Stage Positions", "Chips",
                                                                       "Exposure Schedule"]
     assert win.axes == S3000_AXES and win.view.flipped == (True, False)
-    assert isinstance(win.schedule[0], ColumnSetting) and tab.list.count() == 3 and not tab.b_del.isEnabled()
-    assert "WD 15 mm" in tab.list.item(0).text() and tab.list.item(0).font().bold()
-    tab.select(2)
+    assert isinstance(win.schedule[0], ColumnSetting) and tab.list.count() == 2 and not tab.b_del.isEnabled()
+    assert tab.list.item(0).font().bold()
+    tab.select(1)
     assert not tab.b_del.isEnabled() and not tab.b_up.isEnabled() and "(fixed step)" in tab.editor.title.text()
 
     assert win.open_schedule(demo["schedule"])
-    assert tab.list.count() == 4 and "(9 fields)" in tab.list.item(3).text()
+    assert tab.list.count() == 3 and "(9 fields)" in tab.list.item(2).text() and "field 250 µm" in tab.list.item(0).text()
     assert win.tab_chips.table.rowCount() == 1 and win.tab_chips.table.item(0, 0).text() == "Demo chip"
     x, y = win.view._patterns.getData()
     assert np.nanmin(x) == pytest.approx(4760.0, abs=0.5) and np.nanmax(x) == pytest.approx(5040.0, abs=0.5)
     assert np.nanmax(y) == pytest.approx(5040.0, abs=0.5)  # the layout in SCS around the chip origin
+    x, y = win.view._other.getData()  # every layer, gray: the alignment crosses (layer 2) too
+    assert np.nanmin(x) == pytest.approx(4751.0, abs=0.5) and np.nanmax(x) == pytest.approx(5049.0, abs=0.5)
 
     # the step editor
-    tab.select(3)
+    tab.select(2)
     assert tab.b_del.isEnabled()
     win.replan()
     ed = tab.editor
-    assert isinstance(ed.op, Exposure) and "9 field(s) of 100 µm" in ed.info.text()
+    assert isinstance(ed.op, Exposure) and "9 field(s) of 200 µm" in ed.info.text()
     assert "Global Align in FIELD_R1C1" in ed.info.text() and "8 field(s) with a Local marker" in ed.info.text()
     boxes = {b.title().split(" (")[0]: b for b in ed.findChildren(QtWidgets.QGroupBox)}
     boxes["Local markers"].setChecked(False)
-    assert not win.schedule[3].local_align and win.modified
+    assert not win.schedule[2].local_align and win.modified
     qtbot.waitUntil(lambda: isinstance(tab.editor.op, Exposure) and not tab.editor.op.local_align)
-    win.schedule[3].local_align = True
-    tab.editor.set_op(win.schedule[3])
+    win.schedule[2].local_align = True
+    tab.editor.set_op(win.schedule[2])
     n = tab.editor.set_local_per_field(-45.0, 45.0)
-    assert n == 9 and len(win.schedule[3].local_markers) == 9
-    win.view.stepClicked.emit(3)
-    assert tab.selected() == 3
-
-    # stage positions persist with H = WD − Z; Go to (in focus) / XY; Replace with current
-    pt = win.tab_positions
-    pt.add("Spot", 100.0, 200.0, 3000.0)
-    assert LithoSettings.load(win.settings.path).positions()["Spot"] == StagePosition("Spot", 100.0, 200.0, 3000.0)
-    pt.table.selectRow(2)
-    pt.b_go.click()
-    qtbot.waitUntil(lambda: win.hw.calls and win.hw.calls[-1] == ("move", 100.0, 200.0, 12000.0))  # Z = 15000 − H
-    pt.b_go_xy.click()
-    qtbot.waitUntil(lambda: win.hw.calls[-1] == ("move", 100.0, 200.0))
-    win.hw.z = 12500.0  # focused on it with Z
-    pt.replace_selected(confirm=False)
-    assert win.settings.positions()["Spot"] == StagePosition("Spot", 100.0, 200.0, 2500.0)
-    assert LithoSettings.load(win.settings.path).positions()["Spot"].h == 2500.0 and pt.table.item(2, 3).text() == \
-        "2500.0"
-    # a position without a height: Go to (in focus) off, shown red; a second tab on the settings follows
-    from easyebl.litho.module.tabs import StagePositionsTab
-
-    other = StagePositionsTab(win.settings)
-    qtbot.addWidget(other)
-    pt.add("Old", 1.0, 2.0)
-    assert other.table.rowCount() == 4 and other.table.item(3, 0).text() == "Old"
-    other.table.selectRow(3)
-    assert not other.b_go.isEnabled() and other.b_go_xy.isEnabled()
-    other.delete_selected()
-    assert pt.table.rowCount() == 3 and "Old" not in win.settings.positions()
+    assert n == 9 and len(win.schedule[2].local_markers) == 9
+    tol = [sp for sp in tab.editor.findChildren(QtWidgets.QDoubleSpinBox) if "agree" in sp.toolTip()]
+    assert len(tol) == 1 and tol[0].value() == 0.5
+    tol[0].setValue(0.3)
+    assert win.schedule[2].align_tolerance_um == 0.3
+    win.view.stepClicked.emit(2)
+    assert tab.selected() == 2
 
     # save / reopen
     p = str(tmp_path / "edited.ebls.json")
@@ -137,23 +119,24 @@ def test_window_open_edit_save_run(win, tmp_path, demo, qtbot):
     before = win.schedule.to_dict(str(tmp_path))
     assert win.open_schedule(p) and win.schedule.to_dict(str(tmp_path)) == before
 
-    # run the demo: the WD, the Beam and the Field calibration (Accept each), then the Exposure with Global
-    # Align + Local markers; the demo chip has a height: Z brings it into focus
+    # run the demo (a stored beam calibration): the field size, WD1; the Exposure with Global Align (confirmed) +
+    # Local markers; the stage moves in X, Y only, the focus to the chip's WD2; parked at the calibration sample
     assert win.open_schedule(demo["schedule"])
-    _fast(win.schedule)
-    win.set_chip_height("Demo chip", ChipHeight("constant", 3900.0))
+    win.schedule[1].reuse = True
+    _stored_beamcal(win)
+    win.set_chip_height("Demo chip", ChipHeight("constant", wd_mm=11.3, z_um=ZC))
     win.hw.stage = win.hw.readback = np.array(ORIGIN)
     win.hw.stage_noise = 0.0
     win.hw.calls.clear()
     assert win.run(confirm=False)
-    _waits(qtbot, lambda: win.beamcal_window).b_accept.click()
-    _calibration_waits(win, qtbot).b_accept.click()
     assert win.wait(30)
-    assert tab.states == ["done"] * 4, win.log_box.toPlainText()
-    assert len(win.hw.exposures) == 9 and "9 of 9 field(s) exposed" in tab.list.item(3).toolTip()
-    assert win.hw.calls[:2] == [("prepare",), ("wd", 15.0)] and ("focus", 10000) in win.hw.calls
-    assert {c[3] for c in win.hw.calls if c[0] == "move" and len(c) == 4} == {11000.0, 11100.0}  # the chip: 15000 − 3900
-    assert win.hw.calls[-1] == ("move", 2000.0, 2000.0, 11000.0)  # finished: parked at the calibration grid
+    assert tab.states == ["done"] * 3, win.log_box.toPlainText()
+    assert len(win.hw.exposures) == 9 and "9 of 9 field(s) exposed" in tab.list.item(2).toolTip()
+    calls = win.hw.calls
+    assert calls[:3] == [("prepare",), ("mag", 500), ("wd", WD1)] and ("wd", 11.3) in calls
+    assert all(len(c) == 3 for c in calls[:-2] if c[0] == "move") and win.hw.z == ZC  # Z stays
+    assert calls[-2:] == [("move", 2000.0, 2000.0, ZC), ("wd", WD1)]  # parked: the calibration sample
+    assert len(win.hw.measurements) == 4 + 8  # the Global Align markers twice, 8 Local markers
     assert win.chips["Demo chip"].measured and win.l_global.text().startswith("Chip Demo chip: rot")
     win.replan()
     assert win.tab_chips.table.item(0, 3).text().startswith("rot")
@@ -162,75 +145,117 @@ def test_window_open_edit_save_run(win, tmp_path, demo, qtbot):
     assert "Demo chip" not in win.chips
 
 
+def test_stage_positions_dz_record_wd_and_replace(win, qtbot):
+    from easyebl.litho.module.tabs import StagePositionsTab
+
+    pt = win.tab_positions
+    assert [pt.table.item(r, 0).text() for r in range(pt.table.rowCount())] == [CAL_NAME, "Faraday cup"]
+    assert pt.table.item(0, 3).text() == "0 (reference)" and pt.table.item(1, 3).text() == "+20.0"
+    assert "Calibration sample (250 µm): Z_cal 11000.0 µm, WD1 11.0000 mm" in pt.l_cal.text()
+    pt.table.selectRow(0)
+    assert not pt.b_del.isEnabled() and pt.b_replace.isEnabled()  # always kept
+    # a position: ΔZ against the calibration sample; Go to XYZ: Z_cal + ΔZ and the focus to WD1
+    win.hw.wd = 12.0
+    pt.add("Spot", 100.0, 200.0, 30.0)
+    assert LithoSettings.load(win.settings.path).positions()["Spot"] == StagePosition("Spot", 100.0, 200.0, 30.0)
+    pt.table.selectRow(2)
+    pt.b_go.click()
+    qtbot.waitUntil(lambda: win.hw.calls[-2:] == [("move", 100.0, 200.0, ZC + 30.0), ("wd", WD1)])
+    pt.b_go_xy.click()
+    qtbot.waitUntil(lambda: win.hw.calls[-1] == ("move", 100.0, 200.0))
+    win.hw.z = ZC + 50.0
+    pt.replace_selected(confirm=False)
+    assert win.settings.positions()["Spot"].dz == 50.0 and pt.table.item(2, 3).text() == "+50.0"
+    # Record WD: WD1 and Z_cal from the column and the stage now; no other ΔZ changes
+    win.hw.wd, win.hw.z = 11.05, ZC + 10.0
+    assert pt.record_wd(confirm=False)
+    cal = win.settings.calibration
+    assert (cal.wd_mm, cal.z_um) == (11.05, ZC + 10.0) and win.settings.positions()["Spot"].dz == 50.0
+    assert LithoSettings.load(win.settings.path).calibration.wd_mm == 11.05
+    # Replace the calibration sample at another Z: the other ΔZ follow (their Z stays)
+    pt.table.selectRow(0)
+    win.hw.stage = win.hw.readback = np.array([2010.0, 2000.0])
+    win.hw.z = ZC
+    pt.replace_selected(confirm=False)
+    assert cal.z_um == ZC and cal.x == 2010.0 and win.settings.positions()["Spot"].dz == 60.0
+    assert win.settings.faraday.dz == 30.0 and cal.wd_mm == 11.05
+    # a second tab on the settings follows; a position without ΔZ: Go to XYZ off; the fixed ones are not deleted
+    other = StagePositionsTab(win.settings)
+    qtbot.addWidget(other)
+    pt.add("Old", 1.0, 2.0)
+    assert other.table.rowCount() == 4 and other.table.item(3, 0).text() == "Old"
+    other.table.selectRow(3)
+    assert not other.b_go.isEnabled() and other.b_go_xy.isEnabled()
+    other.delete_selected()
+    assert pt.table.rowCount() == 3 and "Old" not in win.settings.positions()
+    other.table.selectRow(1)
+    other.delete_selected()
+    assert pt.table.rowCount() == 3
+    # no WD known: Record WD refuses
+    win.hw.wd = None
+    assert not pt.record_wd(confirm=False) and "not known" in pt.msg.text()
+
+
 def test_editor_types_chips_and_warnings(win, demo):
-    s = Schedule([ColumnSetting(magnification=2000), Exposure(chip="A", path=Schedule.load(demo["schedule"])
-                                                              .exposures[0].path), FieldCorrection()],
-                 chips=[Chip("A", ORIGIN)])
+    gds = Schedule.load(demo["schedule"]).exposures[0].path
+    s = Schedule([ColumnSetting(field_size="100 µm"), Exposure(chip="A", path=gds)], chips=[Chip("A", ORIGIN)])
     win.set_schedule(s)
-    assert [o.TYPE for o in win.schedule] == ["column", "beam_calibration", "field_correction", "exposure",
-                                              "field_correction"]
+    assert [o.TYPE for o in win.schedule] == ["column", "beam_calibration", "exposure"]
     ws = win.validate()
-    assert any("outside the field" in w for i, w in ws if i == 3)  # 80 µm fields in a 50 µm field
-    assert "⚠" in win.tab_schedule.list.item(3).text()
+    assert any("outside the field" in w for i, w in ws if i == 2)  # 80 µm fields + crosses at ±49 in 83 µm
+    assert any("the Microscope window is at field size 250 µm" in w for i, w in ws if i == 0)
+    assert "⚠" in win.tab_schedule.list.item(2).text()
     tab = win.tab_schedule
     tab.select(0)
-    combo = tab.editor.findChildren(QtWidgets.QComboBox)[0]
-    assert combo.itemText(0) == "Keep as is" and combo.itemData(1) == "default"
+    fs = tab.editor.field_size_combo
+    assert fs.currentData() == "100 µm" and fs.itemText(fs.findData("250 µm")) == "250 µm: ×500, WD 11 mm"
+    fs.setCurrentIndex(fs.findData("250 µm"))
+    assert win.schedule.field_size == "250 µm" and "field 250 µm" in tab.list.item(0).text()
+    combo = [c for c in tab.editor.findChildren(QtWidgets.QComboBox) if c.count() and c.itemText(0) == "Keep as is"][0]
+    assert combo.itemData(1) == "default"
     combo.setCurrentIndex(1)
     assert win.schedule[0].preset == "default"
-    wd = [sp for sp in tab.editor.findChildren(QtWidgets.QDoubleSpinBox) if sp.suffix() == " mm"]
-    assert len(wd) == 1 and wd[0].value() == 15.0  # the schedule's WD: in the first Column setting
-    wd[0].setValue(12.5)
-    assert win.schedule.wd_mm == 12.5 and "WD 12.5 mm" in tab.list.item(0).text()
-    win.hw.wd = 14.2371  # the column's WD now (from the focus)
-    tab.editor.b_wd_current.click()
-    assert win.schedule.wd_mm == 14.237 and wd[0].value() == 14.237 and "WD 14.237 mm" in tab.list.item(0).text()
-    win.hw.wd = None  # not known: nothing changes
-    assert not tab.editor.set_wd_to_current() and win.schedule.wd_mm == 14.237 and "cannot be read" in \
-        tab.editor.msg.text()
-    win.hw.wd = 15.0
-    # the calibration settings are in the steps' editors
+    # the beam calibration settings are in its editor (always on the calibration sample)
     tab.select(1)
-    combos = tab.editor.findChildren(QtWidgets.QComboBox)
-    pos = combos[0]
-    assert pos.findData(GRID_POSITION) > 0 and "H 4000.0" in pos.itemText(pos.findData(GRID_POSITION))
-    pos.setCurrentIndex(pos.findData(GRID_POSITION))
-    assert win.schedule[1].position == GRID_POSITION
+    assert not [c for c in tab.editor.findChildren(QtWidgets.QComboBox) if c.itemText(0).startswith("(choose")]
     px = [sp for sp in tab.editor.findChildren(QtWidgets.QSpinBox) if "px" in sp.suffix()][0]
     px.setValue(1000)
     assert win.schedule[1].config.pixels == 1000
-    mf = [b for b in tab.editor.findChildren(QtWidgets.QCheckBox) if b.text().startswith("focus and stigmate")][0]
+    boxes = {b.text().split(",")[0]: b for b in tab.editor.findChildren(QtWidgets.QCheckBox)}
+    mf = boxes["confirm the focus by hand first"]
     assert mf.isChecked() and win.schedule[1].config.focus_magnification == 10000
     mf.setChecked(False)
     assert win.schedule[1].config.manual_focus is False
     mf.setChecked(True)
-    tab.select(2)
-    pos = tab.editor.findChildren(QtWidgets.QComboBox)[0]
-    pos.setCurrentIndex(pos.findData(CUP_POSITION))
-    assert win.schedule[2].config.position == CUP_POSITION
-    keep = [b for b in tab.editor.findChildren(QtWidgets.QCheckBox) if b.text().startswith("keep the field")][0]
-    assert not keep.isChecked()
-    keep.setChecked(True)
-    assert win.schedule[2].reuse and "in force" in tab.list.item(2).text()
-    keep.setChecked(False)
-    # Add after the fixed steps (a Field / Beam calibration set up like the fixed one)
-    tab.select(1)
+    ed = tab.editor
+    assert "none stored for field size 250 µm: the step measures" in ed.stored.text()
+    boxes["use a stored calibration of the field size (else measure)"].setChecked(True)
+    assert win.schedule[1].reuse and "stored one" in tab.list.item(1).text()
+    win.replan()
+    assert "(none stored: measures)" in tab.list.item(1).text()
+    _stored_beamcal(win)  # stored with its field size: the step reuses it
+    win.settings.set_beamcal(BeamCalibration(sx=1.01, condition=Condition(500.0, None, WD1, "500 µm")))  # not this
+    win.replan()
+    assert "(stored " in tab.list.item(1).text()
+    assert "stored for field size 250 µm" in tab.editor.stored.text() and "used, nothing measured" in \
+        tab.editor.stored.text()
+    # Add after the fixed steps (a Beam calibration set up like the fixed one); a later Column setting: no field size
     tab.add_menu.actions()[1].trigger()  # Column setting
-    tab.add_menu.actions()[2].trigger()  # Field calibration
+    assert not hasattr(tab.editor, "field_size_combo") or tab.editor.field_size_combo.parent() is None or \
+        "The field size is the schedule's" in " ".join(lb.text() for lb in tab.editor.findChildren(QtWidgets.QLabel))
     tab.add_menu.actions()[0].trigger()  # Exposure on the selected chip
-    tab.add_menu.actions()[3].trigger()  # Beam calibration
-    assert [o.TYPE for o in win.schedule] == ["column", "beam_calibration", "field_correction", "column",
-                                              "field_correction", "exposure", "beam_calibration", "exposure",
-                                              "field_correction"]
-    assert win.schedule[5].chip == "A" and win.schedule[5].alignment_only
-    assert win.schedule[4].position == CUP_POSITION and win.schedule[6].config.pixels == 1000
-    tab.select(3)
+    tab.add_menu.actions()[2].trigger()  # Beam calibration
+    assert [o.TYPE for o in win.schedule] == ["column", "beam_calibration", "column", "exposure", "beam_calibration",
+                                              "exposure"]
+    assert win.schedule[3].chip == "A" and win.schedule[3].alignment_only and win.schedule[4].config.pixels == 1000
+    assert [a.text() for a in tab.add_menu.actions()] == ["Exposure", "Column setting", "Beam calibration"]
+    tab.select(2)
     tab.delete()
-    assert len(win.schedule) == 8
-    for i in range(3):  # the fixed steps stay
+    assert len(win.schedule) == 5
+    for i in range(2):  # the fixed steps stay
         tab.select(i)
         tab.delete()
-    assert len(win.schedule) == 8
+    assert len(win.schedule) == 5
     # chips: add, rename (the Exposures follow), move, delete only when unused
     ct = win.tab_chips
     name = ct.add_chip(origin=(100.0, 100.0))
@@ -251,9 +276,13 @@ def test_menu_bar(win):
     menus = [a.text().replace("&", "") for a in win.menuBar().actions()]
     assert menus == ["Schedule", "Step", "Calibration", "View", "Stage"]
     cal = [a.text() for a in win.menuBar().actions()[2].menu().actions() if a.text()]
-    assert cal == ["Run the fixed steps only (column, beam and field calibration)",
-                   "Forget the beam calibration of this condition", "Forget the field calibration"]
+    assert cal == ["Run the fixed steps only (column setting, beam calibration)", "Field calibration…",
+                   "Field sizes…", "Forget the beam calibration of this field size",
+                   "Forget the field calibration of this field size"]
+    step = [a.text() for a in win.menuBar().actions()[1].menu().actions() if a.text()]
+    assert "Add Field calibration" not in step and "Add Beam calibration" in step
     assert not win.a_abort.isEnabled() and win.a_run.isEnabled()
+    assert win.l_fs.text() == "Field size 250 µm (Microscope), schedule ?"
 
 
 def test_move_chip(win, demo, qtbot, monkeypatch):
@@ -284,136 +313,346 @@ def test_move_chip(win, demo, qtbot, monkeypatch):
     win._last_menu.close()
 
 
-def _calibration_schedule(win):
-    s = Schedule()
-    s[1].config = BeamCalConfig(pixels=800, position=GRID_POSITION)
-    s[2].config = FieldCalConfig(position=CUP_POSITION, settle_s=0.0)
+def _beam_schedule(win):
+    """The fixed steps at field size "100 µm" (×1200: 83 µm on the simulator), 800 px."""
+    s = Schedule([ColumnSetting(field_size="100 µm")])
+    s[1].config = BeamCalConfig(pixels=800)
+    win.settings.field_size = "100 µm"
+    assert win.settings.calibration.wd_mm is None  # WD1 is per field size: none for this one yet
+    win.settings.record_wd(WD1, ZC)
     win.set_schedule(s)
     return s
 
 
-def test_the_fixed_steps_beam_then_field_calibration(win, qtbot):
-    assert win.l_beam.text().startswith("Beam calibration: none for ×1000, WD 15.00 mm")
-    _calibration_schedule(win)
+def test_the_fixed_steps_and_the_beam_calibration(win, qtbot):
+    assert win.l_beam.text().startswith("Beam calibration: none for 250 µm ×500")
+    _beam_schedule(win)
     win.hw.stage_noise = 0.0
     assert win.run_calibration_steps()
     bw = _waits(qtbot, lambda: win.beamcal_window)
     assert bw.isVisible() and "X scale" in bw.numbers.text() and "+2" in bw.numbers.text()
     assert bw._img.image.shape == (800, 800)  # the full image, not binned
-    assert win.hw.z == 15000.0 - H and win.beamcal() is None  # in focus through its height; not before Accept
-    assert ("move", 2000.0, 2000.0, 15000.0 - H) in win.hw.calls
+    assert win.hw.z == ZC and win.beamcal() is None  # on the calibration sample; not before Accept
+    assert ("move", 2000.0, 2000.0, ZC) in win.hw.calls and ("focus", 10000) in win.hw.calls
     bw.b_accept.click()
-    cw = _calibration_waits(win, qtbot)  # the field calibration goes through it
+    assert win.wait(30)
     bc = win.beamcal()
     assert bc is not None and bc.sx == pytest.approx(1.002, abs=3e-5) and bc.sy == pytest.approx(0.999, abs=3e-5)
-    assert len(LithoSettings.load(win.settings.path).beamcals) == 1  # saved
-    assert cw.banner.isHidden()
-    cw.b_accept.click()
-    assert win.wait(30) and win.calibration.beamcal_id == bc.id
-    assert win.tab_schedule.states == ["done"] * 3, win.log_box.toPlainText()
+    assert bc.condition.field_size == "100 µm" and len(LithoSettings.load(win.settings.path).beamcals) == 1  # saved
+    assert win.tab_schedule.states == ["done"] * 2, win.log_box.toPlainText()
     win._update_status()
-    assert win.l_beam.text().startswith("Beam calibration: sx") and win.l_cal.text().startswith("Field calibration: rot")
-    assert win.l_wd.text().startswith("WD 15.000 mm")
+    assert win.l_beam.text().startswith("Beam calibration: sx") and win.l_wd.text() == "WD 11.000 mm (WD1 11)"
     # now the schedule may run from a step after the fixed ones
     win.schedule.add(Exposure(chip="A", global_align=True, global_markers=[(0.0, 0.0), (10.0, 0.0)]))
-    assert win.run_from_problem(3) is None
-    win.hw.wd = 15.3  # another WD: neither applies, and no run from step 4
-    win._update_status()
-    assert "none for" in win.l_beam.text() and "not ×1000, WD 15.30 mm" in win.l_cal.text()
-    assert "not at the schedule's WD" in win.run_from_problem(3) and not win.run(3, confirm=False)
-    win.hw.wd = 15.0
+    win.schedule.add_chip("A", ORIGIN)
+    assert win.run_problems(2) == []
+    win.hw.z = ZC + 5.0  # Z moved: no run from step 3
+    assert "not at the calibration sample's Z" in win.run_from_problem(2) and not win.run(2, confirm=False)
+    win.hw.z = ZC
+    win.hw.mag = 1000.0
+    assert "not at the field size's ×1200" in win.run_from_problem(2)
+    win.hw.mag = 1200.0
     win.forget_beamcal()
-    win._update_status()
-    assert win.beamcal() is None and "another beam calibration" in win.l_cal.text()
-    assert "no beam calibration" in win.run_from_problem(3) and not win.run(3, confirm=False)
-    assert "cannot run from step 4" in win.log_box.toPlainText()
+    assert win.beamcal() is None and "no beam calibration" in win.run_from_problem(2)
+    assert not win.run(2, confirm=False) and "cannot run from step 3" in win.log_box.toPlainText()
     # Discard, and Abort while it waits
     assert win.run_calibration_steps()
     _waits(qtbot, lambda: win.beamcal_window).b_discard.click()
     assert win.wait(30) and win.beamcal() is None and "discarded" in win.log_box.toPlainText()
     assert win.run_calibration_steps()
-    _waits(qtbot, lambda: win.beamcal_window).b_accept.click()
-    _calibration_waits(win, qtbot)
+    _waits(qtbot, lambda: win.beamcal_window)
     win.abort()
-    assert win.wait(30) and not win.fieldcal_window.awaiting
+    assert win.wait(30) and not win.beamcal_window.awaiting
 
 
-def test_field_calibration_mirror_mismatch_points_to_the_hardware_settings(win, qtbot):
-    s = _calibration_schedule(win)
-    s[1].reuse = True  # a stored beam calibration: no grid image
-    win.settings.set_beamcal(BeamCalibration(condition=Condition(1000.0, None, 15.0)))
-    win.hw.B = np.eye(2)  # this instrument's stage X runs along the image's x, the settings say mirrored
+def test_the_focus_confirmed_by_hand_is_saved_as_wd1(win, qtbot):
+    s = _beam_schedule(win)
+    win.hw.refocus_wd = 11.08
     win.hw.stage_noise = 0.0
     assert win.run_calibration_steps()
-    cw = _calibration_waits(win, qtbot)
-    assert not cw.banner.isHidden() and "Hardware → Configure" in cw.banner_text.text() and cw.b_fix.isHidden()
-    cw.b_discard.click()
-    assert win.wait(30) and win.calibration is None
-
-
-def test_a_refused_calibration_can_be_used_anyway(win, qtbot):
-    s = _calibration_schedule(win)
-    s[1].reuse = True
-    win.settings.set_beamcal(BeamCalibration(condition=Condition(1000.0, None, 15.0)))
-    hw = win.hw
-    real = hw.capture_image
-    hw.capture_image = lambda w, px, frames=1: (np.random.default_rng(len(hw.calls)).normal(size=(px, px)),
-                                                (w / px, w / px))  # nothing to match: the fit is refused
-    hw.stage_noise = 0.0
-    for use in (False, True):
-        assert win.run_calibration_steps()
-        cw = _calibration_waits(win, qtbot)
-        assert cw.result.problem and cw.b_accept.isVisible() and cw.b_accept.text() == "Use anyway"
-        assert "Use anyway to override" in cw.step.text()
-        (cw.b_accept if use else cw.b_discard).click()
-        assert win.wait(30)
-        assert win.tab_schedule.states[2] == ("done" if use else "failed"), win.log_box.toPlainText()
-    assert win.calibration is cw.result and "override" in win.log_box.toPlainText()
-    # a good fit: Accept again
-    hw.capture_image = real
-    assert win.run_calibration_steps()
-    cw = _calibration_waits(win, qtbot)
-    assert cw.b_accept.text() == "Accept"
-    cw.b_accept.click()
+    _waits(qtbot, lambda: win.beamcal_window).b_accept.click()
     assert win.wait(30)
+    assert win.settings.calibration.wd_mm == 11.08 and LithoSettings.load(win.settings.path).calibration.wd_mm == 11.08
+    assert "WD1 11.08 mm" in win.tab_positions.l_cal.text() or "WD1 11.0800 mm" in win.tab_positions.l_cal.text()
+    assert s[1].config.manual_focus
+
+
+def test_a_run_needs_the_microscope_at_the_schedules_field_size(win, demo):
+    assert win.open_schedule(demo["schedule"])
+    win.settings.field_size = "100 µm"
+    assert not win.run(confirm=False) and "the Microscope window is at field size 100 µm" in win.log_box.toPlainText()
+    win.settings.field_size = "500 µm"  # no WD1 recorded for it
+    win.schedule.field_size = "500 µm"
+    assert not win.run(confirm=False) and "no WD1" in win.log_box.toPlainText()
+    win.settings.field_size = win.schedule.field_size = "250 µm"
+    assert win.settings.calibration.wd_mm == WD1
+    # a chip height recorded at another Z than Z_cal: not allowed to run
+    win.set_chip_height("Demo chip", ChipHeight("constant", wd_mm=11.3, z_um=ZC + 40.0))
+    assert any("chip Demo chip" in p and "not at the calibration sample's Z" in p for p in win.run_problems())
+    assert not win.run(confirm=False)
+    assert "⚠" in win.tab_chips.table.item(0, 4).toolTip() or win.tab_chips.table.item(0, 4).toolTip()
+
+
+def test_the_field_calibration_dialog(win, qtbot, monkeypatch):
+    from easyebl.litho.module.dialogs import FieldCalSetupDialog
+
+    d = win.field_calibration_dialog(exec_=False)
+    qtbot.addWidget(d)
+    assert "Field size 250 µm" in d.findChildren(QtWidgets.QLabel)[0].text()
+    assert not d.bb.button(QtWidgets.QDialogButtonBox.Ok).isEnabled()  # no position chosen
+    d.position.setCurrentIndex(d.position.findData("Faraday cup"))
+    assert d.bb.button(QtWidgets.QDialogButtonBox.Ok).isEnabled() and d.value().position == "Faraday cup"
+
+    def fake_exec(dlg):
+        dlg.position.setCurrentIndex(dlg.position.findData("Faraday cup"))
+        dlg.cfg.settle_s = 0.0
+        return QtWidgets.QDialog.Accepted
+
+    monkeypatch.setattr(FieldCalSetupDialog, "exec", fake_exec)
+    win.hw.stage_noise = 0.0
+    _stored_beamcal(win)
+    win.field_calibration_dialog()
+    cw = _calibration_waits(win, qtbot)
+    assert ("move", 4700.0, 5000.0, ZC + 20.0) in win.hw.calls  # Z_cal + ΔZ
+    assert cw.banner.isHidden()
+    cw.b_accept.click()
+    assert win.wait(30) and win.calibration is not None
+    assert win.settings.fieldcal_config.position == "Faraday cup"
+    t = LithoSettings.load(win.settings.path)
+    assert t.fieldcal("250 µm") is not None and t.fieldcal_config.position == "Faraday cup"  # kept across sessions
+    win._update_status()
+    assert win.l_cal.text().startswith("Field calibration: rot")
+    # a wrong mirror setting: pointed to the hardware settings; Discard keeps the one in force
+    keep = win.calibration
+    win.hw.B = np.eye(2)
+    assert win.run_field_calibration()
+    cw = _calibration_waits(win, qtbot)
+    assert not cw.banner.isHidden() and "Hardware → Configure" in cw.banner_text.text()
+    cw.b_discard.click()
+    assert win.wait(30) and win.calibration is keep
+    # refused (nothing to match): Use anyway overrides
+    win.hw.B = win.axes.matrix
+    hw = win.hw
+    hw.capture_image = lambda w, px, frames=1: (np.random.default_rng(len(hw.calls)).normal(size=(px, px)),
+                                                (w / px, w / px))
+    assert win.run_field_calibration()
+    cw = _calibration_waits(win, qtbot)
+    assert cw.result.problem and cw.b_accept.text() == "Use anyway"
+    cw.b_accept.click()
+    assert win.wait(30) and win.calibration is cw.result and "override" in win.log_box.toPlainText()
+    win.forget_calibration()
+    assert win.calibration is None and LithoSettings.load(win.settings.path).fieldcal("250 µm") is None
+    # not at the field size's magnification: refused
+    win.hw.mag = 1000.0
+    assert win.run_field_calibration() and win.wait(30)
+    assert "not field size 250 µm's ×500" in win.log_box.toPlainText()
+
+
+def test_the_field_sizes_dialog(win, qtbot):
+    from easyebl.litho.module.tabs import PositionsHub
+
+    d = win.field_sizes_dialog(exec_=False)
+    qtbot.addWidget(d)
+    assert d.table.rowCount() == 3 and d.table.item(1, 3).text() == "200"  # 100 mm at ×1 / 500
+    ok = d.bb.button(QtWidgets.QDialogButtonBox.Ok)
+    d.table.item(0, 1).setText("1234")  # not a magnification the SEM accepts
+    assert not ok.isEnabled() and "×1234" in d.msg.text()
+    d.table.item(0, 1).setText("1000")
+    assert ok.isEnabled() and d.table.item(0, 3).text() == "100"
+    d.table.item(2, 0).setText("100 µm")
+    assert not ok.isEnabled() and "same name" in d.msg.text()
+    d.table.item(2, 0).setText("500 µm")
+    seen = []
+    PositionsHub.instance().changed.connect(lambda st: seen.append(st))
+    win.set_field_sizes(d.value())
+    assert seen and win.settings.field_sizes[0] == FieldSize("100 µm", 1000, 7.0)
+    assert LithoSettings.load(win.settings.path).field_sizes[0].magnification == 1000
 
 
 def test_chip_heights_from_the_chips_tab(win, qtbot, demo):
     assert win.open_schedule(demo["schedule"])
     ct = win.tab_chips
-    assert ct.table.item(0, 4).text() == "Z kept"
-    # constant: focused on a feature with Z, Record here
-    win.hw.z = 11500.0
+    assert ct.table.item(0, 4).text() == "focus kept"
+    # constant: focused on a feature with the stage at Z_cal, Record here takes the WD
+    win.hw.wd = 11.3
     d = win.height_dialog("Demo chip", exec_=False)
     qtbot.addWidget(d)
+    assert "Z_cal (11000.0 µm)" in d.findChildren(QtWidgets.QLabel)[0].text()
     d.mode.setCurrentIndex(d.mode.findData("constant"))
     d.record_constant()
     h = d.value()
-    assert h.mode == "constant" and h.value_um == 3500.0
+    assert h.mode == "constant" and h.wd_mm == 11.3 and h.z_um == ZC
     win.set_chip_height("Demo chip", h)
-    assert ct.table.item(0, 4).text() == "H 3500.0 µm" and win.modified
-    p = win._plan()[3]
-    assert {f.z for f in p.fields} == {11500.0}
-    # a map: three points at three stage positions (recorded in CCS)
+    assert ct.table.item(0, 4).text() == "WD2 11.300 mm at Z 11000 µm" and win.modified
+    p = win._plan()[2]
+    assert {f.wd for f in p.fields} == {11.3}
+    # not at Z_cal: refused
+    win.hw.z = ZC + 10.0
     d = win.height_dialog("Demo chip", exec_=False)
     qtbot.addWidget(d)
     d.mode.setCurrentIndex(d.mode.findData("map"))
-    for (x, y), z in (((5000.0, 5000.0), 11500.0), ((4900.0, 5000.0), 11510.0), ((5000.0, 5100.0), 11490.0)):
+    d.record_point()
+    assert not d.value().points and "is at Z 11010.0 µm" in d.msg.text()
+    win.hw.z = ZC
+    # a map: three points at three stage positions (recorded in CCS), each with its WD
+    for (x, y), wd in (((5000.0, 5000.0), 11.3), ((4900.0, 5000.0), 11.31), ((5000.0, 5100.0), 11.29)):
         win.hw.readback = np.array([x, y])
-        win.hw.z = z
+        win.hw.wd = wd
         d.record_point()
     h = d.value()
     assert h.mode == "map" and len(h.points) == 3 and h.points[1][:2] == pytest.approx((100.0, 0.0))  # X mirrored
-    assert h.at((0.0, 0.0)) == pytest.approx(3500.0) and h.at((100.0, 0.0)) == pytest.approx(3490.0)
+    assert h.wd_at((0.0, 0.0)) == pytest.approx(11.3) and h.wd_at((100.0, 0.0)) == pytest.approx(11.31)
     win.set_chip_height("Demo chip", h)
     assert ct.table.item(0, 4).text().startswith("map 3 pts")
-    zs = [f.z for f in win._plan()[3].fields]
-    assert len(set(zs)) > 1 and min(zs) > 11000.0
+    wds = [f.wd for f in win._plan()[2].fields]
+    assert len(set(wds)) > 1 and min(wds) > 11.0
+    # Go to a point: X, Y at Z_cal, the focus to its WD
+    d.table.selectRow(1)
+    d._goto_point()
+    qtbot.waitUntil(lambda: win.hw.calls[-1] == ("wd", 11.31))
+    assert win.hw.calls[-2] == ("move", pytest.approx(4900.0), pytest.approx(5000.0), ZC)
     # two points are not a map: the plan warns and the exposure is refused
-    win.set_chip_height("Demo chip", ChipHeight("map", points=h.points[:2]))
-    assert any("at least 3" in w for i, w in win.validate() if i == 3)
+    win.set_chip_height("Demo chip", ChipHeight("map", points=h.points[:2], z_um=ZC))
+    assert any("at least 3" in w for i, w in win.validate() if i == 2)
     win.save_to(demo["schedule"])
     assert Schedule.load(demo["schedule"]).chips[0].height.points == [tuple(q) for q in h.points[:2]]
+    # more than 1 mm from WD1 (11 mm): warned, also in the dialog
+    win.set_chip_height("Demo chip", ChipHeight("constant", wd_mm=12.5, z_um=ZC))
+    assert any("WD2 12.500 mm more than 1 mm from WD1 11 mm" in w for i, w in win.validate() if i == 2)
+    d = win.height_dialog("Demo chip", exec_=False)
+    qtbot.addWidget(d)
+    assert "from WD1 11 mm" in d.info.text()
+
+
+def test_every_gds_layer_is_drawn_gray(win, tmp_path):
+    """The layers the Exposure does not write are drawn gray – also shapes outside its fields (in the top cell
+    itself, or in cells without an exposed layer)."""
+    import gdstk
+
+    lib = gdstk.Library(unit=1e-6, precision=1e-9)
+    f = lib.new_cell("F")
+    f.add(gdstk.rectangle((-10, -10), (10, 10), layer=1))
+    m = lib.new_cell("MARKS")  # no layer 1 in it: not a field of the Exposure
+    m.add(gdstk.rectangle((300, 0), (310, 10), layer=2))
+    top = lib.new_cell("TOP")
+    top.add(gdstk.Reference(f, (0, 0)), gdstk.Reference(m, (0, 0)))
+    top.add(gdstk.rectangle((-200, -200), (-190, -190), layer=3))  # in the top cell itself
+    path = str(tmp_path / "layers.gds")
+    lib.write_gds(path)
+    s = Schedule([ColumnSetting(field_size="250 µm"), Exposure(chip="A", path=path, layers=[(1, 0)])],
+                 chips=[Chip("A", ORIGIN)])
+    win.set_schedule(s)
+    win.replan()
+    x, _ = win.view._patterns.getData()
+    assert np.nanmin(x) == pytest.approx(4990.0) and np.nanmax(x) == pytest.approx(5010.0)  # layer 1: the field
+    x, y = win.view._other.getData()
+    assert np.nanmin(x) == pytest.approx(5000.0 - 310.0) and np.nanmax(x) == pytest.approx(5000.0 + 200.0)  # X mirrored
+    assert np.nanmin(y) == pytest.approx(4800.0)
+    s.exposures[0].layers = None  # every layer written: what is in no field (the top cell's own shapes) still gray
+    win.replan()
+    x, y = win.view._other.getData()
+    assert np.nanmax(x) == pytest.approx(5000.0 + 200.0) and np.nanmin(y) == pytest.approx(4800.0)
+
+
+def _marks_gds(tmp_path):
+    """F: layer 1 square ±10 µm (exposed); in the top cell itself a layer-2 mark: a 10 µm square at
+    (−200 … −190, −200 … −190)."""
+    import gdstk
+
+    lib = gdstk.Library(unit=1e-6, precision=1e-9)
+    f = lib.new_cell("F")
+    f.add(gdstk.rectangle((-10, -10), (10, 10), layer=1))
+    top = lib.new_cell("TOP")
+    top.add(gdstk.Reference(f, (0, 0)))
+    top.add(gdstk.rectangle((-200, -200), (-190, -190), layer=2))
+    path = str(tmp_path / "marks.gds")
+    lib.write_gds(path)
+    return path
+
+
+def test_markers_are_picked_on_polygon_corners_and_centres(win, tmp_path, qtbot):
+    from easyebl.litho.module.view import snap_targets
+
+    op = Exposure(chip="A", path=_marks_gds(tmp_path), layers=[(1, 0)], offset=(5.0, 0.0), global_align=True,
+                  global_markers=[(0.0, 0.0), (1.0, 1.0)], local_align=True)
+    s = Schedule([ColumnSetting(field_size="250 µm"), op], chips=[Chip("A", ORIGIN)])
+    win.set_schedule(s)
+    ccs, kinds = snap_targets(op, win.library)
+    assert len(ccs) == 10 and kinds.count("centre") == 2  # 4 corners + the centre of each square (CCS = GDS + 5, 0)
+    assert any(np.allclose(c, (-190.0, -195.0)) for c in ccs) and any(np.allclose(c, (5.0, 0.0)) for c in ccs)
+    tab = win.tab_schedule
+    tab.select(2)
+    ed = tab.editor
+    v = win.view
+    g = s.chips[0].nominal(win.axes)
+
+    def click(ccs_pt, free=False, off=(0.0, 0.0)):
+        x, y = g.to_scs(np.asarray(ccs_pt, float)) + np.asarray(off)
+        return v.pick_at(float(x), float(y), free=free)
+
+    v.getPlotItem().getViewBox().setRange(xRange=(4700, 5300), yRange=(4700, 5300), padding=0)
+    # one Global marker: the corner of the gray (layer 2, top-cell) square
+    [b for b in ed.findChildren(QtWidgets.QPushButton) if b.text() == "Pick"][1].click()
+    assert v.picking and "Global marker 2 of 2" in v.pick_banner.text()
+    assert click((-185.0, -190.0), off=(0.3, 0.0))  # 0.3 µm off: snaps (well within 12 px)
+    assert op.global_markers[1] == (-185.0, -190.0) and not v.picking and win.modified
+    # all in turn: the exposed square's centre, then a corner
+    ed = tab.editor
+    ed.b_pick_global.click()
+    assert click((5.0, 0.0)) and v.picking and "Global marker 2 of 2" in v.pick_banner.text()
+    assert not click((100.0, 100.0))  # nothing near: nothing taken
+    assert click((15.0, 10.0)) and not v.picking
+    assert op.global_markers == [(5.0, 0.0), (15.0, 10.0)]
+    # Local markers: each click adds one; Shift-click takes the point itself; Esc ends
+    tab.editor.b_pick_local.click()
+    assert click((-190.0, -195.0))  # the gray square's centre
+    assert click((50.0, 60.0), free=True)
+    assert "2 added" in v.pick_banner.text()
+    v.pickCancelled.emit()
+    assert not v.picking and op.local_markers == [(-190.0, -195.0), pytest.approx((50.0, 60.0))]
+    assert tab.editor.local_table.rowCount() == 2
+    # snapping is in screen pixels: zoomed far out a 30 µm miss still snaps, zoomed in it does not
+    win.pick_markers("global", 0)
+    v.getPlotItem().getViewBox().setRange(xRange=(4990, 5010), yRange=(4990, 5010), padding=0)
+    assert not click((5.0, 0.0), off=(3.0, 0.0))
+    v.getPlotItem().getViewBox().setRange(xRange=(0, 10000), yRange=(0, 10000), padding=0)
+    assert click((5.0, 0.0), off=(3.0, 0.0)) and op.global_markers[0] == (5.0, 0.0)
+    # hovering rings the target a click would take
+    from PySide6 import QtCore
+
+    win.pick_markers("local")
+    vb = v.getPlotItem().getViewBox()
+    x, y = g.to_scs(np.array([5.0, 0.0]))
+    v._moved(vb.mapViewToScene(QtCore.QPointF(float(x), float(y))))
+    assert np.allclose(v._snap.getData()[0], [x]) and np.allclose(v._snap.getData()[1], [y])
+    v._moved(vb.mapViewToScene(QtCore.QPointF(2000.0, 2000.0)))
+    assert len(v._snap.getData()[0]) == 0
+    v.pickCancelled.emit()
+    # in pick mode a click does not select a field, a right click cancels
+    win.pick_markers("local")
+    v.pickCancelled.emit()
+    assert not v.picking
+
+
+def test_the_full_fov_and_a_reduced_imaging_scan(win):
+    """Green: the full field at the stage; red: the SEM imaging scan, only when reduced or shifted."""
+    win.hw.stage = win.hw.readback = np.array(ORIGIN)
+    win._tick()
+    x, _ = win.view._fov.getData()
+    assert np.nanmax(x) - np.nanmin(x) == pytest.approx(200.0) and win.view._scan.getData()[0] is None or \
+        len(win.view._scan.getData()[0]) == 0
+    win.hw.scan = ((0.0, 0.0), 200.0, 200.0, 0.0)  # the whole field: nothing more
+    win._tick()
+    assert not win.view._scan_label.isVisible()
+    win.hw.scan = ((20.0, -10.0), 40.0, 30.0, 0.0)  # zoomed and shifted
+    win._tick()
+    x, y = win.view._scan.getData()
+    assert win.view._scan_label.isVisible()
+    assert np.nanmax(x) - np.nanmin(x) == pytest.approx(40.0) and np.nanmax(y) - np.nanmin(y) == pytest.approx(30.0)
+    assert np.mean(x[:4]) == pytest.approx(5000.0 - 20.0) and np.mean(y[:4]) == pytest.approx(5000.0 - 10.0)  # X mirrored
+    win.hw.scan = None
+    win._tick()
+    assert not win.view._scan_label.isVisible()
 
 
 def test_stage_settings_dialog_shows_the_axes(win, monkeypatch):
@@ -428,6 +667,44 @@ def test_stage_settings_dialog_shows_the_axes(win, monkeypatch):
     win.edit_axes()
     s = LithoSettings.load(win.settings.path)
     assert s.stage_tolerance_um == 0.7 and win.axes == S3000_AXES
+
+
+def test_move_stage_dialog(win, demo, qtbot, monkeypatch):
+    from easyebl.litho.module.dialogs import MoveStageDialog
+
+    assert win.open_schedule(demo["schedule"])
+    win.set_chip_height("Demo chip", ChipHeight("constant", wd_mm=11.3, z_um=ZC))
+    click, markers, positions = win.stage_targets((4980.0, 5010.0))
+    assert click == ("the clicked position (chip Demo chip)", (4980.0, 5010.0), ZC, 11.3)  # on the chip: WD2
+    assert win.stage_targets((100.0, 100.0))[0] == ("the clicked position", (100.0, 100.0), None, None)  # off
+    ms = markers["Demo chip"]
+    assert len(ms) == 2 + 9 and ms[0][1] == pytest.approx((5045.0, 4955.0)) and ms[0][2:] == (ZC, 11.3)  # X mirrored
+    assert [p[0] for p in positions] == [CAL_NAME, "Faraday cup"] and positions[1][2:] == (ZC + 20.0, WD1)
+    d = win.move_stage_dialog(click=(4980.0, 5010.0), exec_=False)
+    qtbot.addWidget(d)
+    assert d.b_click.isChecked() and d.value() == (4980.0, 5010.0, ZC, 11.3)
+    d.marker.setCurrentIndex(1)  # → the marker option
+    assert d.b_marker.isChecked() and d.value() == (pytest.approx(ms[1][1][0]), pytest.approx(ms[1][1][1]), ZC, 11.3)
+    d.position.setCurrentIndex(1)
+    assert d.b_position.isChecked() and d.value() == (4700.0, 5000.0, ZC + 20.0, WD1)
+    d.focus.setChecked(False)
+    assert d.value() == (4700.0, 5000.0, None, None)
+    # from the plot's context menu: the stage goes there
+    picked = {}
+
+    def fake_exec(dlg):
+        dlg.b_position.setChecked(True)
+        dlg.position.setCurrentIndex(0)
+        picked["v"] = dlg.value()
+        return QtWidgets.QDialog.Accepted
+
+    monkeypatch.setattr(MoveStageDialog, "exec", fake_exec)
+    win.hw.wd = 12.0
+    win.view.contextRequested.emit(5.0, 6.0, win.mapToGlobal(win.rect().center()))
+    win._last_menu.actions()[0].trigger()
+    win._last_menu.close()
+    assert picked["v"] == (2000.0, 2000.0, ZC, WD1)
+    qtbot.waitUntil(lambda: win.hw.calls[-2:] == [("move", 2000.0, 2000.0, ZC), ("wd", WD1)])
 
 
 # ====================================================================== in the easyEBL program
@@ -477,6 +754,10 @@ def test_litho_in_the_program_marks_are_clicked_in_the_sem_window(ui, qtbot):
     cfg = ui.backend.engine.config
     assert cfg.width_um == pytest.approx(10.0) and cfg.center_um == pytest.approx((3.0, -2.0))  # zoomed on the mark
     assert sem.view._pick_targets == [(3.0, -2.0)] and sem.view._pick_centre_cross and sem.pick_bar.isVisible()
+    assert w.hw.scan_area()[:2] == (pytest.approx((3.0, -2.0)), pytest.approx(10.0))
+    w.hw.bundle.stage.refresh(("X", "Y")).result(30)
+    w._tick()
+    assert w.view._scan_label.isVisible()  # the zoomed imaging scan, red, inside the green field
     # each click centres the scan there; nothing is answered until Confirm
     eng = ui.backend.engine
     sem.view.pointPicked.emit(3.4, -1.7)
@@ -502,18 +783,23 @@ def test_litho_in_the_program_marks_are_clicked_in_the_sem_window(ui, qtbot):
     assert out["xy"] is None
 
 
-def _program_fixed_steps(w, s, mag=1000.0):
-    """The fixed steps of *s* on the program's simulators: step 1 sets the WD (15 mm), a stored (identity) beam
-    calibration, the field calibration at a stage position in focus where the stage's Z is now."""
+def _program_setup(w, mag=1000):
+    """On the program's simulators: a field size "t" at ×*mag* selected, the calibration sample where the stage
+    is now (Z_cal, WD1 = the WD now), a stored (identity) beam calibration, the column at ×*mag*."""
     mic = w.hw.bundle
-    wd = s.wd_mm = 15.0
     mic.stage.refresh(("X", "Y", "Z")).result(30)
-    z = float(mic.stage.positions["Z"])
-    if "tex" not in w.settings.positions():
-        w.settings.add_position("tex", 300.0, 300.0, 1000.0 * wd - z)
-    s[1].reuse = True
-    w.settings.set_beamcal(BeamCalibration(condition=Condition(mag, None, wd)))
-    s[2].config = FieldCalConfig(position="tex", settle_s=0.1, image_px=256, pattern="cross")
+    x, y, z = (float(mic.stage.positions[k]) for k in ("X", "Y", "Z"))
+    wd = float(mic.sem.working_distance_mm())
+    st = w.settings
+    st.set_field_sizes(st.field_sizes + [FieldSize("t", mag, round(wd, 3))])
+    st.field_size = "t"
+    st.replace_position(CAL_NAME, x, y, z)
+    st.record_wd(wd, z)
+    if "tex" not in st.positions():
+        st.add_position("tex", 300.0, 300.0, 0.0)
+    st.set_beamcal(BeamCalibration(condition=Condition(float(mag), None, wd, "t")))
+    mic.sem.set_magnification(mag).result(30)
+    return x, y, z, wd
 
 
 def test_litho_runs_on_the_simulated_backend(ui, qtbot, demo):
@@ -525,17 +811,17 @@ def test_litho_runs_on_the_simulated_backend(ui, qtbot, demo):
     w = ui.open("litho")
     w.ask_on_close = False
     gds = Schedule.load(demo["schedule"]).exposures[0].path
-    s = Schedule([ColumnSetting(preset="test", magnification=900.0, current_pa=200.0),
+    x, y, z, wd = _program_setup(w, mag=900)
+    s = Schedule([ColumnSetting(preset="test", field_size="t", current_pa=200.0),
                   Exposure(chip="A", path=gds, layers=[(1, 0)], dwell_us=0.5, step_nm=500.0)],
                  chips=[Chip("A", (300.0, 400.0))])
-    _program_fixed_steps(w, s, mag=900.0)
+    s[1].reuse = True
     w.set_schedule(s)
     assert w.run(confirm=False)
-    _calibration_waits(w, qtbot, timeout=180000).b_accept.click()
     qtbot.waitUntil(lambda: w.runner is None, timeout=180000)
-    assert w.tab_schedule.states == ["done"] * 4, w.log_box.toPlainText()
+    assert w.tab_schedule.states == ["done"] * 3, w.log_box.toPlainText()
     assert mic.sem.magnification() == 900
-    assert w.hw.stage_position() == pytest.approx((300.0 - 200.0, 400.0 - 200.0), abs=1.0)  # the last field
+    assert w.hw.stage_position() == pytest.approx((x, y), abs=1.0)  # parked at the calibration sample
     assert w.hw.move_dialogs >= 9 and w.hw.move_dialog is None
     # a move in progress (e.g. the user's) is waited for; Z moves too
     z0 = mic.stage.positions["Z"]
@@ -582,16 +868,18 @@ def test_an_exposure_holds_the_daq_with_the_sem_on_external_scan(ui):
 
 def test_field_calibration_in_the_program(ui, qtbot):
     """BackendHardware on the simulators: real stage moves, SEM captures and the simulated image following
-    the stage – the calibration finds the simulators' hidden map (an identity beam calibration: as measured)."""
+    the stage – the standalone field calibration finds the simulators' hidden map (an identity beam calibration:
+    as measured)."""
     from easyebl.app.backend import SIM_STAGE_TO_BEAM
 
     mic = ui.backend.microscope
     w = ui.open("litho")
     w.ask_on_close = False
-    s = Schedule()
-    _program_fixed_steps(w, s)
-    w.set_schedule(s)
-    assert w.run_calibration_steps()
+    _program_setup(w)
+    w.settings.fieldcal_config.position = "tex"
+    w.settings.fieldcal_config.settle_s = 0.1
+    w.settings.fieldcal_config.pattern = "cross"
+    assert w.run_field_calibration()
     cw = _calibration_waits(w, qtbot, timeout=180000)
     assert cw.banner.isHidden(), cw.banner_text.text()
     cw.b_accept.click()
@@ -599,6 +887,7 @@ def test_field_calibration_in_the_program(ui, qtbot):
     assert w.calibration is not None, w.log_box.toPlainText()
     assert np.allclose(w.calibration.stage_to_beam, np.asarray(SIM_STAGE_TO_BEAM), atol=5e-3)
     assert mic.stage.positions["X"] == pytest.approx(300.0, abs=0.5)
+    assert LithoSettings.load(w.settings.path).fieldcal("t") is not None  # kept for the field size
 
 
 def test_sem_center_with_stage_in_the_program(ui, qtbot):
@@ -612,43 +901,6 @@ def test_sem_center_with_stage_in_the_program(ui, qtbot):
     sem.center_with_stage(c[0] + 4.0, c[1] - 3.0)  # behind the modal stage dialog, which closes itself
     assert st.positions["X"] == pytest.approx(x0 - 4.0, abs=0.5) and st.positions["Y"] == pytest.approx(y0 - 3.0,
                                                                                                         abs=0.5)
-
-
-def test_move_stage_dialog(win, demo, qtbot, monkeypatch):
-    from easyebl.litho.module.dialogs import MoveStageDialog
-
-    assert win.open_schedule(demo["schedule"])
-    win.set_chip_height("Demo chip", ChipHeight("constant", 3900.0))
-    click, markers, positions = win.stage_targets((4980.0, 5010.0))
-    assert click == ("the clicked position (chip Demo chip)", (4980.0, 5010.0), 11100.0)  # on the chip: in focus
-    assert win.stage_targets((100.0, 100.0))[0] == ("the clicked position", (100.0, 100.0), None)  # off: Z stays
-    ms = markers["Demo chip"]
-    assert len(ms) == 2 + 9 and ms[0][1] == pytest.approx((5045.0, 4955.0)) and ms[0][2] == 11100.0  # X mirrored
-    assert [p[0] for p in positions] == [GRID_POSITION, CUP_POSITION] and positions[0][2] == 15000.0 - H
-    d = win.move_stage_dialog(click=(4980.0, 5010.0), exec_=False)
-    qtbot.addWidget(d)
-    assert d.b_click.isChecked() and d.value() == (4980.0, 5010.0, 11100.0)
-    d.marker.setCurrentIndex(1)  # → the marker option
-    assert d.b_marker.isChecked() and d.value() == (pytest.approx(ms[1][1][0]), pytest.approx(ms[1][1][1]), 11100.0)
-    d.position.setCurrentIndex(1)
-    assert d.b_position.isChecked() and d.value() == (4700.0, 5000.0, 15000.0 - H)
-    d.focus.setChecked(False)
-    assert d.value() == (4700.0, 5000.0, None)
-    # from the plot's context menu: the stage goes there
-    picked = {}
-
-    def fake_exec(dlg):
-        dlg.b_position.setChecked(True)
-        dlg.position.setCurrentIndex(0)
-        picked["v"] = dlg.value()
-        return QtWidgets.QDialog.Accepted
-
-    monkeypatch.setattr(MoveStageDialog, "exec", fake_exec)
-    win.view.contextRequested.emit(5.0, 6.0, win.mapToGlobal(win.rect().center()))
-    win._last_menu.actions()[0].trigger()
-    win._last_menu.close()
-    assert picked["v"] == (2000.0, 2000.0, 15000.0 - H)
-    qtbot.waitUntil(lambda: win.hw.calls and win.hw.calls[-1] == ("move", 2000.0, 2000.0, 15000.0 - H))
 
 
 def test_focus_prompt_in_the_program(ui, qtbot):
@@ -678,3 +930,19 @@ def test_focus_prompt_in_the_program(ui, qtbot):
     n = len(sim.received)
     w.hw.prepare_run()
     assert not [x for x in sim.received[n:] if x.startswith(("#RUN", "#SCAN", "RUN ", "SCAN "))], sim.received[n:]
+
+
+def test_the_alignment_prompt_in_the_program(ui, qtbot):
+    """The Global Align passes disagree: Repeat / Continue anyway / Abort."""
+    w = ui.open("litho")
+    w.ask_on_close = False
+    for k, want in enumerate(("repeat", "continue", "abort")):
+        out = {}
+        threading.Thread(target=lambda: out.setdefault("a", w.hw.ask_alignment("passes differ")), daemon=True).start()
+        qtbot.waitUntil(lambda: getattr(w.hw, "alignment_box", None) is not None
+                        and w.hw.alignment_box.isVisible(), timeout=10000)
+        box = w.hw.alignment_box
+        assert "passes differ" in box.text()
+        box.buttons()[[b.text() for b in box.buttons()].index(("Repeat", "Continue anyway", "Abort")[k])].click()
+        qtbot.waitUntil(lambda: "a" in out, timeout=10000)
+        assert out["a"] == want

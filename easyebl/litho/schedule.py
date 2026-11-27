@@ -1,37 +1,39 @@
-"""The exposure schedule (no Qt): chips, and Column setting / Beam calibration / Field calibration /
-Exposure steps.
+"""The exposure schedule (no Qt): chips, and Column setting / Beam calibration / Exposure steps.
 
-* **Working distance** – one WD for the whole schedule (:attr:`Schedule.wd_mm`): the first Column
-  setting sets the focus to it and nothing changes the column's focus after that; every sample is
-  brought into focus with the stage's Z alone, from its height ``H = WD − Z``
-  (:mod:`easyebl.litho.height`): ``Z = 1000·WD − H``.
+* **Field size** – one per schedule (in its first Column setting): a magnification and a nominal
+  WD (:class:`~easyebl.litho.settings.FieldSize`).  A schedule runs only at the field size
+  selected in the Microscope window.
+* **Focus** – the stage Z stays at the calibration sample's ``Z_cal``; the focus (WD) does the
+  rest: ``WD1`` on the calibration sample, ``WD2`` (or a plane through ``WD2x``) on a chip
+  (:mod:`easyebl.litho.height`), all recorded with the stage at ``Z_cal``.
 * **Chip** – a sample with its own chip coordinates (CCS, :mod:`easyebl.litho.coords`): a name,
-  the stage position of the CCS origin (nominal, through the stage axes) and its height (none /
-  constant / a plane through ≥ 3 points).  A Global Align measures where the chip really is
-  (CCS → SCS, affine); that holds for every later Exposure on the chip.
-* Every schedule starts with three fixed steps (not deleted, moved or disabled):
-  **Column setting** (``column``) – beam preset of the microscope module (or keep as is),
-  magnification (sets the field from the global field calibration), optional nominal beam
-  current (for the dose readout), and the schedule's WD; **Beam calibration**
-  (``beam_calibration``) – the grid image at a named stage position (:mod:`easyebl.litho.beamcal`);
-  **Field calibration** (``field_correction``) – the stage → beam map at a named stage position,
-  valid for the column condition (magnification, beam preset, WD) and beam calibration it was
-  measured at.  More Column settings / calibrations may follow (e.g. another magnification).
+  the stage position of the CCS origin (nominal, through the stage axes) and its height.  A Global
+  Align measures where the chip really is (CCS → SCS, affine); that holds for every later
+  Exposure on the chip.
+* Every schedule starts with two fixed steps (not deleted, moved or disabled):
+  **Column setting** (``column``) – the field size (sets the magnification; the focus goes to
+  WD1), the beam preset of the microscope module (or keep as is), an optional nominal beam
+  current (for the dose readout); **Beam calibration** (``beam_calibration``) – the grid image on
+  the calibration sample (:mod:`easyebl.litho.beamcal`).  Later Column settings change the beam
+  preset / current only.  The field calibration (stage ↔ beam rotation) is not a step: one is
+  kept per field size (Field calibration dialog) and used automatically.
 * **Exposure** (``exposure``) – a whole GDS file on a chip.  Its origin is the CCS origin + an
   offset (no rotation).  Each cell of the top level is one *field*: its centre (the cell's
   bounding-box centre, or its origin) is the field centre, its coordinates relative to that are
   FCS.  Markers are CCS points (= GDS top-level coordinates + offset):
 
   - Global Align (2–4 markers) – all inside the field of view of one field, which is written
-    first; it measures the chip's CCS → SCS map;
+    first; measured twice (1 → 2 → 1 → 2), the passes must agree within the alignment tolerance;
+    it measures the chip's CCS → SCS map;
   - Local markers – each assigned to the field whose field of view holds it (nearest centre),
     at most one per field: a shift for that field only.
 
   An Exposure without a GDS file aligns only (one field at the Global Align markers).
 
-Saved as JSON (``format: easyebl-schedule``, version 4; version 3 files are read: the WD and the
-calibration steps are added).  :func:`plan` walks a schedule without
-hardware: fields, stage targets, maps and warnings per step.
+Saved as JSON (``format: easyebl-schedule``, version 5; versions 3 and 4 are read: their WD,
+heights and Field calibration steps are dropped, the magnification becomes the field size with
+it).  :func:`plan` walks a schedule without hardware: fields, stage targets, maps and warnings per
+step.
 """
 from __future__ import annotations
 
@@ -47,20 +49,18 @@ from ..microscope.s3000.commands import ALLOWED_MAGNIFICATIONS
 from . import dose as dosemod
 from .beamcal import BeamCalConfig
 from .coords import S3000_AXES, ChipTransform, FieldMap, StageAxes, check_field, stage_rotation
-from .fieldcal import FieldCalConfig
 from .gds import GDSDoseMapping, load_library, pattern_from_cell
 from .geometry import Dot, Pattern, Polyline, rectangle
-from .height import ChipHeight, z_for
+from .height import WD_WARN_MM, ChipHeight
 
-__all__ = ["Operation", "ColumnSetting", "BeamCalibrationStep", "FieldCorrection", "Exposure", "Chip", "PatternSpec", "PatternLibrary",
+__all__ = ["Operation", "ColumnSetting", "BeamCalibrationStep", "Exposure", "Chip", "PatternSpec", "PatternLibrary",
            "FieldDef", "MarkerAssignment", "exposure_fields", "assign_markers", "ScheduleSettings", "Schedule",
            "StepPlan", "FieldPlan", "plan", "OP_TYPES", "SCHEDULE_FORMAT", "ScheduleError", "dummy_pattern",
            "KEEP_AS_IS", "position_problem", "dose_readout", "MAGNIFICATIONS", "nearest_magnification", "op_from_dict", "find_beamcal",
-           "FIXED_STEPS", "DEFAULT_WD_MM"]
+           "FIXED_STEPS", "field_size_of", "calibration_problem", "wd_far_problem"]
 
 SCHEDULE_FORMAT = "easyebl-schedule"
-SCHEDULE_VERSION = 4
-DEFAULT_WD_MM = 15.0
+SCHEDULE_VERSION = 5
 KEEP_AS_IS = ""  # the column setting's preset: keep the beam as it is
 #: the magnifications the S-3000 accepts (manual section 8)
 MAGNIFICATIONS: tuple = ALLOWED_MAGNIFICATIONS
@@ -195,7 +195,8 @@ class PatternLibrary:
 @dataclass
 class Chip:
     """A sample with its own CCS: *origin* is the nominal stage position of the CCS origin;
-    *height* its H = WD − Z (:class:`~easyebl.litho.height.ChipHeight`, map points in CCS)."""
+    *height* the WD in focus on it at ``Z_cal`` (:class:`~easyebl.litho.height.ChipHeight`, map
+    points in CCS)."""
 
     name: str = "Chip 1"
     origin: tuple = (0.0, 0.0)
@@ -210,10 +211,9 @@ class Chip:
     def nominal(self, axes: StageAxes) -> ChipTransform:
         return ChipTransform.nominal(self.origin, axes)
 
-    def z_at(self, ccs, wd_mm: float | None) -> float | None:
-        """The stage Z that has the chip in focus at CCS *ccs* at *wd_mm* (None: Z kept)."""
-        h = self.height.at(ccs)
-        return None if h is None or wd_mm is None else z_for(wd_mm, h)
+    def wd_at(self, ccs) -> float | None:
+        """The WD (mm) in focus at CCS *ccs* with the stage at Z_cal (None: the focus is kept)."""
+        return self.height.wd_at(ccs)
 
     def to_dict(self) -> dict:
         return {"name": self.name, "origin": list(self.origin), "note": self.note, "height": self.height.to_dict()}
@@ -257,22 +257,31 @@ class ColumnSetting(Operation):
     TYPE: ClassVar[str] = "column"
     TITLE: ClassVar[str] = "Column setting"
     preset: str = KEEP_AS_IS  # beam preset name; "" keeps the beam as it is
-    magnification: int = 1000  # one of MAGNIFICATIONS
+    field_size: str = ""  # FieldSize name (the first Column setting only: the schedule's)
     current_pa: float | None = None  # nominal beam current (dose readout only)
 
-    def __post_init__(self):
-        if not self.magnification or self.magnification <= 0:
-            raise ScheduleError("the magnification must be positive")
-        if float(self.magnification).is_integer():
-            self.magnification = int(self.magnification)  # the SEM driver takes whole numbers only
-
-    @property
-    def permitted(self) -> bool:
-        return self.magnification in MAGNIFICATIONS
-
     def summary(self) -> str:
-        s = f"×{self.magnification:g}, beam {repr(self.preset) if self.preset else 'kept as is'}"
+        s = (f"field {self.field_size or '?'}, " if self.field_size or not self.preset else "") \
+            + f"beam {repr(self.preset) if self.preset else 'kept as is'}"
         return s + (f", {self.current_pa:g} pA" if self.current_pa else "")
+
+    @classmethod
+    def from_dict(cls, d: dict, base_dir: str | None = None) -> "Operation":
+        d = dict(d)
+        if "magnification" in d and not d.get("field_size"):  # version ≤ 4: the field size of that magnification
+            from .settings import DEFAULT_FIELD_SIZES
+            d["field_size"] = next((f.name for f in DEFAULT_FIELD_SIZES()
+                                    if f.magnification == int(d["magnification"] or 0)), "")
+        return super().from_dict(d, base_dir)
+
+
+def field_size_of(name: str, field_sizes=None):
+    """The :class:`~easyebl.litho.settings.FieldSize` named *name* in *field_sizes* (None: the
+    defaults), or None."""
+    if field_sizes is None:
+        from .settings import DEFAULT_FIELD_SIZES
+        field_sizes = DEFAULT_FIELD_SIZES()
+    return next((f for f in field_sizes if f.name == name), None)
 
 
 class _CalibrationStep(Operation):
@@ -306,35 +315,18 @@ class _CalibrationStep(Operation):
 
 @dataclass
 class BeamCalibrationStep(_CalibrationStep):
-    """Beam calibration: one image of a calibration grid at a named stage position (in focus through
-    its height), fitted (:mod:`easyebl.litho.beamcal`); valid for the magnification and WD."""
+    """Beam calibration: one image of the calibration grid on the calibration sample (at Z_cal, the
+    focus at WD1 – confirmed by hand), fitted (:mod:`easyebl.litho.beamcal`); valid for the field
+    size (at any WD)."""
 
     TYPE: ClassVar[str] = "beam_calibration"
     TITLE: ClassVar[str] = "Beam calibration"
     CONFIG: ClassVar[type] = BeamCalConfig
     config: BeamCalConfig = field(default_factory=BeamCalConfig)
-    reuse: bool = False  # use a stored beam calibration of the same magnification and WD (else measure)
+    reuse: bool = False  # use a stored beam calibration of the field size (else measure)
 
     def summary(self) -> str:
-        where = f"at {self.position!r}" if self.position else "no position"
-        return where + (", stored one if there is" if self.reuse else "")
-
-
-@dataclass
-class FieldCorrection(_CalibrationStep):
-    """Field calibration (stage → beam map) at a named stage position (in focus through its height),
-    valid for the column condition it is measured at (see :mod:`easyebl.litho.fieldcal`)."""
-
-    TYPE: ClassVar[str] = "field_correction"
-    TITLE: ClassVar[str] = "Field calibration"
-    CONFIG: ClassVar[type] = FieldCalConfig
-    config: FieldCalConfig = field(default_factory=FieldCalConfig)
-    notes: str = ""
-    reuse: bool = False  # keep the field calibration in force when it applies (same condition, beam calibration)
-
-    def summary(self) -> str:
-        where = f"at {self.position!r}" if self.position else "no position"
-        return where + (", the one in force if it applies" if self.reuse else "")
+        return "on the calibration sample" + (", stored one if there is" if self.reuse else "")
 
 
 ORDERS = ("file", "raster", "serpentine")
@@ -359,6 +351,7 @@ class Exposure(Operation):
     local_align: bool = False
     local_markers: list = field(default_factory=list)  # CCS points, at most one per field
     view_um: float = 10.0  # width of the zoomed SEM scan around a predicted marker
+    align_tolerance_um: float = 0.5  # the two Global Align passes must agree within this (µm)
 
     def __post_init__(self):
         self.offset = _xy(self.offset)
@@ -371,6 +364,8 @@ class Exposure(Operation):
             raise ScheduleError(f"order must be one of {', '.join(ORDERS)}")
         if not self.dwell_us > 0 or not self.step_nm > 0:
             raise ScheduleError("dwell and step must be positive")
+        if not self.align_tolerance_um > 0:
+            raise ScheduleError("the alignment tolerance must be positive")
 
     @property
     def alignment_only(self) -> bool:
@@ -412,9 +407,11 @@ class Exposure(Operation):
         return super().from_dict(d, base_dir)
 
 
-OP_TYPES: dict = {c.TYPE: c for c in (ColumnSetting, BeamCalibrationStep, FieldCorrection, Exposure)}
+OP_TYPES: dict = {c.TYPE: c for c in (ColumnSetting, BeamCalibrationStep, Exposure)}
 #: the first steps of every schedule, in this order (not deleted, moved or disabled)
-FIXED_STEPS: tuple = (ColumnSetting, BeamCalibrationStep, FieldCorrection)
+FIXED_STEPS: tuple = (ColumnSetting, BeamCalibrationStep)
+#: steps of older files that are dropped (the field calibration is kept per field size now)
+DROPPED_TYPES = ("field_correction",)
 
 
 def op_from_dict(d: dict, base_dir: str | None = None) -> Operation:
@@ -556,10 +553,15 @@ def assign_markers(fields_: list, exp: Exposure, field_um: float) -> MarkerAssig
 
 
 def find_beamcal(beamcals, condition):
-    """The beam calibration for *condition* (magnification and WD), or None."""
+    """The beam calibration stored for *condition*: the same field size (when *condition* has one, a
+    stored one must have the same – one without a field size, from an older file, does not count)
+    and magnification; any beam preset and WD.  None: none."""
+    fs = getattr(condition, "field_size", None)
     for bc in reversed(list(beamcals or [])):
         c = getattr(bc, "condition", None)
-        if c is not None and c.matches(condition, preset=False):
+        if c is None or (fs and c.field_size != fs):
+            continue
+        if c.matches(condition, preset=False):
             return bc
     return None
 
@@ -571,7 +573,7 @@ class ScheduleSettings:
     serpentine: bool = False
     order: str = "as_is"
     on_out_of_field: str = "ask"  # ask (skip the field or abort) | skip | abort
-    max_z_change_um: float = 2000.0  # a stage Z move (to bring a sample into focus) larger than this fails
+    max_z_change_um: float = 2000.0  # a stage Z move (to a stage position) larger than this fails
 
 
 @dataclass
@@ -581,7 +583,6 @@ class Schedule:
     settings: ScheduleSettings = field(default_factory=ScheduleSettings)
     vector_settings: dict = field(default_factory=dict)  # VectorScanSettings overrides
     chips: list = field(default_factory=list)  # [Chip]
-    wd_mm: float = DEFAULT_WD_MM  # the working distance of the whole schedule
     path: str = field(default="", compare=False)
 
     def __post_init__(self):
@@ -589,9 +590,15 @@ class Schedule:
             if len(self.operations) <= k or not isinstance(self.operations[k], cls):
                 self.operations.insert(k, cls())
             self.operations[k].enabled = True
-        self.wd_mm = float(self.wd_mm)
-        if not 4.0 <= self.wd_mm <= 60.0:
-            raise ScheduleError(f"the working distance must be 4–60 mm (got {self.wd_mm:g})")
+
+    @property
+    def field_size(self) -> str:
+        """The schedule's field size (its first Column setting's)."""
+        return self.operations[0].field_size
+
+    @field_size.setter
+    def field_size(self, name: str) -> None:
+        self.operations[0].field_size = str(name)
 
     def __len__(self) -> int:
         return len(self.operations)
@@ -663,7 +670,7 @@ class Schedule:
 
     # ---------------------------------------------------------------- file
     def to_dict(self, base_dir: str | None = None) -> dict:
-        return {"format": SCHEDULE_FORMAT, "version": SCHEDULE_VERSION, "name": self.name, "wd_mm": self.wd_mm,
+        return {"format": SCHEDULE_FORMAT, "version": SCHEDULE_VERSION, "name": self.name,
                 "settings": asdict(self.settings), "vector_settings": dict(self.vector_settings),
                 "chips": [c.to_dict() for c in self.chips],
                 "operations": [o.to_dict(base_dir) for o in self.operations]}
@@ -673,16 +680,14 @@ class Schedule:
         if d.get("format") != SCHEDULE_FORMAT:
             raise ScheduleError("not an easyEBL schedule file")
         v = int(d.get("version", 1))
-        if v not in (3, SCHEDULE_VERSION):
-            raise ScheduleError(f"schedule file version {v} is not supported (this program reads versions 3 and "
+        if v not in (3, 4, SCHEDULE_VERSION):
+            raise ScheduleError(f"schedule file version {v} is not supported (this program reads versions 3 to "
                                 f"{SCHEDULE_VERSION}: chips and Exposures of whole GDS files)")
         known = {f.name for f in fields(ScheduleSettings)}
         st = ScheduleSettings(**{k: v for k, v in (d.get("settings") or {}).items() if k in known})
-        ops = [op_from_dict(o, base_dir) for o in d.get("operations", [])]
-        if v == 3 and len(ops) > 1 and isinstance(ops[1], FieldCorrection):
-            ops.insert(1, BeamCalibrationStep())  # its Field calibration right after the Column setting stays the 3rd
+        ops = [op_from_dict(o, base_dir) for o in d.get("operations", []) if o.get("type") not in DROPPED_TYPES]
         return cls(ops, d.get("name", ""), st, dict(d.get("vector_settings") or {}),
-                   [Chip.from_dict(c) for c in d.get("chips", [])], float(d.get("wd_mm", DEFAULT_WD_MM)))
+                   [Chip.from_dict(c) for c in d.get("chips", [])])
 
     def save(self, path: str | None = None) -> str:
         path = path or self.path
@@ -720,7 +725,7 @@ class FieldPlan:
     centre_ccs: tuple
     target: tuple  # SCS
     map: FieldMap  # FCS → XCS
-    z: float | None = None  # stage Z that has the field in focus at the schedule's WD (None: Z kept)
+    wd: float | None = None  # the WD the focus is set to at the field (None: kept)
     local_marker: tuple | None = None
     is_global: bool = False
     fov_check: object = None
@@ -754,38 +759,71 @@ def position_problem(name: str, positions: dict, what: str) -> str | None:
     p = positions.get(name)
     if p is None:
         return f"no stage position named {name!r} for the {what}"
-    if getattr(p, "h", None) is None:
-        return f"the stage position {name!r} has no height (Replace it with the current stage, in focus)"
+    if getattr(p, "role", "") == "calibration":
+        return calibration_problem(p)
+    if getattr(p, "dz", None) is None:
+        return f"the stage position {name!r} has no ΔZ (Replace it with the current stage)"
+    cal = _calibration_of(positions)
+    if cal is None or cal.z_um is None:
+        return "the calibration sample's Z is not recorded (Stage positions → Record WD)"
     return None
+
+
+def calibration_problem(p) -> str | None:
+    """Why the calibration sample *p* cannot be used (None: X, Y, Z_cal and WD1 recorded)."""
+    if p is None:
+        return "no calibration sample"
+    missing = [n for n, v in (("Z_cal", p.z_um), ("WD1", p.wd_mm)) if v is None]
+    if missing:
+        return (f"the calibration sample has no {' and no '.join(missing)} for the selected field size (focus on it, "
+                "then Stage positions → Record WD)")
+    return None
+
+
+def wd_far_problem(height, wd1) -> str | None:
+    """A chip's WD2 / WD2x more than :data:`~easyebl.litho.height.WD_WARN_MM` from WD1 (None: not, or
+    either not known)."""
+    if wd1 is None:
+        return None
+    far = [w for w in height.wds() if abs(w - wd1) > WD_WARN_MM]
+    if not far:
+        return None
+    return f"WD2 {', '.join(f'{w:.3f}' for w in far)} mm more than {WD_WARN_MM:g} mm from WD1 {wd1:g} mm"
+
+
+def _calibration_of(positions: dict):
+    return next((p for p in (positions or {}).values() if getattr(p, "role", "") == "calibration"), None)
 
 
 def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = None, presets=None,
          library: PatternLibrary | None = None, chips: dict | None = None, calibration=None,
-         preset: str | None = None, positions: dict | None = None, beamcals=None, start: int = 0) -> list:
+         preset: str | None = None, positions: dict | None = None, beamcals=None, start: int = 0,
+         field_sizes=None, selected: str | None = None) -> list:
     """Walk *schedule* without hardware.  *chips*: {chip name: measured ChipTransform} (else the
     nominal map from the chip origin; a Global Align is assumed to measure what is known);
-    *calibration*: the field calibration in force, *beamcals*: the stored beam calibrations;
-    *field_at_1x_um*: the global field calibration (field = K / mag); *preset*: the beam preset in
-    force before the schedule (None: not known); *positions*: {name: StagePosition}; *start*: a run
-    from that step (≥ the fixed steps: they are skipped, the calibrations in force must apply).
-    The working distance is the schedule's.  One :class:`StepPlan` per operation."""
+    *calibration*: the field calibration of the schedule's field size (None: none),
+    *beamcals*: the stored beam calibrations; *field_at_1x_um*: the global field calibration
+    (field = K / mag); *preset*: the beam preset in force before the schedule (None: not known);
+    *positions*: {name: StagePosition} (with the calibration sample); *field_sizes*: [FieldSize]
+    (None: the defaults); *selected*: the field size selected in the Microscope window (None: not
+    known); *start*: a run from that step (≥ the fixed steps: they are skipped, the calibrations in
+    force must apply).  One :class:`StepPlan` per operation."""
     from .fieldcal import Condition
 
     axes = axes or S3000_AXES
     library = library or PatternLibrary()
     positions = positions or {}
     chips = {k: v.copy() for k, v in (chips or {}).items()}
-    wd = schedule.wd_mm
-    field_um = float(field_at_1x_um) / schedule[0].magnification
+    fs = field_size_of(schedule.field_size, field_sizes)
+    mag = fs.magnification if fs is not None else None
+    field_um = float(field_at_1x_um) / (mag or 1000)
+    cal_pos = _calibration_of(positions)
+    z_cal = cal_pos.z_um if cal_pos is not None else None
     cur = None
-    mag = None
-    cal = calibration
     beams = list(beamcals or [])
     beam_measured: list = []  # conditions a Beam calibration step of the schedule measures
-    cal_measured_cond = None  # a Field calibration step in the schedule
     skip = start if start >= len(FIXED_STEPS) else 0
     if skip:  # the fixed steps are not run: the column stays as it is (assumed as the schedule says)
-        mag = schedule[0].magnification
         preset = schedule[0].preset or preset
         cur = schedule[0].current_pa
     out = []
@@ -797,53 +835,48 @@ def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = Non
         if not op.enabled and not schedule.is_fixed(i):
             continue
         try:
-            cond = Condition(mag, preset, wd)
+            cond = Condition(mag, preset, None, fs.name if fs is not None else None)
             if isinstance(op, ColumnSetting):
                 preset = op.preset or preset
-                if not op.permitted:
-                    sp.warnings.append(f"magnification ×{op.magnification:g} is not one the SEM accepts "
-                                       f"(nearest: ×{nearest_magnification(op.magnification)})")
                 if presets is not None and op.preset and op.preset not in presets:
                     sp.warnings.append(f"no beam preset named {op.preset!r} in the microscope module")
-                mag = op.magnification
-                field_um = float(field_at_1x_um) / op.magnification
                 cur = op.current_pa or cur
-                cond = Condition(mag, preset, wd)
-                if i > 0 and find_beamcal(beams, cond) is None and not any(c.matches(cond, False)
-                                                                           for c in beam_measured):
-                    sp.warnings.append(f"no beam calibration for {cond.describe()} (add a Beam calibration step "
-                                       "after this one): nominal beam")
+                cond = Condition(mag, preset, None, fs.name if fs is not None else None)
+                if i == 0:
+                    if not schedule.field_size:
+                        sp.warnings.append("no field size chosen")
+                    elif fs is None:
+                        sp.warnings.append(f"no field size named {schedule.field_size!r} (Field sizes…)")
+                    else:
+                        if fs.magnification not in MAGNIFICATIONS:
+                            sp.warnings.append(f"field size {fs.name}: ×{fs.magnification:g} is not a magnification "
+                                               f"the SEM accepts (nearest: ×{nearest_magnification(fs.magnification)})")
+                        if selected is not None and selected != fs.name:
+                            sp.warnings.append(f"the Microscope window is at field size {selected or 'none'!s}, not "
+                                               f"{fs.name}: the schedule cannot run")
+                    w = calibration_problem(cal_pos)
+                    if w:
+                        sp.warnings.append(w)
+                elif find_beamcal(beams, cond) is None and not any(c.matches(cond, False) for c in beam_measured):
+                    sp.warnings.append(f"no beam calibration for {cond.describe()}: nominal beam")
             elif isinstance(op, BeamCalibrationStep):
-                w = position_problem(op.position, positions, "beam calibration")
-                if w:
+                w = calibration_problem(cal_pos)
+                if w and not (op.reuse and find_beamcal(beams, cond) is not None):
                     sp.warnings.append(w)
                 if op.reuse and find_beamcal(beams, cond) is not None:
                     sp.beamcal = find_beamcal(beams, cond)
                 beam_measured.append(cond)
-            elif isinstance(op, FieldCorrection):
-                kept = op.reuse and cal is not None and cal.valid_for(cond, find_beamcal(beams, cond))
-                if kept:  # the one in force is kept (as long as the beam calibration stays the stored one)
-                    sp.calibrated = True
-                else:
-                    w = position_problem(op.position, positions, "field calibration")
-                    if w:
-                        sp.warnings.append(w)
-                    if find_beamcal(beams, cond) is None and not any(c.matches(cond, False) for c in beam_measured):
-                        sp.warnings.append("measured without a beam calibration for this condition")
-                cal_measured_cond = cond
             elif isinstance(op, Exposure):
                 bc = find_beamcal(beams, cond)
-                if cal_measured_cond is not None and cal_measured_cond.matches(cond):
-                    ok, b = True, (cal.stage_to_beam if cal is not None else axes.matrix)
-                else:
-                    ok = cal is not None and cal.valid_for(cond, bc)
-                    b = cal.stage_to_beam if ok else None
+                ok = calibration is not None and calibration.valid_for(cond)
+                b = calibration.stage_to_beam if ok else None
                 bmat = stage_rotation(b, axes) if b is not None else axes.matrix
                 sp.calibrated, sp.beamcal, sp.condition, sp.stage_to_beam = ok, bc, cond, bmat
                 if not ok:
-                    sp.warnings.append(f"no field calibration for {cond.describe()} (a Field calibration step): "
-                                       "nominal stage ↔ beam rotation")
-                _plan_exposure(sp, op, schedule, chips, axes, bmat, bc, field_um, library, i)
+                    sp.warnings.append(f"no field calibration for field size {schedule.field_size or '?'} "
+                                       "(Calibration → Field calibration…): nominal stage ↔ beam rotation")
+                _plan_exposure(sp, op, schedule, chips, axes, bmat, bc, field_um, library, i, z_cal,
+                               cal_pos.wd_mm if cal_pos is not None else None)
         except Exception as e:  # noqa: BLE001 - reported per step
             sp.warnings.append(f"{type(e).__name__}: {e}")
         sp.field_um, sp.current_pa = field_um, cur
@@ -851,7 +884,7 @@ def plan(schedule: Schedule, field_at_1x_um: float, axes: StageAxes | None = Non
 
 
 def _plan_exposure(sp: StepPlan, op: Exposure, schedule: Schedule, chips: dict, axes, bmat, bc, field_um,
-                   library, i) -> None:
+                   library, i, z_cal=None, wd1=None) -> None:
     chip = schedule.chip(op.chip)
     if chip is None:
         sp.warnings.append(f"no chip named {op.chip!r} (Chips tab)" if op.chip else "no chip chosen")
@@ -859,9 +892,13 @@ def _plan_exposure(sp: StepPlan, op: Exposure, schedule: Schedule, chips: dict, 
     g = chips.get(chip.name) or chip.nominal(axes)
     sp.chip = g
     if chip.height.mode == "none":
-        sp.warnings.append(f"chip {chip.name} has no height: the stage's Z is kept (Chips → Height…)")
-    elif chip.height.problem():
-        sp.warnings.append(f"chip {chip.name}: {chip.height.problem()}")
+        sp.warnings.append(f"chip {chip.name} has no height: the focus is kept (Chips → Height…)")
+    elif chip.height.problem(z_cal, check_z=True):
+        sp.warnings.append(f"chip {chip.name}: {chip.height.problem(z_cal, check_z=True)}")
+    else:
+        w = wd_far_problem(chip.height, wd1)
+        if w:
+            sp.warnings.append(f"chip {chip.name}: {w}")
     flds = exposure_fields(op, library)
     if not flds:
         sp.warnings.append("no fields: the GDS has no non-empty top-level cells" if op.path
@@ -878,9 +915,9 @@ def _plan_exposure(sp: StepPlan, op: Exposure, schedule: Schedule, chips: dict, 
         tgt = g.to_scs(np.asarray(f.centre_ccs, float))
         fm = FieldMap.make(g, f.centre_ccs, tgt, bmat, beamcal=bc)
         fp = FieldPlan(k, f.name, f.centre_ccs, (float(tgt[0]), float(tgt[1])), fm,
-                       chip.z_at(f.centre_ccs, schedule.wd_mm), asg.local.get(k), k == asg.global_field)
-        if fp.z is not None and fp.z < 0:
-            fp.warnings.append("stage Z below 0 (the stage refuses negative coordinates)")
+                       chip.wd_at(f.centre_ccs), asg.local.get(k), k == asg.global_field)
+        if fp.wd is not None and not 4.0 <= fp.wd <= 60.0:
+            fp.warnings.append(f"WD {fp.wd:.3f} mm outside 4–60 mm (the height map?)")
         if tgt[0] < 0 or tgt[1] < 0:
             fp.warnings.append("stage target below 0 (the stage refuses negative coordinates)")
         if not op.alignment_only:

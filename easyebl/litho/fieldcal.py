@@ -16,9 +16,8 @@ sample …) the procedure
 The image shifts are converted to BCS (true µm) through the beam calibration of the condition
 (its linear part), so ``B`` holds the rotation between stage and beam axes and the mirror of the
 stage axes; its scale (stage encoder against the calibration grid) is a cross-check only – the
-exposure uses the rotation (:func:`~easyebl.litho.coords.stage_rotation`).  The result is valid
-for the column condition it was measured at (magnification, beam preset, WD) and the beam
-calibration it was measured through.
+exposure uses the rotation (:func:`~easyebl.litho.coords.stage_rotation`).  One result is kept
+per field size (:mod:`easyebl.litho.settings`, across sessions) and used at any WD of it.
 """
 from __future__ import annotations
 
@@ -51,14 +50,17 @@ WD_TOLERANCE_MM = 0.1
 @dataclass(frozen=True)
 class Condition:
     """The column condition a calibration belongs to (preset None: not known / kept as it was;
-    wd_mm: the working distance computed from the focus, None: not known)."""
+    wd_mm: the working distance it was measured at, from the focus – for information, a
+    calibration is used at any WD; field_size: the field size's name, None: not known)."""
 
     magnification: float | None
     preset: str | None = None
     wd_mm: float | None = None
+    field_size: str | None = None
 
     def describe(self) -> str:
-        m = f"×{self.magnification:g}" if self.magnification else "×?"
+        m = (f"{self.field_size} " if self.field_size else "") + (f"×{self.magnification:g}" if self.magnification
+                                                                   else "×?")
         if self.wd_mm is not None:
             m += f", WD {self.wd_mm:.2f} mm"
         return m + (f", beam {self.preset!r}" if self.preset else "")
@@ -69,25 +71,29 @@ class Condition:
         return abs(float(self.wd_mm) - float(other.wd_mm)) <= tol_mm + 1e-9
 
     def matches(self, other: "Condition", preset: bool = True) -> bool:
-        """Same magnification and WD (±:data:`WD_TOLERANCE_MM`), and preset unless *preset* is False."""
-        if other is None or self.magnification != other.magnification or not self.same_wd(other):
+        """Same magnification and field size (when both know it), and preset unless *preset* is
+        False.  The WD does not matter (the focus follows each chip)."""
+        if other is None or self.magnification != other.magnification:
+            return False
+        if self.field_size and other.field_size and self.field_size != other.field_size:
             return False
         return not preset or self.preset == other.preset
 
     def to_dict(self) -> dict:
-        return {"magnification": self.magnification, "preset": self.preset, "wd_mm": self.wd_mm}
+        return {"magnification": self.magnification, "preset": self.preset, "wd_mm": self.wd_mm,
+                "field_size": self.field_size}
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "Condition":
         d = d or {}
-        return cls(d.get("magnification"), d.get("preset"), d.get("wd_mm"))
+        return cls(d.get("magnification"), d.get("preset"), d.get("wd_mm"), d.get("field_size"))
 
 
 @dataclass
 class FieldCalConfig:
-    """How to calibrate (a Field calibration step of the schedule)."""
+    """How to calibrate (the Field calibration dialog; kept in the litho settings)."""
 
-    position: str = ""  # the named stage position (its X, Y and height H)
+    position: str = ""  # the named stage position (its X, Y and ΔZ), with a feature with structure
     pattern: str = "grid"  # grid (3 × 3) | cross (5)
     step_fraction: float = 0.3  # stage shift d / field
     image_fraction: float = 0.8  # scan width / field
@@ -172,10 +178,32 @@ class FieldCalResult:
         }
 
     def valid_for(self, condition: Condition, beamcal=None) -> bool:
-        """Measured at *condition* (magnification, preset, WD) through the beam calibration
-        *beamcal* that applies now (None: none)."""
-        bid = getattr(beamcal, "id", None) if beamcal is not None else None
-        return self.condition.matches(condition) and self.beamcal_id == bid
+        """Measured at the field size / magnification of *condition* (any beam preset, WD and beam
+        calibration: only the rotation is used)."""
+        return self.condition.matches(condition, preset=False)
+
+    def to_dict(self) -> dict:
+        d = {f.name: getattr(self, f.name) for f in fields(self)}
+        d["stage_to_beam"] = self.stage_to_beam.tolist()
+        d["condition"] = self.condition.to_dict()
+        d["shifts"] = [[list(a), list(b)] for a, b in self.shifts]
+        d["predicted"] = [list(p) for p in self.predicted]
+        d["position"] = list(self.position)
+        d["drift"] = list(self.drift)
+        d["quality"] = [float(q) for q in self.quality]
+        d["rejected"] = [int(i) for i in self.rejected]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FieldCalResult":
+        known = {f.name for f in fields(cls)}
+        d = {k: v for k, v in d.items() if k in known}
+        d["condition"] = Condition.from_dict(d.get("condition"))
+        d["shifts"] = [(tuple(a), tuple(b)) for a, b in d.get("shifts", [])]
+        d["predicted"] = [tuple(p) for p in d.get("predicted", [])]
+        d["position"] = tuple(d.get("position", (0.0, 0.0)))
+        d["drift"] = tuple(d.get("drift", (0.0, 0.0)))
+        return cls(**d)
 
     def correction(self, axes: StageAxes) -> np.ndarray:
         """``B·M``: how true WCS µm along the stage axes appear in BCS (identity when nominal)."""

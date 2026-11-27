@@ -2,32 +2,34 @@
 
 Per step (on the calling thread; the litho window runs it on a worker thread):
 
-* **Column setting** – recall the beam preset (unless kept as is), set the focus to the
-  schedule's working distance (the first Column setting; later ones check it is still there),
-  set the magnification (the field follows the global field calibration), take the nominal
-  current.  Nothing changes the focus after that: every stage move also sets Z to bring the
-  target into focus, ``Z = 1000·WD − H`` (:mod:`easyebl.litho.height`).
-* **Beam calibration** – the grid image at a named stage position (X, Y, H), fitted
-  (:mod:`easyebl.litho.beamcal`), shown for Accept / Discard (``review_beam``); or a stored one
-  of the same magnification and WD (``reuse``).
-* **Field calibration** – the stage → beam map at a named stage position (X, Y, H), through the
-  beam calibration of the condition (shown for Accept / Discard by ``review``).
+* **Column setting** – recall the beam preset (unless kept as is), take the nominal current; the
+  first one also sets the schedule's field size (its magnification; the field follows the global
+  field calibration) and the focus to WD1 (the calibration sample's).
+* **Beam calibration** – the stage to the calibration sample (X, Y, Z_cal), the focus at WD1,
+  zoomed in for the user to confirm the focus by hand (the WD then is WD1 from there on), the
+  grid image fitted (:mod:`easyebl.litho.beamcal`), shown for Accept / Discard
+  (``review_beam``); or a stored one of the field size (``reuse``).
 * **Exposure** – every field of the GDS (the Global Align field first), each:
 
   1. stage → ``G(c_f)`` (the chip's CCS → SCS map, nominal from the chip origin until a Global
-     Align), Z from the chip's height at the field centre; the read-back ``ŝ`` is what the field
-     is written against;
+     Align) in X, Y only – Z stays at Z_cal – then the focus to the chip's WD at the field
+     centre (WD2, or the plane through WD2x); the read-back ``ŝ`` is what the field is written
+     against;
   2. Global Align (its field only): the markers' XCS positions are predicted through the chain
      (:mod:`easyebl.litho.coords`), measured by the hardware (the litho window: zoomed SEM scan,
-     the user clicks), taken back to SCS and fitted: the chip's new ``G`` (kept for all later
-     Exposures of the chip);
+     the user clicks) twice (1 → 2 → 1 → 2), the passes compared against the alignment
+     tolerance (repeat / continue / abort), taken back to SCS and fitted: the chip's new ``G``
+     (kept for all later Exposures of the chip);
   3. Local marker (if the field has one): a shift ``δ_f`` (SCS) for this field;
   4. the pattern (FCS) is checked against the field and written through
-     ``xcs = beamcal⁻¹(B·(A_g·fcs + G(c_f) − ŝ + δ_f))``.
+     ``xcs = beamcal⁻¹(B·(A_g·fcs + G(c_f) − ŝ + δ_f))``, ``B`` the rotation of the field size's
+     field calibration (kept per field size, measured outside a schedule:
+     :meth:`ScheduleRunner.field_calibrate`).
 
-A run from a step after the fixed three (Column setting, Beam / Field calibration) skips them:
-the column must be at the schedule's WD and the beam and field calibrations in force must apply
-to it.
+A run must be at the field size selected in the Microscope window.  A run from a step after the
+two fixed ones (Column setting, Beam calibration) skips them: the column must be at the field
+size's magnification, the stage at Z_cal, and a beam calibration of the field size in force.
+When a run finishes the stage goes back to the calibration sample (Z_cal, WD1).
 
 :class:`SimulatedHardware` has a hidden truth (sample rotation / stretch, the stage → beam
 rotation, the beam's scale / shear / pincushion, stage errors) and tells where each exposure
@@ -46,11 +48,12 @@ import numpy as np
 from . import dose as dosemod
 from .compiler import VectorScanSettings
 from .coords import ChipTransform, FieldMap, StageAxes, check_field, fit_chip, stage_rotation
-from .fieldcal import (WD_TOLERANCE_MM, Condition, FieldCalError, FieldCalResult, measure_field_calibration,
+from .fieldcal import (Condition, FieldCalConfig, FieldCalError, FieldCalResult, measure_field_calibration,
                        shift_pattern)
-from .height import height_um, z_for
-from .schedule import (FIXED_STEPS, BeamCalibrationStep, ColumnSetting, Exposure, FieldCorrection, PatternLibrary,
-                       Schedule, ScheduleError, assign_markers, exposure_fields, find_beamcal, position_problem)
+from .height import Z_MATCH_UM
+from .schedule import (FIXED_STEPS, BeamCalibrationStep, ColumnSetting, Exposure, PatternLibrary, Schedule,
+                       ScheduleError, assign_markers, calibration_problem, exposure_fields, field_size_of, find_beamcal,
+                       position_problem, wd_far_problem)
 from .writer import ExposureParameters
 
 __all__ = ["LithoHardware", "SimulatedHardware", "ScheduleRunner", "MarkRequest", "RunAborted", "STEP_STATES",
@@ -112,6 +115,11 @@ class LithoHardware:
     def magnification(self) -> float | None:
         return None
 
+    def scan_area(self) -> tuple | None:
+        """The SEM imaging scan now: (centre (x, y) XCS µm, width µm, height µm, rotation rad) – a
+        reduced or shifted scan is a part of the field (None: not known)."""
+        return None
+
     def working_distance_mm(self) -> float | None:
         """The working distance computed from the focus (None: not known)."""
         return None
@@ -157,6 +165,11 @@ class LithoHardware:
         """Wait while the user focuses and stigmates by hand (*text* says where); True: continue,
         False: abort.  The column (magnification) is set by the runner before and after."""
         return self.ask(text)
+
+    def ask_alignment(self, text: str) -> str:
+        """The Global Align passes disagree (*text*): ``"repeat"``, ``"continue"`` (use them anyway)
+        or ``"abort"``."""
+        return "continue" if self.ask(text + "\n\nContinue anyway? (No aborts.)") else "abort"
 
     def auto_focus(self, mode: str = "auto"):
         """Auto focus at the present scan field (:mod:`easyebl.imaging.autotune`; ``mode`` auto /
@@ -251,6 +264,8 @@ class SimulatedHardware(LithoHardware):
         self.answer = False  # what ask() answers
         self.focus_answer = True  # what ask_focus() answers
         self.refocus_wd = None  # the WD "the user" focuses to in ask_focus (None: unchanged)
+        self.alignment_answers: list = []  # what ask_alignment() answers, in turn (then "continue")
+        self.scan = None  # what scan_area() reports (None: not known)
         self.calls: list = []
         self._abort = threading.Event()
         self._texture = {}  # field µm -> (tile µm, periodic texture image)
@@ -303,6 +318,9 @@ class SimulatedHardware(LithoHardware):
 
     def magnification(self):
         return self.mag
+
+    def scan_area(self):
+        return self.scan
 
     def field_um(self):
         return self.k / self.mag
@@ -379,6 +397,10 @@ class SimulatedHardware(LithoHardware):
             self.wd = float(self.refocus_wd)
         return self.focus_answer
 
+    def ask_alignment(self, text):
+        self.calls.append(("align", text))
+        return self.alignment_answers.pop(0) if self.alignment_answers else "continue"
+
     def expose(self, pattern, params, transform, settings):
         if self._abort.is_set():
             return {"aborted": True}
@@ -415,32 +437,39 @@ class ScheduleRunner:
     ``"alignment"`` ({chip, transform, index}), ``"calibration_start"`` ({index, n, position,
     condition, field_um}), ``"calibration_image"`` ({k, n, shift, image, reference}),
     ``"calibration"`` ({result}), ``"beamcal_start"`` ({index, position, condition, field_um, pixels}),
-    ``"beamcal_image"`` ({image, pixel_um}), ``"beamcal"`` ({result}), ``"exposed"`` ({index,
-    report}) and ``"finished"`` ({state, message}).
+    ``"beamcal_image"`` ({image, pixel_um}), ``"beamcal"`` ({result}), ``"focus_request"`` ({index,
+    position, magnification}), ``"wd1"`` ({wd_mm, old, z_um}: the WD on the calibration sample,
+    focused again), ``"exposed"`` ({index, report}) and ``"finished"`` ({state, message}).
 
     ``review(result) -> bool`` / ``review_beam(result) -> bool`` (optional, blocking) decide whether
     a field / beam calibration is used: False discards it (a schedule run stops).  They are also
     called with a refused result (``result.problem`` set): True uses it anyway (an override), False
     fails the step.
 
-    *positions*: {name: :class:`~easyebl.litho.settings.StagePosition`} (X, Y, height)."""
+    *positions*: {name: :class:`~easyebl.litho.settings.StagePosition`} with the calibration sample
+    (copied: WD1 focused again reaches the caller through the ``"wd1"`` event);
+    *calibration*: the field calibration of the schedule's field size; *field_sizes*: [FieldSize]
+    (None: the defaults); *selected*: the field size selected in the Microscope window (a run at
+    another one is refused; None: not checked)."""
 
     def __init__(self, schedule: Schedule, hardware: LithoHardware, axes: StageAxes | None = None,
                  library: PatternLibrary | None = None, chips: dict | None = None,
                  on_event: Callable | None = None, calibration: FieldCalResult | None = None,
                  positions: dict | None = None, stage_tolerance_um: float = 0.5, review: Callable | None = None,
-                 beamcals=None, review_beam: Callable | None = None):
+                 beamcals=None, review_beam: Callable | None = None, field_sizes=None, selected: str | None = None):
         self.schedule = schedule
         self.hw = hardware
         self.axes = axes or hardware.stage_axes()
         self.library = library or PatternLibrary()
         self.chips = {k: v.copy() for k, v in (chips or {}).items()}
         self.calibration = calibration
-        self.positions = dict(positions or {})
+        self.positions = {k: replace(v) for k, v in (positions or {}).items()}
         self.tolerance = float(stage_tolerance_um)
         self.review = review
         self.review_beam = review_beam
         self.beamcals = list(beamcals or [])
+        self.field_sizes = field_sizes
+        self.selected = selected
         self.on_event = on_event or (lambda kind, data: None)
         self.current_pa = None
         self.field = None
@@ -462,23 +491,50 @@ class ScheduleRunner:
         return None if v is None else float(v)
 
     @property
-    def condition(self) -> Condition:
-        return Condition(self.magnification, self.preset, self._wd())
+    def field_size(self):
+        """The schedule's :class:`~easyebl.litho.settings.FieldSize` (None: not chosen / not known)."""
+        return field_size_of(self.schedule.field_size, self.field_sizes)
+
+    def _need_field_size(self):
+        fs = self.field_size
+        if fs is None:
+            raise ScheduleError(f"no field size named {self.schedule.field_size!r}" if self.schedule.field_size
+                                else "the schedule has no field size (its first Column setting)")
+        return fs
 
     @property
-    def wd_mm(self) -> float:
-        """The schedule's working distance: what every stage Z is computed for."""
-        return float(self.schedule.wd_mm)
+    def condition(self) -> Condition:
+        fs = self.field_size
+        return Condition(self.magnification, self.preset, self._wd(), fs.name if fs is not None else None)
 
-    def check_wd(self) -> float:
-        """The column's WD (from the focus), which must be the schedule's (±WD_TOLERANCE_MM)."""
-        wd = self._wd()
-        if wd is None:
-            raise ScheduleError("the working distance cannot be read (microscope not connected?)")
-        if abs(wd - self.wd_mm) > WD_TOLERANCE_MM + 1e-9:
-            raise ScheduleError(f"the column is at WD {wd:.3f} mm, not the schedule's {self.wd_mm:.3f} mm "
-                                "(the focus was changed?)")
-        return wd
+    @property
+    def cal_position(self):
+        """The calibration sample (a copy: WD1 focused again is kept here for the run)."""
+        return next((p for p in self.positions.values() if p.role == "calibration"), None)
+
+    @property
+    def z_cal(self) -> float | None:
+        p = self.cal_position
+        return None if p is None else p.z_um
+
+    @property
+    def wd1(self) -> float | None:
+        p = self.cal_position
+        return None if p is None else p.wd_mm
+
+    def _need_calibration_sample(self):
+        p = self.cal_position
+        w = calibration_problem(p)
+        if w:
+            raise ScheduleError(w)
+        return p
+
+    def z_of(self, p) -> float | None:
+        """The stage Z of stage position *p*: Z_cal + ΔZ (None: not known)."""
+        zc = self.z_cal
+        if p.role == "calibration":
+            return zc
+        return None if zc is None or p.dz is None else zc + p.dz
 
     def _position(self, name: str, what: str):
         w = position_problem(name, self.positions, what)
@@ -490,11 +546,11 @@ class ScheduleRunner:
         return find_beamcal(self.beamcals, condition or self.condition)
 
     def stage_to_beam(self, condition: Condition | None = None) -> tuple[np.ndarray, bool]:
-        """B in use (rotation of the field calibration with the stage mirror; nominal ``M``) and
-        whether a field calibration applies."""
+        """B in use (the rotation of the field size's field calibration with the stage mirror;
+        nominal ``M``) and whether a field calibration applies."""
         cond = condition or self.condition
         cal = self.calibration
-        if cal is not None and cal.valid_for(cond, self.beamcal(cond)):
+        if cal is not None and cal.valid_for(cond):
             return stage_rotation(cal.stage_to_beam, self.axes), True
         return self.axes.matrix, False
 
@@ -544,8 +600,8 @@ class ScheduleRunner:
     def run(self, start: int = 0, stop: int | None = None) -> str:
         """Run the steps ``start … stop − 1`` (*stop* None: to the end); returns the final state
         (done / aborted / failed).  A *start* within the fixed steps runs from the first step; one
-        after them skips them – the column must then be at the schedule's WD and the beam and field
-        calibrations in force must apply to it."""
+        after them skips them – the column must then be at the field size's magnification, the
+        stage at Z_cal, and a beam calibration of the field size in force."""
         self.state = "running"
         msg = ""
         n_fixed = len(FIXED_STEPS)
@@ -554,6 +610,11 @@ class ScheduleRunner:
         steps = list(range(start, end))
         i = start
         try:
+            fs = self._need_field_size()
+            if self.selected is not None and self.selected != fs.name:
+                raise ScheduleError(f"the Microscope window is at field size {self.selected or 'none'}, the schedule "
+                                    f"at {fs.name}: select {fs.name} there first")
+            self._need_calibration_sample()
             self.hw.prepare_run()
             self.log("SEM: RUN mode, Slow scan 1")
             if start:
@@ -585,35 +646,79 @@ class ScheduleRunner:
         return self.state
 
     def _park(self) -> None:
-        """After a finished run: the stage to the calibration grid (the fixed Beam calibration
-        step's position), in focus at the WD.  A failure is only logged."""
-        name = self.schedule[1].config.position
-        if position_problem(name, self.positions, "beam calibration"):
-            self.log("the stage stays: the Beam calibration step has no usable stage position")
+        """After a finished run: the stage to the calibration sample (Z_cal), the focus at WD1.
+        A failure is only logged."""
+        p = self.cal_position
+        if calibration_problem(p):
+            self.log("the stage stays: the calibration sample is not recorded")
             return
-        p = self.positions[name]
         try:
-            self.move_stage(p.x, p.y, z_for(self.wd_mm, p.h))
-            self.log(f"stage parked at {name!r}")
+            self.move_stage(p.x, p.y, p.z_um)
+            self.hw.set_working_distance(p.wd_mm)
+            self.log(f"stage parked at {p.name!r}, WD1 {p.wd_mm:g} mm")
         except Exception as e:  # noqa: BLE001 - the run is done
-            self.log(f"WARNING the stage could not go to {name!r}: {type(e).__name__}: {e}")
+            self.log(f"WARNING the stage could not go to {p.name!r}: {type(e).__name__}: {e}")
+
+    def _check_z_cal(self) -> None:
+        """The stage must be at Z_cal (chip heights are WDs at that Z)."""
+        z = self.hw.stage_z()
+        zc = self.z_cal
+        if z is None or zc is None:
+            raise ScheduleError("the stage Z or the calibration sample's Z is not known")
+        if abs(z - zc) > max(self.tolerance, Z_MATCH_UM):
+            raise ScheduleError(f"the stage is at Z {z:.1f} µm, not at the calibration sample's Z {zc:.1f} µm "
+                                "(the chip heights are WDs at that Z)")
 
     def _resume_column(self) -> None:
-        """A run after the fixed steps: take the column as it is; it must be calibrated."""
-        self.magnification = self.hw.magnification()
+        """A run after the fixed steps: take the column as it is; it must be at the field size, the
+        stage at Z_cal and a beam calibration in force."""
+        fs = self._need_field_size()
+        mag = self.hw.magnification()
+        if mag is None or int(round(mag)) != fs.magnification:
+            raise ScheduleError(f"the column is at ×{mag:g}, not the field size's ×{fs.magnification:g}: run the "
+                                "schedule from the start" if mag is not None else "the magnification is not known")
+        self.magnification = fs.magnification
         self.field = float(self.hw.field_um())
         first = self.schedule[0]
         if first.current_pa:
             self.current_pa = float(first.current_pa)
-        self.check_wd()
+        if first.preset:
+            self.preset = first.preset
+        self._check_z_cal()
         cond = self.condition
         bc = self.beamcal(cond)
         if bc is None:
             raise ScheduleError(f"no beam calibration for {cond.describe()}: run the schedule from the start")
-        cal = self.calibration
-        if cal is None or not cal.valid_for(cond, bc):
-            raise ScheduleError(f"no field calibration for {cond.describe()}: run the schedule from the start")
         self.log(f"the fixed steps are skipped: the column as it is ({cond.describe()}), calibrated")
+
+    def _execute(self, i: int, op) -> str:
+        if isinstance(op, ColumnSetting):
+            return self._column(i, op)
+        if isinstance(op, BeamCalibrationStep):
+            return self._beam_calibrate(i, op)
+        if isinstance(op, Exposure):
+            return self._exposure(i, op)
+        raise TypeError(f"unknown operation {type(op).__name__}")
+
+    def _column(self, i: int, op: ColumnSetting) -> str:
+        if op.preset:
+            self.hw.apply_preset(op.preset)
+            self.preset = op.preset
+        if op.current_pa:
+            self.current_pa = float(op.current_pa)
+        if i == 0:
+            fs = self._need_field_size()
+            p = self._need_calibration_sample()
+            self.magnification = fs.magnification
+            self.field = float(self.hw.set_magnification(fs.magnification))
+            self.hw.set_working_distance(p.wd_mm)
+            self.log(f"step 1: field size {fs.name} (×{fs.magnification:g}), the focus at WD1 {p.wd_mm:g} mm")
+            return (f"field {fs.name}, ×{fs.magnification:g} ({self.field:.4g} µm), beam {op.preset or 'kept as is'}, "
+                    f"WD1 {p.wd_mm:g} mm")
+        cond = self.condition
+        if self.beamcal(cond) is None:
+            self.log(f"step {i + 1}: no beam calibration for {cond.describe()}: nominal beam")
+        return f"beam {op.preset or 'kept as is'}" + (f", {op.current_pa:g} pA" if op.current_pa else "")
 
     def _beam_calibrate(self, i: int, op: BeamCalibrationStep) -> str:
         from .beamcal import BeamCalError, measure_beam_calibration
@@ -625,14 +730,14 @@ class ScheduleRunner:
                 self.log(f"step {i + 1}: the stored beam calibration for {cond.describe()}: {bc.describe()}")
                 return f"stored: {bc.describe()}"
         cfg = op.config
-        p = self._position(cfg.position, "beam calibration")
-        x, y, z = p.x, p.y, z_for(self.wd_mm, p.h)
+        p = self._need_calibration_sample()
+        x, y, z = p.x, p.y, p.z_um
         self.move_stage(x, y, z)
+        if self._wd() is None or abs(self._wd() - p.wd_mm) >= 5e-4:
+            self.hw.set_working_distance(p.wd_mm)
         if cfg.manual_focus:
             self._manual_focus(i, cfg)
-            cond = self.condition
-            z_now = self.hw.stage_z()
-            z = z if z_now is None else z_now
+        cond = self.condition
         field = float(self.hw.field_um())
         self._emit("beamcal_start", index=i, position=(x, y, z), condition=cond, field_um=field,
                    pixels=int(cfg.pixels))
@@ -660,117 +765,94 @@ class ScheduleRunner:
         return res.describe()
 
     def _manual_focus(self, i: int, cfg) -> None:
-        """Zoom in at the grid and wait while the user focuses and stigmates by hand; then back to
-        the step's magnification.  The WD read back becomes the schedule's for the rest of the run
-        (``"wd"`` event) and the grid position's height is recorded again (``"position_height"``)."""
-        name = cfg.position
+        """Zoom in on the calibration sample and wait while the user focuses and stigmates by hand;
+        then back to the step's magnification.  The WD read back is WD1 from then on (``"wd1"``);
+        the stage Z must not change."""
+        p = self.cal_position
         mag = int(cfg.focus_magnification)
         back = self.magnification
-        self.log(f"step {i + 1}: ×{mag:g} at {name!r}: focus and stigmate by hand")
-        self._emit("focus_request", index=i, position=name, magnification=mag)
+        self.log(f"step {i + 1}: ×{mag:g} on {p.name!r}: focus and stigmate by hand")
+        self._emit("focus_request", index=i, position=p.name, magnification=mag)
         self.hw.set_magnification(mag)
         try:
-            ok = self.hw.ask_focus(f"Step {i + 1}: focus and stigmate on the calibration grid at {name!r} "
-                                   f"(×{mag:,}), then Continue.\n\nThe focus you set is the working distance for "
-                                   "the rest of the run; the stage Z then brings each sample into focus.")
+            ok = self.hw.ask_focus(f"Step {i + 1}: focus and stigmate on the calibration grid ({p.name}, ×{mag:,}) – "
+                                   f"it should be close at WD1 {p.wd_mm:g} mm – then Continue.\n\nDo not move the "
+                                   "stage Z: the chip heights are WDs at this Z.")
         finally:
             if back is not None:
                 self.field = float(self.hw.set_magnification(back))
         if not ok:
             raise RunAborted("focus cancelled")
         self._check()
+        self._check_z_cal()
         wd = self._wd()
         if wd is None:
             raise ScheduleError("the working distance cannot be read after the focus")
-        wd = round(wd, 3)
+        wd = round(wd, 4)
         if not 4.0 <= wd <= 60.0:
             raise ScheduleError(f"the WD after the focus ({wd:g} mm) is outside 4–60 mm")
-        old = self.wd_mm
+        old = p.wd_mm
         if abs(wd - old) >= 5e-4:
-            self.schedule.wd_mm = wd
-            self.log(f"step {i + 1}: working distance {old:g} → {wd:g} mm (focused by hand): the schedule's WD "
-                     "for the rest of the run")
-            self._emit("wd", index=i, wd_mm=wd, old=old)
-        z = self.hw.stage_z()
-        if z is not None:
-            h = height_um(self.wd_mm, z)
-            p = self.positions[name]
-            if p.h is None or abs(p.h - h) >= 0.05:
-                self.log(f"step {i + 1}: {name!r}: H {p.h:.1f} → {h:.1f} µm (in focus at WD {self.wd_mm:g} mm, "
-                         f"Z {z:.1f} µm)")
-            self.positions[name] = replace(p, h=h)
-            self._emit("position_height", name=name, h=h)
+            p.wd_mm = wd
+            self.log(f"step {i + 1}: WD1 {old:g} → {wd:g} mm (focused by hand)")
+            self._emit("wd1", wd_mm=wd, old=old, z_um=p.z_um)
 
-    def _execute(self, i: int, op) -> str:
-        if isinstance(op, ColumnSetting):
-            if not op.permitted:
-                raise ValueError(f"magnification ×{op.magnification:g} is not one the SEM accepts")
-            if op.preset:
-                self.hw.apply_preset(op.preset)
-                self.preset = op.preset
-            if i == 0:
-                self.hw.set_working_distance(self.wd_mm)
-                self.log(f"step 1: working distance {self.wd_mm:g} mm (the focus is not changed after this)")
-            self.check_wd()
-            self.magnification = op.magnification
-            self.field = float(self.hw.set_magnification(op.magnification))
-            if op.current_pa:
-                self.current_pa = float(op.current_pa)
-            cond = self.condition
-            bc = self.beamcal(cond)
-            if bc is None and i > 0:
-                self.log(f"step {i + 1}: no beam calibration for {cond.describe()}: nominal beam")
-            cal = self.calibration
-            if i > 0 and cal is not None and not cal.valid_for(cond, bc):
-                self.log(f"step {i + 1}: the field calibration ({cal.condition.describe()}) does not apply to "
-                         f"{cond.describe()}")
-            return (f"×{op.magnification:g}, field {self.field:.4g} µm, beam {op.preset or 'kept as is'}, "
-                    f"WD {self.wd_mm:g} mm")
-        self.check_wd()  # the focus must still be at the schedule's WD (Z alone brings samples into focus)
-        if isinstance(op, BeamCalibrationStep):
-            return self._beam_calibrate(i, op)
-        if isinstance(op, FieldCorrection):
-            return self._calibrate(i, op)
-        if isinstance(op, Exposure):
-            return self._exposure(i, op)
-        raise TypeError(f"unknown operation {type(op).__name__}")
-
-    def _calibrate(self, i: int, op: FieldCorrection) -> str:
-        cfg = op.config
-        if op.reuse:
-            cond = self.condition
-            cal = self.calibration
-            if cal is not None and cal.valid_for(cond, self.beamcal(cond)):
-                self.log(f"step {i + 1}: the field calibration in force applies to {cond.describe()}: kept")
-                return f"in force: {cal.describe(self.axes)}"
-        p = self._position(cfg.position, "field calibration")
-        pos = (p.x, p.y)
-        self.move_stage(p.x, p.y, z_for(self.wd_mm, p.h))
+    # ---------------------------------------------------------------- field calibration (standalone)
+    def field_calibrate(self, config: FieldCalConfig) -> FieldCalResult:
+        """The field calibration of the field size (outside a schedule): at the stage position of
+        *config* (Z_cal + ΔZ, the focus at WD1), the column as it is – at the field size's
+        magnification.  Returns the result (also :attr:`calibration`, ``"calibration"`` event)."""
+        fs = self._need_field_size()
+        mag = self.hw.magnification()
+        if mag is None or int(round(mag)) != fs.magnification:
+            raise ScheduleError(f"the column is at ×{mag:g}, not field size {fs.name}'s ×{fs.magnification:g} "
+                                "(select the field size in the Microscope window)" if mag is not None
+                                else "the magnification is not known")
+        self.magnification = fs.magnification
+        self.field = float(self.hw.field_um())
+        cal = self._need_calibration_sample()
+        p = self._position(config.position, "field calibration")
+        self.move_stage(p.x, p.y, self.z_of(p))
+        if self._wd() is None or abs(self._wd() - cal.wd_mm) >= 5e-4:
+            self.hw.set_working_distance(cal.wd_mm)
         cond = self.condition
         bc = self.beamcal(cond)
         if bc is None:
             self.log(f"field calibration: no beam calibration for {cond.describe()} – measured with the nominal beam")
-        n = len(shift_pattern(cfg.pattern, 1.0))
-        self._emit("calibration_start", index=i, n=n, position=tuple(map(float, pos)), condition=cond,
-                   field_um=self.field if self.field is not None else float(self.hw.field_um()))
+        n = len(shift_pattern(config.pattern, 1.0))
+        self._emit("calibration_start", index=-1, n=n, position=(p.x, p.y), condition=cond, field_um=self.field)
 
         def on_image(k, n, shift, image, reference):
             self._emit("calibration_image", k=k, n=n, shift=shift, image=image, reference=reference)
 
         try:
-            res = measure_field_calibration(self.hw, cfg, pos, cond, self.log, self._check,
+            res = measure_field_calibration(self.hw, config, (p.x, p.y), cond, self.log, self._check,
                                             self.axes, on_image=on_image, beamcal=bc)
         except FieldCalError as e:
             if e.result is None or self.review is None or not self.review(e.result):
                 raise
             res = e.result
-            self.log(f"step {i + 1}: WARNING the refused field calibration is used (override): {e}")
+            self.log(f"field calibration: WARNING the refused field calibration is used (override): {e}")
         else:
             if self.review is not None and not self.review(res):
                 raise RunAborted("field calibration discarded")
         self.calibration = res
         self._emit("calibration", result=res)
-        return res.describe(self.axes)
+        return res
+
+    def run_field_calibration(self, config: FieldCalConfig) -> str:
+        """:meth:`field_calibrate` with the run bookkeeping (``"finished"``); returns done / aborted / failed."""
+        self.state = "running"
+        try:
+            res = self.field_calibrate(config)
+            self.state, msg = "done", f"field calibration: {res.describe(self.axes)}"
+        except RunAborted as e:
+            self.state, msg = "aborted", str(e) or "aborted"
+        except Exception as e:  # noqa: BLE001 - reported
+            self.state, msg = "failed", f"field calibration: {type(e).__name__}: {e}"
+        self.log(msg)
+        self._emit("finished", state=self.state, message=msg)
+        return self.state
 
     # ---------------------------------------------------------------- exposure
     def _measure(self, i: int, op: Exposure, marks: list, g: ChipTransform, nominal: ChipTransform,
@@ -795,6 +877,43 @@ class ScheduleRunner:
         self.log(f"step {i + 1}: {kind} – markers off the prediction by {dev} µm (stage)")
         return scs
 
+    def _global_align(self, i: int, op: Exposure, g: ChipTransform, nominal: ChipTransform, stage, b, bc):
+        """Global Align, confirmed: every marker measured, then all again (1 → 2 → 1 → 2), the
+        second pass predicted from the first.  The passes must agree within the Exposure's
+        alignment tolerance, else ``ask_alignment``: repeat / continue (an override) / abort.
+        Returns the chip map fitted to the mean of the two passes."""
+        ccs = np.asarray(op.global_markers, float)
+        marks = [(f"global marker {j + 1}", m) for j, m in enumerate(op.global_markers)]
+        tol = float(op.align_tolerance_um)
+        attempt = 0
+        while True:
+            attempt += 1
+            first = self._measure(i, op, marks, g, nominal, stage, b, bc, "Global Align")
+            g1, _ = fit_chip(ccs, first, self.axes)
+            second = self._measure(i, op, [(f"{n} (again)", m) for n, m in marks], g1, nominal, stage, b, bc,
+                                   "Global Align, confirmation")
+            dev = np.hypot(*(second - first).T)
+            worst = float(np.max(dev))
+            mean = 0.5 * (first + second)
+            if worst <= tol:
+                self.log(f"step {i + 1}: Global Align confirmed: the two passes agree within {worst:.3f} µm "
+                         f"(tolerance {tol:g} µm)")
+                break
+            text = (f"Step {i + 1}: the two Global Align passes differ by up to {worst:.3f} µm (marker "
+                    + ", ".join(f"{j + 1}: {d:.3f}" for j, d in enumerate(dev))
+                    + f" µm), more than the tolerance {tol:g} µm.")
+            self.log(f"step {i + 1}: WARNING {text.split(': ', 1)[1]}")
+            ans = self.hw.ask_alignment(text)
+            if ans == "repeat":
+                self.log(f"step {i + 1}: Global Align repeated (attempt {attempt + 1})")
+                continue
+            if ans == "continue":
+                self.log(f"step {i + 1}: WARNING Global Align not confirmed, continued anyway (override)")
+                break
+            raise RunAborted("Global Align not confirmed")
+        g, _ = fit_chip(ccs, mean, self.axes)
+        return g
+
     def _exposure(self, i: int, op: Exposure) -> str:
         chip = self.schedule.chip(op.chip)
         if chip is None:
@@ -810,10 +929,15 @@ class ScheduleRunner:
             self.log(f"step {i + 1}: WARNING {w}")
         if op.global_align and asg.global_field is None:
             raise ScheduleError("the Global Align markers are not inside one field's field of view")
-        if chip.height.problem():
-            raise ScheduleError(f"chip {chip.name}: {chip.height.problem()}")
+        w = chip.height.problem(self.z_cal, check_z=True)
+        if w:
+            raise ScheduleError(f"chip {chip.name}: {w}")
         if chip.height.mode == "none":
-            self.log(f"step {i + 1}: chip {chip.name} has no height: the stage's Z is kept")
+            self.log(f"step {i + 1}: chip {chip.name} has no height: the focus is kept")
+        w = wd_far_problem(chip.height, self.wd1)
+        if w:
+            self.log(f"step {i + 1}: WARNING chip {chip.name}: {w}")
+        self._check_z_cal()
         cond = self.condition
         b, calibrated = self.stage_to_beam(cond)
         bc = self.beamcal(cond)
@@ -827,14 +951,16 @@ class ScheduleRunner:
             f = flds[k]
             self._emit("field", index=i, k=k_i, n=n, name=f.name, state="running", map=None)
             target = g.to_scs(np.asarray(f.centre_ccs, float))
-            z = chip.z_at(f.centre_ccs, self.wd_mm)
-            self.log(f"step {i + 1}: field {f.name} ({k_i + 1}/{n}): stage → ({target[0]:.2f}, {target[1]:.2f}"
-                     + (f", Z {z:.1f}" if z is not None else "") + ") µm")
-            stage = np.asarray(self.move_stage(float(target[0]), float(target[1]), z), float)
+            wd = chip.wd_at(f.centre_ccs)
+            self.log(f"step {i + 1}: field {f.name} ({k_i + 1}/{n}): stage → ({target[0]:.2f}, {target[1]:.2f}) µm"
+                     + (f", WD {wd:.4f} mm" if wd is not None else ""))
+            stage = np.asarray(self.move_stage(float(target[0]), float(target[1])), float)
+            if wd is not None:
+                if not 4.0 <= wd <= 60.0:
+                    raise ScheduleError(f"field {f.name}: WD {wd:.3f} mm is outside 4–60 mm (the height map?)")
+                self.hw.set_working_distance(round(wd, 4))
             if op.global_align and k == asg.global_field:
-                marks = [(f"global marker {j + 1}", m) for j, m in enumerate(op.global_markers)]
-                scs = self._measure(i, op, marks, g, nominal, stage, b, bc, "Global Align")
-                g, _ = fit_chip(np.asarray(op.global_markers, float), scs, self.axes)
+                g = self._global_align(i, op, g, nominal, stage, b, bc)
                 g.step = i
                 self.chips[chip.name] = g
                 if g.rms_um is not None:
@@ -880,21 +1006,22 @@ class ScheduleRunner:
 
     def move_stage(self, x: float, y: float, z: float | None = None) -> tuple:
         """Move and check the read-back position against the target (``StageError`` when off by
-        more than the tolerance); returns the read-back (x, y).  A Z move larger than the
-        schedule's ``max_z_change_um`` is refused (``StageError``) before anything moves."""
+        more than the tolerance); returns the read-back (x, y).  *z* None: Z stays.  A Z move
+        larger than the schedule's ``max_z_change_um`` is refused (``StageError``) before anything
+        moves."""
         if z is None:
             self.hw.move_stage(float(x), float(y))
         else:
             z = float(z)
             if z < 0:
-                raise StageError(f"stage Z {z:.1f} µm is below 0 (the height or the WD is wrong?)")
+                raise StageError(f"stage Z {z:.1f} µm is below 0 (ΔZ or Z_cal wrong?)")
             z0 = self.hw.stage_z()
             if z0 is None:
-                raise StageError("the stage Z is not known: cannot bring the sample into focus")
+                raise StageError("the stage Z is not known")
             limit = float(self.schedule.settings.max_z_change_um)
             if abs(z - z0) > limit:
                 raise StageError(f"Z would move by {z - z0:+.1f} µm (from {z0:.1f} to {z:.1f}), more than the "
-                                 f"schedule allows ({limit:g} µm): check the heights and the WD")
+                                 f"schedule allows ({limit:g} µm): check ΔZ and Z_cal")
             self.hw.move_stage(float(x), float(y), z)
             zr = self.hw.stage_z()
             if zr is None or abs(zr - z) > max(self.tolerance, 1.0):
