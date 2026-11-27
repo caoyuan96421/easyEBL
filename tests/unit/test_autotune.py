@@ -124,3 +124,68 @@ def test_the_engine_holds_the_sem_on_external_scan_between_captures(tmp_path, mo
         assert calls == [("on", True), ("release",)], calls
     finally:
         b.close()
+
+
+@pytest.fixture
+def sim_tuner(tmp_path):
+    """The simulators: the SEM image blurs with the simulated focus and stigmator (best: FOCUS C
+    10670, FOCUS F 2300, stigmator X 2400, Y 1808)."""
+    from easyebl.app.backend import SystemBackend
+    from easyebl.app.config import SystemConfig
+
+    b = SystemBackend(SystemConfig(), eds_settings_path=str(tmp_path / "eds.json"), microscope_delay_s=0.01).start()
+    sem = b.microscope.sem
+    deadline = time.time() + 10
+    while not isinstance(sem.state.get("focus_fine"), int) and time.time() < deadline:
+        time.sleep(0.05)
+    b.engine.update(nx=640, ny=480)
+    sem.set_stigmator("X", 2400).result(5)
+    sem.set_stigmator("Y", 1808).result(5)
+    sem.set_focus("C", 10670).result(5)
+    events = []
+    b.microscope.autotune.add_listener(lambda e: events.append(e.get("text", "")))
+    yield b, sem, b.microscope.autotune, events
+    b.close()
+
+
+def test_the_depth_of_focus_sets_the_last_focus_step(sim_tuner):
+    """Refining stops at the largest acceptable defocus: the blur 2·α·Δz below the larger of the live
+    image's pixel and the diffraction-limited probe (λ of the kV), in FOCUS F counts (focus table)."""
+    b, sem, t, _ = sim_tuner
+    tol = t.focus_tolerance_counts()
+    assert 1.0 <= tol < t.focus_step_counts() / 0.08155
+    b.engine.update(nx=2560, ny=1920)  # smaller pixels: a smaller tolerance
+    assert t.focus_tolerance_counts() < tol
+
+
+@pytest.mark.parametrize("start", [2450, 1900, 600])
+def test_auto_focus_searches_near_the_present_value_first(sim_tuner, start):
+    b, sem, t, events = sim_tuner
+    sem.set_focus("F", start).result(5)
+    r = t.run_focus("auto")
+    assert r.ok, r.message
+    assert abs(r.final["focus_fine"] - 2300) <= max(2 * t.focus_tolerance_counts(), 30)
+    assert not any("whole range" in e for e in events)  # a peak or a trend near the start
+    assert r.steps <= 22  # the full-range grid alone is 9 images, then the halvings to 1 count
+
+
+def test_auto_stigmation_searches_near_the_present_value_first(sim_tuner):
+    b, sem, t, events = sim_tuner
+    sem.set_focus("F", 2300).result(5)
+    sem.set_stigmator("X", 2448).result(5)
+    sem.set_stigmator("Y", 1728).result(5)
+    r = t.run_stigmate()
+    assert r.ok, r.message
+    assert abs(r.final["stig_x"] - 2400) <= 32 and abs(r.final["stig_y"] - 1808) <= 32
+    assert r.final["stig_x"] % 16 == 0 and r.final["stig_y"] % 16 == 0
+    assert not any("whole range" in e for e in events)
+
+
+def test_no_trend_near_the_start_falls_back_to_the_whole_range(sim_tuner):
+    """Far out of focus (flat sharpness near the start): the whole FOCUS F range is searched."""
+    b, sem, t, events = sim_tuner
+    t.set_options(local_contrast=50.0)  # nothing counts as a clear trend
+    sem.set_focus("F", 2450).result(5)
+    r = t.run_focus("fine")
+    assert r.ok and any("whole range" in e for e in events)
+    assert abs(r.final["focus_fine"] - 2300) <= max(2 * t.focus_tolerance_counts(), 30)

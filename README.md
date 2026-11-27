@@ -213,19 +213,31 @@ Open → *SEM imaging*.  The window looks and works like a commercial SEM screen
   one `SEMControl` setting confirmed by its readback (≈ 0.5 s on the S-3000) plus one image, and
   background reads are held meanwhile.  The SEM is switched to external scan once for the whole
   run (`ImagingEngine.hold_external_scan()`), not at every test image.
+  - **Near the present value first** (focus and stigmator): the start value and two steps either side
+    (focus: one focus step, see below; stigmator: 64 counts).  A **peak** there (the sharpest not at an
+    end of the five) is refined; a **clear trend** (the sharpest at an end, best / worst ≥ 1.10) is
+    followed that way with doubling steps until the sharpness falls – the peak bracketed – at most 16
+    steps from the start, then refined.  Refining halves the step around the sharpest value down to
+    the **depth of focus** (stigmator: 16 counts, its step), then a parabola through the best three.
+    With no peak or trend nearby the whole range is searched as below.  On the simulators the focus
+    takes ≈ 14–19 images, the stigmation ≈ 9 per axis.
+  - **Depth of focus**: the largest defocus whose blur 2·α·Δz stays below the larger of the live image's
+    pixel and the diffraction-limited probe (0.61 λ / α, λ from the accelerating voltage; α the beam
+    convergence, 5 mrad), turned into FOCUS F counts with the focus table (the WD calibration) – e.g.
+    ≈ 48 counts for a 640-pixel image of a 100 µm field.  FOCUS F is not refined beyond it.
   - **Focus** moves one knob at a time.
-    - **Fine** (FOCUS F) searches its whole range 0–4095: first a grid at 512 counts, then halves
-      the step around the sharpest value, two images per halving, down to 1 count, so the result
-      is tested to the last digit.  At high magnification the first grid is finer, so it cannot
+    - **Fine** (FOCUS F), the whole range 0–4095: first a grid at 512 counts, then halves the step
+      around the sharpest value, two images per halving, down to the depth of focus.  At high magnification the first grid is finer, so it cannot
       step over the focus: at most 4 focus steps, where one step blurs the test image by
       ≈ 2 pixels (e.g. 128 counts at ×10k).  It takes ≈ 27 images, ≈ 23 s up to ≈ ×5k.
     - **Coarse** (FOCUS C) is only for when the fine focus cannot find the focus, and has no time
       limit.  It moves at most 0.1 mm of WD per setting (also on the way back and when restoring)
       and never beyond ±1 mm of WD from its start.  It sweeps one way until the sharpness has
       clearly fallen past its peak, the other way if needed, then fits the peak.
-    - **Auto** runs fine; if the whole FOCUS F range shows no clear optimum, or its peak is at an
-      end, it sets FOCUS F back, runs the coarse sweep, then fine again.
-  - **Stigmation** is a full-range golden-section search on X, then on Y, ending with a parabola.
+    - **Auto** searches near the present FOCUS F first, then the whole range; if that shows no clear
+      optimum, or its peak is at an end, it sets FOCUS F back, runs the coarse sweep, then fine again.
+  - **Stigmation**, when nothing is found near the present value: a full-range golden-section search on
+    X, then on Y, ending with a parabola.
     It takes ≈ 9–10 steps per axis, ≈ 16 s for both with the default images.
   - **Falling back to the start values:** a result is kept only when it is sharper than the
     start.  Otherwise the start values are set again, as they are on cancel, on an error, on a

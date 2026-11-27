@@ -9,10 +9,14 @@ reads back a new focus / stigmator value at once.  One step = one setting with i
 (:class:`~easyebl.microscope.sem.SEMControl` confirms it: ≈ 0.5 s) + one test image (by default
 Slow 1 at 256²: ≈ 0.35 s; :class:`AutoTuneOptions`, the SEM window's Advanced settings).  The background reads are held for the duration, so no step waits behind one.
 
+* **Near the present value first** (:meth:`_Ctx.local`) – focus and stigmator: the start value and
+  two steps either side; a peak there is refined, a clear trend (best / worst ≥ ``local_contrast``)
+  is walked with doubling steps until the sharpness falls (at most ``local_range`` steps), then
+  refined – halving down to the depth of focus (:meth:`AutoTuner.focus_tolerance_counts`; the
+  stigmator: 16 counts) and a parabola.  No peak or trend nearby: the whole range, as below.
 * **Focus** – one knob at a time.  *Fine* moves FOCUS F only, over its whole range: a grid of
   512 counts (9 images), then the step halved around the sharpest value – two images per halving
-  – down to 1 count, so the result is tested to the last digit; the sharpest value measured is
-  kept.  At high magnification the grid is finer, at most 4 focus steps (one step blurs the test
+  – down to the depth of focus; the sharpest value measured is kept.  At high magnification the grid is finer, at most 4 focus steps (one step blurs the test
   image by ≈ ``blur_px`` pixels, ``Δz = blur_px · pixel / convergence`` µm of WD, turned into focus
   counts with the focus table), so it cannot step over the focus curve: 128 counts at ×10k.
   ≈ 27 images (≈ 23 s) up to ≈ ×5k, more above.
@@ -23,7 +27,7 @@ Slow 1 at 256²: ≈ 0.35 s; :class:`AutoTuneOptions`, the SEM window's Advanced
   the peak is not bracketed, then fits the peak.  No time limit: it runs when the fine focus cannot
   find the focus.  *Auto*: fine; if the whole FOCUS F range has no clear optimum (or its peak is
   at an end), the fine focus is set back, the coarse sweep runs, then fine again.
-* **Stigmation** – full-range golden-section search on X (Y fixed), then on Y: each round keeps
+* **Stigmation** – when nothing is found nearby: full-range golden-section search on X (Y fixed), then on Y: each round keeps
   0.62 of the bracket and needs one new image; after 6 rounds a parabola through the best three
   gives the value.  ≈ 9–10 steps per axis (≈ 16 s for both).
 
@@ -74,6 +78,12 @@ class AutoTuneOptions:
     min_contrast: float = 1.30  # best / worst sharpness of a search below this: no structure
     min_sharpness: float = 0.0  # best sharpness at or below this: no visible detail (all blurred / noise)
     keep_margin: float = 0.0  # a result is kept when sharpness ≥ start · (1 + margin)
+    # local search first (focus and stigmator): the start value and two steps each side; a peak or a
+    # clear trend there (best / worst ≥ local_contrast) is followed – walking with doubling steps at
+    # most local_range steps from the start – else the whole range is searched
+    local_contrast: float = 1.10
+    local_range: int = 16
+    stig_local_step: int = 64  # stigmator counts per probe step (the result to 16 counts, its step)
     timeout_s: float = 10.0  # per setting / per image
 
 
@@ -388,6 +398,30 @@ class AutoTuner:
         dz_mm = o.blur_px * pixel_um / o.convergence_rad / 1000.0
         return dz_mm * self.counts_per_mm()
 
+    def focus_tolerance_counts(self) -> float:
+        """FOCUS F counts of the largest acceptable defocus: the defocus blur 2·α·Δz stays below the
+        larger of the live image's pixel and the diffraction-limited probe (0.61 λ / α, λ of the
+        accelerating voltage); Δz turned into counts with the focus table (WD calibration).  ≥ 1."""
+        import math as _m
+
+        from ..microscope.s3000.focus_wd import FINE_WEIGHT
+
+        a = float(self.options.convergence_rad)
+        try:
+            px = float(self.engine.config.pixel_size_um[0])
+        except Exception:  # noqa: BLE001
+            px = 0.0
+        kv = None
+        try:
+            kv = self.sem.accelerating_voltage_kv() if hasattr(self.sem, "accelerating_voltage_kv") else None
+        except Exception:  # noqa: BLE001
+            kv = None
+        v = 1e3 * float(kv or getattr(self.sem, "state", {}).get("hv_kv") or 20.0)
+        lam_um = 1.226 / _m.sqrt(v * (1.0 + 0.9785e-6 * v)) * 1e-3  # electron wavelength
+        blur_um = max(px, 0.61 * lam_um / a)
+        dz_mm = blur_um / (2.0 * a) / 1000.0
+        return max(1.0, dz_mm * self.counts_per_mm() / FINE_WEIGHT)
+
     def coarse_step_counts(self) -> int:
         """The largest FOCUS C change per setting (``coarse_step_mm`` of WD), ≥ 1."""
         return max(1, int(round(self.options.coarse_step_mm * self.counts_per_mm())))
@@ -401,6 +435,13 @@ class AutoTuner:
         if mode == "coarse":
             ctx.coarse_sweep()
             return
+        tol = self.focus_tolerance_counts()
+        ctx.focus_tol = tol
+        x = ctx.local("focus_fine", max(4, int(round(hf))), max(1, int(tol)), 1)  # near the present value
+        if x is not None:
+            return
+        self._emit(type="progress", text=f"{ctx.kind}: no peak or trend near FOCUS F {ctx.start['focus_fine']} – "
+                                         "the whole range")
         try:
             ctx.fine_focus(hf)  # the whole FOCUS F range: 512-count grid, then halving
             return
@@ -415,7 +456,11 @@ class AutoTuner:
     def _stigmate(self, ctx: "_Ctx") -> None:
         ctx.use("stig")
         for key in ("stig_x", "stig_y"):
-            ctx.golden("stig_" + key[-1], key)
+            q = 16  # the stigmator's step
+            if ctx.local(key, max(q, int(self.options.stig_local_step) // q * q), q, q) is None:
+                self._emit(type="progress", text=f"{ctx.kind}: no peak or trend near {key.replace('_', ' ')} "
+                                                 f"{ctx.cur[key]} – the whole range")
+                ctx.golden("stig_" + key[-1], key)
 
 
 class _OutOfRange(AutoTuneFailed):
@@ -447,6 +492,7 @@ class _Ctx:
         self.image = "focus"  # which test images: "focus" or "stig" (AutoTuneOptions)
         self.coarse_step = tuner.coarse_step_counts() if "focus_coarse" in start else 1
         self._score: tuple | None = None  # (image, sharpness) at the present settings
+        self.focus_tol = 1.0  # FOCUS F counts: the depth of focus (AutoTuner.focus_tolerance_counts)
 
     @property
     def score_now(self) -> float | None:
@@ -546,6 +592,79 @@ class _Ctx:
         if len(vals) >= 3 and max(vals) < self.t.options.min_contrast * max(min(vals), 1e-12):
             raise AutoTuneFailed(f"{what}: no clear optimum (sharpness changes < "
                                  f"{(self.t.options.min_contrast - 1) * 100:.0f} %; not enough structure?)")
+
+    def local(self, key: str, step: int, min_step: int, quantum: int):
+        """Near the present value first: it and *step* / 2·*step* either side.  A peak (the best not
+        at an end of the five) is refined; a clear trend (the best at an end, best / worst ≥
+        ``local_contrast``) is walked that way with doubling steps until the sharpness falls (the
+        peak bracketed), at most ``local_range`` steps from the start, then refined.  Refining halves
+        the step around the best value down to *min_step* (the depth of focus; the stigmator's 16),
+        then a parabola through the best three.  Values are multiples of *quantum*.  Returns the
+        value set, or None (no peak or trend: the caller searches the whole range; the start value
+        is set again)."""
+        o = self.t.options
+        lo, hi = _LIMITS[key]
+        x0 = self.cur[key]
+        pts: dict[int, float] = {}
+
+        def snap(x):
+            return int(min(hi, max(lo, round(x / quantum) * quantum)))
+
+        def ev(x):
+            x = snap(x)
+            if x not in pts:
+                got, sc = self.evaluate(key, x)
+                pts[got] = sc
+                return got
+            return x
+
+        if self.score_now is None:
+            self.measure()
+        pts[x0] = self.score_now
+        self.samples.append((key, x0, self.score_now))
+        for k in (-1, 1, -2, 2):
+            ev(x0 + k * step)
+        probe = sorted(pts)
+        vals = [pts[x] for x in probe]
+        best = max(pts, key=pts.get)
+        if max(vals) <= o.min_sharpness or max(vals) < o.local_contrast * max(min(vals), 1e-12):
+            self.set(key, x0)
+            return None
+        if best in (probe[0], probe[-1]) and best not in (lo, hi):  # a trend: walk that way
+            d = 1 if best == probe[-1] else -1
+            gap = step
+            while True:
+                if abs(best - x0) >= o.local_range * step:
+                    self.set(key, x0)
+                    return None
+                gap *= 2
+                nxt = ev(best + d * gap)
+                if pts[nxt] < pts[best] or nxt in (lo, hi):
+                    break
+                best = nxt
+            if pts[nxt] >= pts[best]:  # the end of the range: no peak bracketed
+                self.set(key, x0)
+                return None
+            step = gap // 2
+        elif best in (lo, hi):
+            self.set(key, x0)
+            return None
+        # refine: halve the step around the best value down to min_step
+        while step > min_step:
+            step = max(min_step, step // 2)
+            b = max(pts, key=pts.get)
+            ev(b - step)
+            ev(b + step)
+        xs = sorted(pts)
+        b = max(pts, key=pts.get)
+        i = xs.index(b)
+        if 0 < i < len(xs) - 1:
+            trio = xs[i - 1:i + 2]
+            v = fit_log_parabola(trio, [pts[x] for x in trio])
+            if v is not None and trio[0] <= v <= trio[-1]:
+                ev(v)
+        self.t._emit(type="progress", text=f"{self.kind}: {key.replace('_', ' ')} – peak near the start value")
+        return self._end_at_best(key, pts)
 
     def _end_at_best(self, key: str, pts: dict) -> int:
         best = max(pts, key=pts.get)
@@ -653,9 +772,10 @@ class _Ctx:
         for x in (grid if x0 - lo <= hi - x0 else grid[::-1]):
             ev(x)
         self._check_structure(pts, key)
-        # halving down to single counts: the result is tested to the last digit of FOCUS F
+        # halving down to the depth of focus (focus_tolerance_counts)
+        stop = max(1, int(getattr(self, "focus_tol", 1)))
         step = s0 // 2
-        while step >= 1:
+        while step >= stop:
             best = max(pts, key=pts.get)
             ev(best - step)
             ev(best + step)
