@@ -17,11 +17,11 @@ ZOOM_STEP = 2 ** (1 / 3)
 
 Notify = Callable[[str], None]
 
-RUN_STYLE = "QPushButton{background:#2e7d32;color:white;font-weight:bold;font-size:15px;border-radius:4px}" \
+RUN_STYLE = "QPushButton{background:#2e7d32;color:white;font-weight:bold;border-radius:4px}" \
             "QPushButton:hover{background:#388e3c}"
-FREEZE_STYLE = "QPushButton{background:#1565c0;color:white;font-weight:bold;font-size:15px;border-radius:4px}" \
+FREEZE_STYLE = "QPushButton{background:#1565c0;color:white;font-weight:bold;border-radius:4px}" \
                "QPushButton:hover{background:#1976d2}"
-FREEZING_STYLE = "QPushButton{background:#ef6c00;color:white;font-weight:bold;font-size:15px;border-radius:4px}"
+FREEZING_STYLE = "QPushButton{background:#ef6c00;color:white;font-weight:bold;border-radius:4px}"
 
 
 def _group(title: str) -> tuple[QtWidgets.QGroupBox, QtWidgets.QGridLayout]:

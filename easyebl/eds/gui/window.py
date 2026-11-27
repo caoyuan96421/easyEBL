@@ -164,7 +164,6 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.b_clear = QtWidgets.QPushButton("Clear all")
         f_ = self.b_clear.font()
         f_.setBold(True)
-        f_.setPointSizeF(f_.pointSizeF() * 1.4)
         self.b_clear.setFont(f_)
         self.b_clear.setToolTip("remove the sites not acquired yet and the line; the map region goes back to the "
                                 "whole image.  Acquired data stays in the Data Manager (delete it there).")
@@ -681,7 +680,7 @@ class EDSWindow(QtWidgets.QMainWindow):
         v = QtWidgets.QVBoxLayout(g)
         self.el_label = QtWidgets.QLabel("–")
         self.el_label.setWordWrap(True)
-        self.el_label.setStyleSheet("font-size:16px;font-weight:bold")
+        self.el_label.setStyleSheet("font-weight:bold")
         v.addWidget(self.el_label)
         note = QtWidgets.QLabel("Selected elements stay for every spectrum until cleared; "
                                 "AutoID only adds to them.")

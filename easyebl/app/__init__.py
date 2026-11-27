@@ -5,11 +5,12 @@
     easyebl --open sem,eds   # also open these windows (sem, eds, microscope, litho, …)
     python -m easyebl        # the same
 
-Starting it opens a small menu window showing whether the scan DAQ, the EDS
-pulse processor and the microscope are connected, and puts an icon in the
-system tray.  The hardware stays connected in the background when windows
-(or the menu itself) are closed; *Shut down easyEBL* in the tray menu ends it.
-A second start only brings the running program's menu forward.
+Starting it opens the main window - SEM, EDS and Lithography tabs, the microscope
+on the left, the active subsystem's settings on the right, data at the bottom
+(``--classic``: the small menu window and one window per subsystem instead) - and
+puts an icon in the system tray.  The hardware stays connected in the background
+when windows are closed; *Shut down easyEBL* in the tray menu ends it.  A second
+start only brings the running program's window forward.
 
 * :mod:`.config`  – :class:`SystemConfig` (``%APPDATA%\\easyEBL\\system.json``)
 * :mod:`.backend` – :class:`SystemBackend`: DAQ + imaging engine, DP5 + EDS controller, microscope port
@@ -43,7 +44,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None, help="hardware configuration JSON (default: per-user file)")
     p.add_argument("--open", default="", metavar="LIST",
                    help="open these subsystems at start, comma separated: " + ", ".join(SUBSYSTEM_KEYS))
-    p.add_argument("--tray", action="store_true", help="start in the tray (no menu window)")
+    p.add_argument("--tray", action="store_true", help="start in the tray (no window)")
+    p.add_argument("--classic", action="store_true",
+                   help="the small menu window and one window per subsystem instead of the main window")
     return p
 
 
@@ -125,10 +128,20 @@ def main(argv=None) -> int:
     from .gui import EasyEBLApp
 
     apply_dark_theme(app)
+    from .mainwindow import UI_POINT_SIZE
+
+    font = app.font()  # one font size everywhere (small enough for a 1080p screen)
+    font.setPointSizeF(UI_POINT_SIZE)
+    app.setFont(font)
     config = SystemConfig.load(args.config)
     if args.sim:
         config = config.as_simulated()
-    ui = EasyEBLApp(config, persistent=not args.sim)
+    import os
+
+    from .config import default_config_path
+
+    layout = os.path.join(os.path.dirname(args.config or default_config_path()), "mainwindow.ini")
+    ui = EasyEBLApp(config, persistent=not args.sim, main_window=not args.classic, layout_path=layout)
     server = _listen(name, ui)
     ui.start(show_menu=not args.tray)
     for k in opens:

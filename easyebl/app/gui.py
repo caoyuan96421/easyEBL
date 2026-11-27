@@ -1,4 +1,9 @@
-"""The easyEBL entry point: a small menu window, a tray icon and the subsystem windows.
+"""The easyEBL entry point: the main window (or the classic small menu window), a tray icon and
+the subsystem windows.
+
+* With ``main_window=True`` (the program's default) :class:`~easyebl.app.mainwindow.MainWindow`
+  holds every subsystem in one window; the separate windows stay available from its *Windows*
+  menu, and the classic menu window from its *easyEBL* menu.
 
 * :class:`EasyEBLApp` owns the :class:`~easyebl.app.backend.SystemBackend` and opens
   one window per subsystem (SEM imaging, EDS, microscope, lithography and debug tools).
@@ -502,7 +507,7 @@ class MenuWindow(QtWidgets.QMainWindow):
     def update_status(self, status: dict[str, ComponentStatus], config: SystemConfig):
         for key, (dot, text) in self.rows.items():
             s = status[key]
-            dot.setStyleSheet(f"color:{STATE_COLORS.get(s.state, '#ccc')};font-size:15px")
+            dot.setStyleSheet(f"color:{STATE_COLORS.get(s.state, '#ccc')}")
             text.setText(s.text)
             text.setToolTip(f"{STATE_WORDS.get(s.state, s.state)}: {s.text}")
         mode = "simulators" if config.simulated else "instrument"
@@ -534,7 +539,8 @@ class EasyEBLApp(QtCore.QObject):
 
     def __init__(self, config: SystemConfig, persistent: bool = True, eds_settings_path: str | None = None,
                  microscope_settings=None, microscope_delay_s: float = 0.25, use_tray: bool = True,
-                 confirm: Callable[[str, str], bool] | None = None):
+                 confirm: Callable[[str, str], bool] | None = None, main_window: bool = False,
+                 layout_path: str | None = None):
         super().__init__()
         self.config = config
         self.persistent = persistent
@@ -551,6 +557,11 @@ class EasyEBLApp(QtCore.QObject):
 
         self.scan_tap = ScanTap()  # outlives backend restarts; attached to each new DAQ backend
         self.menu = MenuWindow(self)
+        self.main = None  # MainWindow: every subsystem in one window
+        if main_window:
+            from .mainwindow import MainWindow
+
+            self.main = MainWindow(self, layout_path)
         self.tray = None
         if use_tray and QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QtWidgets.QSystemTrayIcon(make_icon(), self)
@@ -572,6 +583,9 @@ class EasyEBLApp(QtCore.QObject):
     # ------------------------------------------------------------------ lifecycle
     def start(self, show_menu: bool = True) -> "EasyEBLApp":
         self.backend.start()
+        if self.main is not None:
+            self.main.build()
+            self.main.restore_layout()
         self._wire_backend()
         self.refresh_status()
         self.timer.start(self.STATUS_MS)
@@ -586,6 +600,8 @@ class EasyEBLApp(QtCore.QObject):
         self.menu.monitor.set_orientation(d.invert_x, d.invert_y, d.swap_xy)  # same coordinates as the images
         if self.backend.microscope is not None:
             self.backend.microscope.opener = lambda: self.open("microscope")
+        if self.main is not None and self.main.monitor is not None:
+            self.main.monitor.set_orientation(d.invert_x, d.invert_y, d.swap_xy)
 
     def shutdown(self, ask: bool = True) -> bool:
         """Close every window and disconnect all hardware; the program ends."""
@@ -596,12 +612,16 @@ class EasyEBLApp(QtCore.QObject):
                 msg += "\n\nStill running: " + ", ".join(busy) + " (it will be stopped)."
             if not self.confirm("Shut down easyEBL", msg):
                 return False
+        if self.main is not None and not self.main.teardown():  # e.g. unsaved data kept
+            return False
         self.closing = True
         self.timer.stop()
         self.menu.monitor.stop()
         self.close_windows()
         self.backend.close()
         self.menu.close()
+        if self.main is not None:
+            self.main.close()
         if self.tray is not None:
             self.tray.hide()
         self.shut_down.emit()
@@ -621,10 +641,12 @@ class EasyEBLApp(QtCore.QObject):
 
     def restart_backend(self, config: SystemConfig | None = None, ask: bool = True) -> bool:
         """Reconnect everything (with a new configuration): the subsystem windows are closed first."""
-        if ask and (self.windows or self.backend.busy):
+        if ask and (self.windows or self.backend.busy or self.main is not None):
             what = ", ".join(self.backend.busy) or "the subsystem windows"
             if not self.confirm("Reconnect hardware", f"Reconnecting closes {what}. Continue?"):
                 return False
+        if self.main is not None and not self.main.teardown():
+            return False
         self.close_windows()
         self.backend.close()
         if config is not None:
@@ -636,6 +658,8 @@ class EasyEBLApp(QtCore.QObject):
                     QtWidgets.QMessageBox.warning(self.menu, "easyEBL", f"Configuration not saved: {e}")
         self.backend = SystemBackend(self.config, **self._backend_kw)
         self.backend.start()
+        if self.main is not None:
+            self.main.build()
         self._wire_backend()
         self.refresh_status()
         return True
@@ -662,7 +686,7 @@ class EasyEBLApp(QtCore.QObject):
         return self.restart_backend()
 
     def configure(self):
-        d = HardwareDialog(self.config, self.menu if self.menu.isVisible() else None, persistent=self.persistent)
+        d = HardwareDialog(self.config, self._parent(), persistent=self.persistent)
         if d.exec() == QtWidgets.QDialog.Accepted:
             return self.restart_backend(d.config())
         return False
@@ -671,6 +695,8 @@ class EasyEBLApp(QtCore.QObject):
     def refresh_status(self):
         st = self.backend.status()
         self.menu.update_status(st, self.config)
+        if self.main is not None:
+            self.main.update_status(st, self.config)
         if self.tray is not None:
             state = _overall(st)
             if state != getattr(self, "_tray_state", None):
@@ -712,7 +738,9 @@ class EasyEBLApp(QtCore.QObject):
     def _fill_tray_menu(self, tm: QtWidgets.QMenu):
         tm.clear()
         self._open_actions = [a for a in getattr(self, "_open_actions", []) if _alive(a) and a.parent() is not tm]
-        tm.addAction("Show easyEBL menu", self.show_menu)
+        tm.addAction("Show easyEBL" if self.main is not None else "Show easyEBL menu", self.show_menu)
+        if self.main is not None:
+            tm.addAction("Classic menu window", self.show_classic_menu)
         tm.addSeparator()
         self.fill_open_menu(tm)
         tm.addSeparator()
@@ -730,6 +758,13 @@ class EasyEBLApp(QtCore.QObject):
             self.tray.showMessage("easyEBL", text, make_icon(), 5000)
 
     def show_menu(self):
+        """The main window (the classic menu window without one)."""
+        if self.main is not None:
+            self.main.bring_up()
+            return self.main
+        return self.show_classic_menu()
+
+    def show_classic_menu(self):
         self.menu.show()
         self.menu.setWindowState(self.menu.windowState() & ~QtCore.Qt.WindowMinimized)
         self.menu.raise_()
@@ -737,8 +772,23 @@ class EasyEBLApp(QtCore.QObject):
         return self.menu
 
     # ------------------------------------------------------------------ subsystem windows
+    def _parent(self):
+        if self.main is not None and self.main.isVisible():
+            return self.main
+        return self.menu if self.menu.isVisible() else None
+
     def open(self, key: str):
-        """Show the window of subsystem *key* (created once; again after it was closed)."""
+        """Show subsystem *key*: with the main window its tab (SEM, EDS, Lithography) or panel
+        (microscope), the tools in their own windows; else its own window (:meth:`open_window`)."""
+        if self.main is not None:
+            if key in ("sem", "eds", "litho"):
+                return self.main.show_tab(key)
+            if key == "microscope" and self.main.mic is not None:
+                return self.main.show_microscope()
+        return self.open_window(key)
+
+    def open_window(self, key: str):
+        """Show the separate window of subsystem *key* (created once; again after it was closed)."""
         w = self.windows.get(key)
         if w is not None and _alive(w):
             w.show()
@@ -748,13 +798,13 @@ class EasyEBLApp(QtCore.QObject):
             return w
         ok, why = self.available(key)
         if not ok:
-            QtWidgets.QMessageBox.information(self.menu if self.menu.isVisible() else None, "easyEBL",
+            QtWidgets.QMessageBox.information(self._parent(), "easyEBL",
                                               f"{_BY_KEY[key].title.replace('&&', '&')} is not available.\n\n{why}")
             return None
         try:
             w = self._create(key)
         except Exception as e:  # noqa: BLE001 - shown to the user
-            QtWidgets.QMessageBox.warning(self.menu if self.menu.isVisible() else None, "easyEBL",
+            QtWidgets.QMessageBox.warning(self._parent(), "easyEBL",
                                           f"Cannot open {_BY_KEY[key].title.replace('&&', '&')}:\n{type(e).__name__}: {e}")
             return None
         w.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
@@ -802,7 +852,7 @@ class EasyEBLApp(QtCore.QObject):
                 from ..litho.coords import StageAxes
 
                 mc = b.config.microscope
-                return BackendHardware(b.engine, b.manager, b.microscope, win.bridge, open_sem=lambda: self.open("sem"),
+                return BackendHardware(b.engine, b.manager, b.microscope, win.bridge, open_sem=self._sem_for_litho,
                                        parent_widget=win, axes=StageAxes(mc.stage_mirror_x, mc.stage_mirror_y))
 
             w = LithoWindow(hardware)
@@ -833,9 +883,15 @@ class EasyEBLApp(QtCore.QObject):
         w.resize(1300, 850)
         return w
 
+    def _sem_for_litho(self):
+        """The SEM window the lithography picks markers in (the main window's SEM tab)."""
+        if self.main is not None and self.main.sem is not None:
+            return self.main.sem_for_litho()
+        return self.open_window("sem")
+
     # ------------------------------------------------------------------ misc
     def _ask(self, title: str, text: str) -> bool:
-        parent = self.menu if self.menu.isVisible() else None
+        parent = self._parent()
         return QtWidgets.QMessageBox.question(parent, title, text) == QtWidgets.QMessageBox.Yes
 
     def handle_command(self, cmd: str):

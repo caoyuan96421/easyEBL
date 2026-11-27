@@ -26,7 +26,7 @@ from .stage import AXES, StageControl
 __all__ = ["MicroscopeWindow", "BeamPresetDialog"]
 
 STATE_COLORS = {"connected": "#4c4", "uncertain": "#fb4", "disconnected": "#f55", "closed": "#888"}
-_BIG = "font-size:20px;font-weight:bold"
+_BIG = "font-weight:bold"  # one font size everywhere
 _NOTE = "color:#9aa"
 
 
@@ -136,20 +136,30 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
     # ================================================================ SEM panel
     def _sem_panel(self):
+        """The column, compact (it fits the left side bar of the main window at 1080p): every
+        control in a grid, explanations in the tooltips."""
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(4)
         sem = self.sem
 
+        def grid(title):
+            g = QtWidgets.QGroupBox(title)
+            f = QtWidgets.QGridLayout(g)
+            f.setContentsMargins(6, 4, 6, 4)
+            f.setHorizontalSpacing(6)
+            f.setVerticalSpacing(3)
+            lay.addWidget(g)
+            return g, f
+
         # --- high voltage
-        g = QtWidgets.QGroupBox("Accelerating voltage")
-        f = QtWidgets.QGridLayout(g)
+        g, f = grid("Accelerating voltage")
         self.l_hv = QtWidgets.QLabel("—")
         self.l_hv.setStyleSheet(_BIG)
-        f.addWidget(self.l_hv, 0, 0, 1, 2)
         self.l_emi = QtWidgets.QLabel("emission —")
         self.l_emi.setStyleSheet(_NOTE)
         self.l_emi.setToolTip("R EMI (raw – the protocol does not give its units)")
-        f.addWidget(self.l_emi, 0, 2, 1, 2)
         self.hv_set = _dspin(0.3, 30.0, 2, 20.0, 0.1, " kV")
         self.hv_set.setToolTip("setpoint: 0.30–9.99 kV in 0.01 kV, 10.0–30.0 kV in 0.1 kV steps")
         self.b_hv_set = QtWidgets.QPushButton("Set")
@@ -160,21 +170,19 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.b_hv_off = QtWidgets.QPushButton("HV OFF")
         self.b_hv_off.setStyleSheet("QPushButton{background:#8a2c2c;color:white;font-weight:bold}")
         self.b_hv_off.clicked.connect(lambda: self._confirmed("Switch the high voltage OFF?", sem.hv_off, "HV OFF"))
-        f.addWidget(QtWidgets.QLabel("Setpoint"), 1, 0)
-        f.addWidget(self.hv_set, 1, 1)
-        f.addWidget(self.b_hv_set, 1, 2)
-        r = QtWidgets.QHBoxLayout()
-        r.addWidget(self.b_hv_on)
-        r.addWidget(self.b_hv_off)
-        f.addLayout(r, 2, 0, 1, 4)
-        lay.addWidget(g)
+        f.addWidget(self.l_hv, 0, 0)
+        f.addWidget(self.l_emi, 0, 1, 1, 3)
+        f.addWidget(self.hv_set, 1, 0)
+        f.addWidget(self.b_hv_set, 1, 1)
+        f.addWidget(self.b_hv_on, 1, 2)
+        f.addWidget(self.b_hv_off, 1, 3)
 
-        # --- magnification
-        g = QtWidgets.QGroupBox("Magnification")
-        f = QtWidgets.QGridLayout(g)
+        # --- exposure field size (the Lithography's) and magnification
+        g, f = grid("Field size && magnification")
+        f.addWidget(QtWidgets.QLabel("Field size"), 0, 0)
+        f.addWidget(self._field_size_combo(), 0, 1, 1, 4)
         self.l_mag = QtWidgets.QLabel("×—")
         self.l_mag.setStyleSheet(_BIG)
-        f.addWidget(self.l_mag, 0, 0, 1, 2)
         self.mag_combo = QtWidgets.QComboBox()
         for m in MAGNIFICATIONS:
             self.mag_combo.addItem(_fmt_mag(m), m)
@@ -183,17 +191,18 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         b_dn = QtWidgets.QPushButton("−")
         b_up = QtWidgets.QPushButton("+")
         for b in (b_dn, b_up):
-            b.setFixedWidth(36)
+            b.setFixedWidth(28)
         b_dn.clicked.connect(lambda: self._call(sem.step_magnification, -1))
         b_up.clicked.connect(lambda: self._call(sem.step_magnification, +1))
-        f.addWidget(b_dn, 1, 0)
-        f.addWidget(self.mag_combo, 1, 1)
-        f.addWidget(b_up, 1, 2)
-        lay.addWidget(g)
+        f.addWidget(QtWidgets.QLabel("Mag."), 1, 0)
+        f.addWidget(self.l_mag, 1, 1)
+        f.addWidget(b_dn, 1, 2)
+        f.addWidget(self.mag_combo, 1, 3)
+        f.addWidget(b_up, 1, 4)
+        f.setColumnStretch(3, 1)
 
-        # --- focus / WD
-        g = QtWidgets.QGroupBox("Focus && working distance")
-        f = QtWidgets.QGridLayout(g)
+        # --- focus / WD and stigmator
+        g, f = grid("Focus && stigmator")
         self.wd = _dspin(3.0, 60.0, 3, 15.0, 0.1, " mm")
         self.wd.setToolTip("working distance computed from the coarse and fine focus; a new value sets the "
                            "focus (FOCUS C and F from the focus table)")
@@ -202,58 +211,48 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.focus_c.valueChanged.connect(lambda v: self._user(sem.set_focus, "C", v))
         self.focus_f = _spin(0, 4095, 2048, sem.focus_step)
         self.focus_f.valueChanged.connect(lambda v: self._user(sem.set_focus, "F", v))
-        f.addWidget(QtWidgets.QLabel("Working distance"), 0, 0)
-        f.addWidget(self.wd, 0, 1)
-        f.addWidget(QtWidgets.QLabel("Focus coarse"), 1, 0)
-        f.addWidget(self.focus_c, 1, 1)
-        f.addWidget(QtWidgets.QLabel("Focus fine"), 2, 0)
-        f.addWidget(self.focus_f, 2, 1)
-        lay.addWidget(g)
-
-        # --- stigmator
-        g = QtWidgets.QGroupBox("Stigmator")
-        f = QtWidgets.QGridLayout(g)
         self.stig_x = _spin(0, 4095, 2048, sem.stig_step)
         self.stig_x.valueChanged.connect(lambda v: self._user(sem.set_stigmator, "X", v))
         self.stig_y = _spin(0, 4095, 2048, sem.stig_step)
         self.stig_y.valueChanged.connect(lambda v: self._user(sem.set_stigmator, "Y", v))
-        f.addWidget(QtWidgets.QLabel("X"), 0, 0)
-        f.addWidget(self.stig_x, 0, 1)
-        f.addWidget(QtWidgets.QLabel("Y"), 1, 0)
-        f.addWidget(self.stig_y, 1, 1)
-        lay.addWidget(g)
+        for r, (a, wa, b, wb) in enumerate((("WD", self.wd, "Stig X", self.stig_x),
+                                            ("Coarse", self.focus_c, "Stig Y", self.stig_y),
+                                            ("Fine", self.focus_f, None, None))):
+            f.addWidget(QtWidgets.QLabel(a), r, 0)
+            f.addWidget(wa, r, 1)
+            if b is not None:
+                f.addWidget(QtWidgets.QLabel(b), r, 2)
+                f.addWidget(wb, r, 3)
+        f.setColumnStretch(1, 1)
+        f.setColumnStretch(3, 1)
 
         # --- beam current (condenser)
-        g = QtWidgets.QGroupBox("Beam current (condenser)")
-        f = QtWidgets.QGridLayout(g)
+        g, f = grid("Beam current (condenser)")
+        g.setToolTip("Raw 0–99 settings (the remote protocol reports no calibrated probe current; "
+                     "watch the EDS input count rate to judge the current).")
         self.beam_c = _spin(0, 99, 50)
         self.beam_c.valueChanged.connect(lambda v: self._user(sem.set_beam, "C", v))
         self.beam_f = _spin(0, 99, 50)
         self.beam_f.valueChanged.connect(lambda v: self._user(sem.set_beam, "F", v))
-        f.addWidget(QtWidgets.QLabel("Coarse"), 0, 0)
-        f.addWidget(self.beam_c, 0, 1)
-        f.addWidget(QtWidgets.QLabel("Fine"), 1, 0)
-        f.addWidget(self.beam_f, 1, 1)
-        note = QtWidgets.QLabel("Raw 0–99 settings (the remote protocol reports no calibrated probe current; "
-                                "watch the EDS input count rate to judge the current).")
-        note.setWordWrap(True)
-        note.setStyleSheet(_NOTE)
-        f.addWidget(note, 2, 0, 1, 3)
         b = QtWidgets.QPushButton("Presets…")
         b.setToolTip("save and recall named settings: beam coarse / fine, stigmator, contrast / brightness")
         b.clicked.connect(self.open_presets)
-        f.addWidget(b, 0, 2, 2, 1)
         self.b_aga = QtWidgets.QPushButton("Auto gun alignment")
         self.b_aga.setToolTip("AGA ON: the SEM's automatic gun alignment (holds the port until it ends)")
         self.b_aga.clicked.connect(lambda: self._confirmed(
             "Run the SEM's automatic gun alignment? It takes the port until the SEM has finished.",
             lambda: sem.alignment("gun"), "auto gun alignment"))
-        f.addWidget(self.b_aga, 3, 0, 1, 3)
-        lay.addWidget(g)
+        f.addWidget(QtWidgets.QLabel("Coarse"), 0, 0)
+        f.addWidget(self.beam_c, 0, 1)
+        f.addWidget(QtWidgets.QLabel("Fine"), 0, 2)
+        f.addWidget(self.beam_f, 0, 3)
+        f.addWidget(b, 1, 0, 1, 2)
+        f.addWidget(self.b_aga, 1, 2, 1, 2)
+        f.setColumnStretch(1, 1)
+        f.setColumnStretch(3, 1)
 
         # --- SEM display
-        g = QtWidgets.QGroupBox("SEM display && detector")
-        f = QtWidgets.QGridLayout(g)
+        g, f = grid("SEM display && detector")
         self.cont = _spin(0, 4095, 2048, 16)
         self.cont.valueChanged.connect(lambda v: self._user(sem.set_contrast, v))
         self.brt = _spin(0, 4095, 2048, 16)
@@ -275,27 +274,24 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.b_run.setCheckable(True)
         self.b_run.setToolTip("RUN OFF / RUN ON – freezes the SEM's own display (does not blank the beam)")
         self.b_run.toggled.connect(lambda on: self._user(sem.set_running, not on))
-        f.addWidget(QtWidgets.QLabel("Contrast"), 0, 0)
-        f.addWidget(self.cont, 0, 1)
-        f.addWidget(QtWidgets.QLabel("Brightness"), 1, 0)
-        f.addWidget(self.brt, 1, 1)
-        f.addWidget(b_abc, 0, 2, 2, 1)
-        f.addWidget(QtWidgets.QLabel("Scan"), 2, 0)
-        f.addWidget(self.scan_combo, 2, 1)
-        f.addWidget(self.b_run, 2, 2)
-        f.addWidget(QtWidgets.QLabel("Detector"), 3, 0)
-        f.addWidget(self.det_combo, 3, 1)
-        lay.addWidget(g)
-
-        g = QtWidgets.QGroupBox("Background read")
-        f = QtWidgets.QFormLayout(g)
         self.sem_poll = QtWidgets.QCheckBox("Read SEM settings in the background")
         self.sem_poll.setChecked(sem.polling)
         self.sem_poll.setToolTip("Reads the SEM settings one after another without pause (MAG / HV most "
                                  "often), so changes on the SEM panel reach imaging and EDS")
         self.sem_poll.toggled.connect(self._sem_poll_changed)
-        f.addRow(self.sem_poll)
-        lay.addWidget(g)
+        f.addWidget(QtWidgets.QLabel("Contrast"), 0, 0)
+        f.addWidget(self.cont, 0, 1)
+        f.addWidget(QtWidgets.QLabel("Bright."), 0, 2)
+        f.addWidget(self.brt, 0, 3)
+        f.addWidget(QtWidgets.QLabel("Scan"), 1, 0)
+        f.addWidget(self.scan_combo, 1, 1)
+        f.addWidget(QtWidgets.QLabel("Detector"), 1, 2)
+        f.addWidget(self.det_combo, 1, 3)
+        f.addWidget(b_abc, 2, 0, 1, 2)
+        f.addWidget(self.b_run, 2, 2, 1, 2)
+        f.addWidget(self.sem_poll, 3, 0, 1, 4)
+        f.setColumnStretch(1, 1)
+        f.setColumnStretch(3, 1)
         lay.addStretch(1)
         return w
 
@@ -307,7 +303,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         lay.setSpacing(4)
         self.b_stop = QtWidgets.QPushButton("STOP ALL AXES")
         self.b_stop.setMinimumHeight(32)
-        self.b_stop.setStyleSheet("QPushButton{background:#c62828;color:white;font-size:15px;font-weight:bold}"
+        self.b_stop.setStyleSheet("QPushButton{background:#c62828;color:white;font-weight:bold}"
                                   "QPushButton:pressed{background:#8e0000}")
         self.b_stop.setToolTip("S0 to every axis at once – also while a SEM command holds the port (Esc)")
         self.b_stop.clicked.connect(self.stop_all)
@@ -332,16 +328,19 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.dro, self.dro_state = {}, {}
         for i, a in enumerate(AXES):
             name = QtWidgets.QLabel(a)
-            name.setStyleSheet("font-size:15px;font-weight:bold;color:#9cf")
+            name.setStyleSheet("font-weight:bold;color:#9cf")
             val = DROLabel("—")
             val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            val.setFont(QtGui.QFont("Consolas", 14, QtGui.QFont.Bold))
+            fv = QtGui.QFont(val.font())  # the size of every other text
+            fv.setFamily("Consolas")
+            fv.setBold(True)
+            val.setFont(fv)
             val.setStyleSheet("background:#111;color:#7f7;border:1px solid #333;padding:0px 6px")
             val.setMinimumWidth(140)
             val.setToolTip(f"double-click: move {a}")
             val.double_clicked.connect(lambda a=a: self.open_move_dialog(a))
             state = QtWidgets.QLabel("—")
-            state.setStyleSheet("color:#bbb;font-size:11px")
+            state.setStyleSheet("color:#bbb")
             grid.addWidget(name, i, 0)
             grid.addWidget(val, i, 1)
             grid.addWidget(QtWidgets.QLabel(st.unit(a)), i, 2)
@@ -382,7 +381,6 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         def jb(text, axis, sign, tip):
             b = QtWidgets.QToolButton(text=text)
             b.setFixedSize(32, 26)
-            b.setStyleSheet("font-size:12px")
             b.setToolTip(tip)
             b.clicked.connect(lambda _=False: self.jog(axis, sign))
             return b
@@ -414,9 +412,76 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self._show_move_state()
         return w
 
+    def _field_size_box(self):
+        """The exposure field size (the Lithography's list, shared settings): selecting one sets its
+        magnification, the stage Z to 1000 × its nominal WD (µm) and the focus to the WD1 recorded
+        for it on the calibration sample (the nominal WD when none is).  A schedule runs only at
+        the field size selected here."""
+        g = QtWidgets.QGroupBox("Exposure field size")
+        f = QtWidgets.QHBoxLayout(g)
+        f.addWidget(self._field_size_combo(), 1)
+        return g
+
+    def _field_size_combo(self):
+        """The field size selector (see :meth:`_field_size_box`)."""
+        from ..litho.module.tabs import PositionsHub
+        from ..litho.settings import LithoSettings
+
+        self.litho_settings = LithoSettings.shared()
+        self.field_size = QtWidgets.QComboBox()
+        self.field_size.setToolTip("sets the magnification, the stage Z to the nominal WD and the focus to the WD1 "
+                                   "recorded for it (else the nominal WD); tune either by hand after.  The Lithography runs a schedule only at the field size "
+                                   "selected here (Lithography → Calibration → Field sizes… edits the list)")
+        self.field_size.activated.connect(lambda i: self.select_field_size(self.field_size.itemData(i)))
+        self._fill_field_sizes()
+        PositionsHub.instance().changed.connect(lambda st: st is self.litho_settings and self._fill_field_sizes())
+        return self.field_size
+
+    def _fill_field_sizes(self):
+        st = self.litho_settings
+        self.field_size.blockSignals(True)
+        self.field_size.clear()
+        self.field_size.addItem("(none)", "")
+        for fs in st.field_sizes:
+            self.field_size.addItem(fs.describe(), fs.name)
+        self.field_size.setCurrentIndex(max(0, self.field_size.findData(st.field_size)))
+        self.field_size.blockSignals(False)
+
+    def select_field_size(self, name: str, move_z: bool = True) -> bool:
+        """Select field size *name* ("" none): its magnification, the stage Z to 1000 × its nominal
+        WD µm (*move_z*; the move asks first when the window confirms moves) and the focus to its
+        WD1 (recorded on the calibration sample; else the nominal WD)."""
+        from ..litho.module.tabs import PositionsHub
+
+        st = self.litho_settings
+        fs = st.find_field_size(name) if name else None
+        if name and fs is None:
+            self.notify(f"no field size named {name!r}")
+            return False
+        st.field_size = fs.name if fs is not None else ""
+        try:
+            st.save()
+        except OSError as e:
+            self.notify(f"litho settings not saved: {e}")
+        self._fill_field_sizes()
+        PositionsHub.instance().changed.emit(st)
+        if fs is None:
+            self.notify("field size: none")
+            return True
+        wd1 = st.wd1(fs.name)
+        wd = fs.wd_mm if wd1 is None else wd1
+        self.notify(f"field size {fs.describe()}; the focus to " + (f"WD1 {wd1:g} mm" if wd1 is not None else
+                                                                     f"the nominal {wd:g} mm (no WD1 recorded)"))
+        self._call(self.sem.set_magnification, fs.magnification, what=f"magnification ×{fs.magnification}")
+        self._call(self.sem.set_working_distance, wd, what=f"working distance {wd:g} mm")
+        if move_z:
+            self.move({"Z": 1000.0 * fs.wd_mm}, relative=False)
+        return True
+
     def _positions_box(self):
-        """The Lithography window's Stage Positions (the same list, shared settings): X, Y and the
-        height H = WD − Z; a move to one sets Z for focus at the WD now."""
+        """The Lithography window's Stage Positions (the same list, shared settings): X, Y and ΔZ
+        (against the calibration sample, whose Z_cal and WD1 Record WD takes); Go to XYZ sets Z_cal +
+        ΔZ and the focus to WD1."""
         from ..litho.module.tabs import StagePositionsTab
         from ..litho.settings import LithoSettings
 
@@ -438,11 +503,15 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         v.addWidget(self.positions_tab)
         return g
 
-    def goto_position(self, x: float, y: float, z=None):
+    def goto_position(self, x: float, y: float, z=None, wd=None):
+        """Move to (x, y) and Z *z* (None: Z stays); the focus to *wd* mm (None: stays)."""
         targets = {"X": float(x), "Y": float(y)}
         if z is not None:
             targets["Z"] = float(z)
-        return self.move(targets, relative=False)
+        fut = self.move(targets, relative=False)
+        if fut is not None and wd is not None:
+            self._call(self.sem.set_working_distance, float(wd), what=f"working distance {float(wd):g} mm")
+        return fut
 
     # ================================================================ helpers
     def notify(self, msg: str):
@@ -545,7 +614,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         busy = self.stage.busy
         self.l_move.setText("STAGE MOVING – easyEBL has the stage (#STAGE ON)" if busy else
                             "STAGE: SEM PC (trackball) – a move takes it for its duration")
-        self.l_move.setStyleSheet("font-size:12px;font-weight:bold;"
+        self.l_move.setStyleSheet("font-weight:bold;"
                                   + ("background:#ef6c00;color:white" if busy else "background:#455a64;color:#ddd"))
         self.g_jog.setEnabled(not busy)
 

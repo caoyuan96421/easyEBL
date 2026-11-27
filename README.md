@@ -47,14 +47,41 @@ There is one program:
 ```bash
 easyebl                  # the hardware configured in Hardware → Configure… (saved per user)
 easyebl --sim            # this session on simulators only (the saved configuration is kept)
-easyebl --open sem,eds   # also open these windows: sem, eds, microscope, litho, vector, gds, dose,
-                         # alignment, raster, hal
+easyebl --open sem,eds   # also show these: sem, eds, microscope, litho (tabs), vector, gds, dose,
+                         # alignment, raster, hal (windows)
+easyebl --classic        # the small menu window and one window per subsystem (the former layout)
 python -m easyebl        # the same as easyebl
 ```
 
-It opens a **small menu window** that shows, for the scan DAQ, the EDS pulse processor and the
-microscope, whether it is connected (green), simulated (blue), waiting or needing attention
-(orange) or failed (red, with the reason), and puts an **icon in the system tray**.
+It opens the **main window** (laid out for a 1920 × 1080 screen, one font size throughout) and puts
+an **icon in the system tray**:
+
+* **Centre – tabs SEM, EDS, Lithography**: the SEM image, the EDS electron image and spectrum,
+  the lithography stage plot.
+* **Left – the microscope**: *Column* (HV, exposure field size and magnification, focus and
+  stigmator, beam current, SEM display), *Stage* (STOP ALL AXES, position, jog, stage positions)
+  and, below, the **beam monitor** (the scan monitor described below).
+* **Right – the active tab's settings**: SEM scan / capture / image / field of view / column;
+  EDS acquire / map / composition; lithography chips and exposure schedule.
+* **Bottom – data**: *Messages* (of the active tab), *Stage positions* (the lithography's, with
+  ΔZ, Record WD, Go to), *Calibration* (per field size: magnification, nominal WD, WD1, Z_cal,
+  the stored beam and field calibrations), *Alignment* (each chip: Global Align result, height),
+  *SEM view* (a small live SEM image: a marker pick asked by the lithography shows there and in
+  the SEM tab – click, Confirm or Cancel in either; the SEM tab has the full magnification and
+  field-of-view controls), *EDS data* (the Data Manager), *EDS live spectrum*, *Microscope log*.
+* **Menus and toolbar**: *easyEBL*, *Hardware*, *Panels* (show / hide the side bars, reset the
+  layout), *Windows* (a separate SEM or Microscope window, the tools) – and the active tab's own
+  menus and toolbar.  A tab's keyboard shortcuts (F5, Ctrl+S, …) work only while it is shown.
+* **Esc stops everything** (also the red *STOP ALL* button): every stage axis, a running exposure
+  schedule (and a marker pick), EDS acquisitions and the SEM scan.
+* The side bars can be moved, floated and resized; the layout is saved in
+  `%APPDATA%\easyEBL\mainwindow.ini`.  Closing the window hides it to the tray.
+* The status bar shows, for the scan DAQ, the EDS pulse processor and the microscope, whether it
+  is connected (green), simulated (blue), waiting or needing attention (orange) or failed (red;
+  the tooltip says why).
+
+The **classic menu window** (*easyEBL → Classic menu window*, the tray menu, or `--classic`) shows
+the same status, one line per device, and opens each subsystem in a window of its own:
 
 * **Open** starts a subsystem: SEM imaging, EDS, Microscope (column & stage), and under *Tools*
   vector and GDS lithography, the dose calculator, alignment, the raster debug GUI and HAL debug.
@@ -76,11 +103,12 @@ microscope, whether it is connected (green), simulated (blue), waiting or needin
 * **The hardware stays connected in the background.**  All subsystems share the one backend (one
   DAQ manager, one DP5, one serial port), so SEM and EDS share the DAQ through the HAL lease.
   Closing a subsystem window, or the menu window itself, does not disconnect anything.
-* **Tray icon:** click it to bring the menu back; right-click it for the menu, any subsystem,
+* **Tray icon:** click it to bring the window back; right-click it for the menu, any subsystem,
   *Hardware…* and **Shut down easyEBL**, which closes every window and disconnects all hardware.
   The icon shows a coloured dot when a device needs attention.
-* Only one easyEBL runs per user: starting it again brings the running menu to the front (and
-  opens the windows named by `--open`).
+* Only one easyEBL runs per user: starting it again brings the running window to the front (and
+  shows what `--open` names).  EDS and Lithography exist once (the tabs); the SEM and the
+  microscope can also have a window of their own (*Windows* menu).
 
 In VS Code select the `.venv` interpreter (*Python: Select Interpreter*) and pick *easyEBL* or
 *easyEBL (simulators)* in *Run and Debug* (F5).
@@ -351,14 +379,15 @@ S-3000. On top of it:
   (`microscope/coupling.py`) keeps the DAQ field at `K / magnification` (the global field calibration,
   see the SEM window); zooming keeps the scan's share of the field.  EDS takes the
   SEM's kV as the nominal beam energy, and spectra and images carry the column and stage readbacks.
-* The window: HV, magnification, focus / WD, stigmator, condenser and SEM display on the left.  On
+* The window: HV, the lithography's **exposure field size** (see *Lithography*), magnification,
+  focus / WD, stigmator, condenser and SEM display on the left.  On
   the right is a compact stage panel:
   - **STOP ALL** (also *Esc*);
   - the line showing who drives the stage;
   - a digital readout of X, Y, Z, R and T (double-click a value to move that axis to / by a value);
   - the X/Y/Z/R/T jogs, with the step sizes and the X/Y approach beside them;
   - the lithography's **Stage positions** (the same list and buttons as the Lithography window's
-    Stage Positions tab, X, Y and H = WD − Z; see *Lithography*);
+    Stage Positions tab: X, Y, ΔZ, *Record WD*; see *Lithography*);
   - the raw TX/RX log.
 
   On the real instrument, HV switching, the automatic routines and moves ask for confirmation.  The
@@ -384,41 +413,50 @@ image*).  It shows:
 
 - every chip: its CCS origin and x / y axes (nominal, or as measured by a Global Align);
 - every field of every Exposure: its field of view (dashed), its pattern where the chip map puts
-  it, and the selected step's fields highlighted;
+  it, and the selected step's fields highlighted; the whole GDS – every layer, also shapes in no
+  field such as markers placed in the top cell itself – is drawn gray underneath, so what the
+  Exposure does not write stays gray;
 - the alignment markers (Global: magenta, Local: cyan);
-- the named stage positions, and the stage with its current field of view (green).
+- the named stage positions, and the stage with its current field of view: the full deflection
+  field (green) and, when the SEM imaging window scans a reduced or shifted area, that area (red).
 
 Right click on the plot (or *Stage → Move stage…*): **Move stage…** to the clicked position, to a
-Global / Local marker of a chosen chip, or to a stage position – in focus (Z for the chip's or
-the position's height at the WD now; off: Z stays).
+Global / Local marker of a chosen chip, or to a stage position – in focus (a chip: Z_cal and its
+WD2 there; a stage position: Z_cal + ΔZ and WD1; off: Z and the focus stay).
 
-The status bar shows the selected chip's alignment, the column's WD against the schedule's, the
-beam and field calibrations for the column condition now, and the last field's map.
+The status bar shows the selected chip's alignment, the field size selected in the Microscope
+window (against the schedule's), the WD now and WD1, the beam and field calibrations of the field
+size, and the last field's map.
 
-### Focus: the working distance and heights (H = WD − Z)
+### Field sizes and focus (WD1, WD2, ΔZ)
 
-After the beam calibration the column – focus and stigmation – is not touched again: every
-sample is brought into focus with the **stage Z** alone.  A surface in focus at working distance
-`WD` (from the focus, mm) with the stage at `Z` (µm, growing away from the lens) has the height
+The stage Z is not accurate enough, and there is no height sensor, to focus with Z, and the WD
+(from the focus) is nominal.  So the stage Z stays at the calibration sample's **Z_cal** on every
+chip and the **focus** does the rest:
 
-    H = 1000·WD − Z      (µm)
+1. **Field size** (*Calibration → Field sizes…*: name, magnification, nominal WD; to start with
+   100 µm ×1200 WD 7 mm, 250 µm ×500 WD 11 mm, 500 µm ×250 WD 24 mm).  After loading the sample,
+   select one in the **Microscope window**: it sets the magnification, moves the stage Z to
+   1000 × the nominal WD (µm), and sets the focus to the **WD1 recorded for that field size**
+   (the nominal WD when there is none yet).  Tune either by hand.  A schedule runs only at the
+   field size selected there.
+2. **WD1**: go to the *Calibration sample* (Stage positions), focus and stigmate at a high
+   magnification, then **Record WD**: WD1 and the stage Z (Z_cal).  Both are kept **per field
+   size**, with the field size settings; every ΔZ is against the selected field size's Z_cal.
+   *Go to XYZ* moves to Z_cal + ΔZ and sets the focus to WD1.
+3. **WD2**: go to the chip, focus on the corner / first alignment mark with the stage still at
+   Z_cal, and record it in the chip's *Height…* dialog – one WD2 for the chip, or WD2x at ≥ 3
+   points for a plane (a least-squares plane in chip coordinates; each field's WD from it at its
+   centre).  A height is refused at another Z than Z_cal, and a schedule with a chip height
+   recorded at another Z (Z_cal changed since) does not run.
+4. A WD2 / WD2x more than 1 mm from WD1 is warned about.
 
-which does not depend on the column: at the schedule's WD the same surface is in focus at
-`Z = 1000·WD − H`.  Every named stage position has an H (recorded with the object in focus), and
-so has every chip (*Chips → Height…*):
-
-* **constant** – focus by hand (with Z) on a feature of the chip, *Record here*;
-* **height map** – *Record here* at ≥ 3 points of the chip (stored in chip coordinates), a
-  least-squares plane; each field's Z comes from the plane at its centre;
-* **none** – the stage's Z is left where it is (a warning).
-
-The schedule has one **working distance** (in its first step, default 15 mm; *Set to current WD*
-takes the column's WD now) for the whole run: the first step sets the focus to it; before each
-measuring beam calibration you focus by hand on the grid, and the WD then read back becomes the
-schedule's WD from there on (see below); every other step checks the column is still at it
-(±0.1 mm, else the step fails – someone refocused) and moves Z for focus.  A Z move larger than *largest
-Z move* (Schedule settings, default 2 mm) or a Z below 0 fails the step before the stage moves,
-so a wrong height or WD cannot drive the sample into the lens.
+During a run the stage moves in X and Y only; after it reaches a field centre the focus is set to
+the chip's WD there (WD2, or the plane).  Stage positions store **ΔZ** (µm, relative to Z_cal;
+positive moves the stage away from the gun).  Replacing the calibration sample (*Replace with
+current*) at another Z changes every other ΔZ so their Z stays; *Record WD* changes only the
+calibration sample.  A Z move to a stage position larger than *largest Z move* (Schedule settings,
+default 2 mm) or a Z below 0 fails before the stage moves.
 
 ### Coordinates
 
@@ -449,50 +487,46 @@ later fields.
 The stage mirror is a hardware setting: *Hardware → Configure… → Devices → Microscope*
 (S-3000: mirror X on, Y off).
 
-### Calibrations: the fixed first steps
+### Calibrations
 
-Every schedule starts with three steps that cannot be deleted, moved or disabled: **Column
-setting** (beam preset, magnification and the schedule's WD), **Beam calibration** and **Field
-calibration**.  Their settings are in the steps' editors (and saved with the schedule); the
-calibration positions are named stage positions, in focus through their heights.
-*Calibration → Run the fixed steps only* (Ctrl+K) runs just these three.
+Every schedule starts with two steps that cannot be deleted, moved or disabled: **Column
+setting** (the schedule's field size – the magnification; the focus goes to WD1 –, beam preset,
+nominal current) and **Beam calibration**.  *Calibration → Run the fixed steps only* (Ctrl+K)
+runs just these two.  Later Column settings change the beam preset / current only.
 
-* **Beam calibration**: the stage goes to its stage position (X, Y and the Z for its height) on a
-  calibration sample with a 1 µm square grid.  With *focus and stigmate by hand first* (default on)
-  the column zooms to ×10k (settable), the SEM window scans live, and a prompt waits – it does not
-  block the other windows: focus and stigmate (SEM panel, Microscope or SEM window), then
-  *Continue* (or *Abort*).  The WD read back then is the schedule's WD for the rest of the run
-  (the schedule is marked modified) and the grid position's H is recorded again (1000·WD − Z,
-  saved; every Stage Positions list follows).  This is to be replaced by auto focus / stigmation.
-  Back at the step's magnification one image is taken over the whole field at
-  ≤ 0.1 µm pixels (5000 × 5000 for 500 µm).  The grid's two lattice frequencies are demodulated
-  and their phases fitted for the X / Y scale, shear and pincushion `k` (the grid's rotation and
-  shift are fitted and dropped).  A window shows the image, the numbers, the fit residual and a
-  map of the beam position error over the field; *Accept* keeps it, saved in `litho.json`, for
-  its condition: **magnification and WD** (±0.1 mm).  With *use a stored calibration* the step
-  takes a stored one of the same condition instead of measuring.  The one-step inverse leaves an
-  error of about 3·k²·r⁵ (≈ 40 nm at the field edge for 0.8 µm of distortion there).
-* **Field calibration**: a reference image at its stage position (a structured feature), then
-  one at each of a 3 × 3 grid (or 5-point cross) of stage shifts of ±30 % of the field; the
-  images are de-noised (Gaussian, 2.5 px) and flattened (a wide blur subtracted), matched by
-  partially whitened phase correlation (sub-pixel; quality: the peak-to-sidelobe ratio), and an
-  image far off the others is left out of the fit; the shifts, converted to BCS through the beam
-  calibration, give `B`.  Its rotation is used; its scale (stage encoder against the grid) is a
-  check.  A window shows the progress and the result (rotation, scale, stretch, shear, drift,
-  residuals, a table and a plot); *Accept* uses it, *Discard* drops it (and stops the run).  Each
-  image is matched for every mirroring, so a wrong mirror setting shows as a mismatch, pointing
-  to the hardware setting.  Valid for the **magnification, beam preset and WD** it was measured at
-  and the beam calibration it went through (this window session only).  With *keep the field
-  calibration in force when it applies* the step measures nothing when the one in force (from an
-  earlier run in this window) fits the condition and the beam calibration now.
+* **Beam calibration**: the stage goes to the calibration sample (its X, Y, Z_cal), the focus to
+  WD1.  With *confirm the focus by hand first* (default on) the column zooms to ×10k (settable),
+  the SEM window scans live, and a prompt waits – it does not block the other windows: focus and
+  stigmate (it should be very close), then *Continue* (or *Abort*); the WD read back is WD1 from
+  then on (saved for the field size); the stage Z must not change.  This is to be replaced by auto
+  focus / stigmation.  Back at the step's magnification one image of the calibration grid (1 µm
+  square) is taken over the whole field at ≤ 0.1 µm pixels (5000 × 5000 for 500 µm).  The grid's
+  two lattice frequencies are demodulated and their phases fitted for the X / Y scale, shear and
+  pincushion `k` (the grid's rotation and shift are fitted and dropped).  A window shows the
+  image, the numbers, the fit residual and a map of the beam position error over the field;
+  *Accept* keeps it, saved in `litho.json`, for the **field size** (used at any WD on the chips).
+  Every accepted one is stored with its field size (the last one per field size and
+  magnification).  With *use a stored calibration* the step takes the one stored for the
+  schedule's field size instead of measuring (and measures when none is); the step's line and
+  editor show which one (its date and numbers).  One stored without a field size (an older file)
+  is not used.  The one-step inverse leaves an error of about 3·k²·r⁵ (≈ 40 nm at the field edge for
+  0.8 µm of distortion there).
+* **Field calibration** is not a step: *Calibration → Field calibration…* measures it outside a
+  schedule, at the field size selected now, at a chosen stage position with a structured feature
+  (Z_cal + ΔZ, the focus at WD1): a reference image, then one at each of a 3 × 3 grid (or 5-point
+  cross) of stage shifts of ±30 % of the field; the images are de-noised (Gaussian, 2.5 px) and
+  flattened (a wide blur subtracted), matched by partially whitened phase correlation (sub-pixel;
+  quality: the peak-to-sidelobe ratio), and an image far off the others is left out of the fit;
+  the shifts, converted to BCS through the beam calibration, give `B`.  Only its **stage ↔ beam
+  rotation** is used; its scale (stage encoder against the grid) is a check.  A window shows the
+  progress and the result; *Accept* keeps it – **one per field size, across sessions** (in
+  `litho.json`) – and the schedules use it automatically; *Discard* keeps the one in force.  Each
+  image is matched for every mirroring, so a wrong mirror setting shows as a mismatch, pointing to
+  the hardware setting.  Without one for the field size the nominal rotation is used (a warning).
 
 A fit that is refused (rms over the limit, weak matches, …) is shown with **Use anyway** next to
-*Discard*: an override – the refused calibration is used (logged as such) and the run goes on;
-*Discard* fails the step.  When nothing could be fitted at all (no grid found) there is nothing
-to use and the step fails.
-
-More Beam / Field calibration steps can be added later in a schedule (e.g. after another Column
-setting); they start as copies of the fixed ones.
+*Discard*: an override – the refused calibration is used (logged as such); *Discard* fails the
+step.  When nothing could be fitted at all (no grid found) there is nothing to use.
 
 ### Stage
 
@@ -507,64 +541,75 @@ setting); they start as copies of the fixed ones.
 
 ### Tabs
 
-* **Stage Positions**: named positions X, Y and **H = WD − Z** (calibration samples, Faraday
-  cup …), recorded with the object in focus: *Add current stage*, *Add…*, *Replace with current*
-  (the selected one becomes the stage now), *Go to (in focus)* (X, Y and the Z for its height at
-  the WD now), *Go to XY*, *Delete*.  A position without a height (from an older file, which
-  stored Z) is shown red and cannot be used by a calibration step.  The same list, with the same
-  buttons, is in the Microscope window; both follow every change.  Saved in
-  `%APPDATA%\easyEBL\litho.json` (`EASYEBL_LITHO_SETTINGS` overrides).
+* **Stage Positions**: named positions X, Y and **ΔZ**: *Add current stage*, *Add…*, *Replace
+  with current* (the selected one becomes the stage now), **Record WD** (WD1 of the field size and
+  Z_cal on the calibration sample), *Go to XYZ* (X, Y, Z_cal + ΔZ, the focus to WD1), *Go to XY*,
+  *Delete*.  *Calibration sample* and *Faraday cup* are always in the list (replaced, not
+  deleted).  A position without ΔZ (from an older file, which stored H or Z) is shown red.  The
+  same list, with the same buttons, is in the Microscope window; both follow every change.
+  Saved in `%APPDATA%\easyEBL\litho.json` (`EASYEBL_LITHO_SETTINGS` overrides) with the field
+  sizes, WD1 per field size and the calibrations.
 * **Chips**: name, the nominal stage position of the CCS origin, the alignment, the height, a
   note; *Add chip* (at the stage), *Origin = stage*, *Move…* (a reference point – the origin,
   the first field centre, the bounding-box centre or Global marker 1 – to the stage, a click or
-  a typed position), *Reset alignment*, *Height…* (none, constant or a height map: *Record
-  here*, *Go to* a point in focus; the Z range over the chip's fields at the schedule's WD).
-* **Exposure Schedule**, four step types:
-  - *Column setting*: a beam preset of the microscope module (or *Keep as is*), the
-    magnification (the field follows the global field calibration), an optional nominal
-    current for the dose readout; the first one also has the schedule's working distance.
-  - *Beam calibration* and *Field calibration*: at a named stage position, with their settings.
+  a typed position), *Reset alignment*, *Height…* (focus kept, one WD2 or a WD2x map: *Record
+  here* at Z_cal, *Go to* a point – Z_cal and its WD; the WD range over the chip's fields).
+* **Exposure Schedule**, three step types:
+  - *Column setting*: the field size (the first one: the schedule's), a beam preset of the
+    microscope module (or *Keep as is*), an optional nominal current for the dose readout.
+  - *Beam calibration*: on the calibration sample, with its settings.
   - *Exposure*: a chip and a whole GDS file (top cell, layers, offset of the GDS origin in CCS).
     Each top-level cell (the references placed by the top cell, array elements included) is one
     field; its centre is the cell's bounding-box centre, or (checkbox) the cell's origin.
     Dwell per point and point step (GDS dose factors multiply the dwell).  Markers are CCS
     points: **Global Align** 2–4 markers, all inside one field's field of view – that field is
-    written first; **Local markers**, assigned automatically to the field whose field of view
-    holds them (nearest centre), at most one per field (*One per field…* puts one at the same
-    place in every field).  Wrong assignments are warnings.  Without a GDS file the step only
-    aligns.
+    written first; they are measured twice (1 → 2 → 1 → 2), the second pass predicted from the
+    first, and the two passes must agree within the *alignment tolerance* (default 0.5 µm; the
+    mean is used) – else *Repeat*, *Continue anyway* (an override) or *Abort*; **Local
+    markers**, assigned automatically to the field whose field of view holds them (nearest
+    centre), at most one per field (*One per field…* puts one at the same place in every
+    field).  Wrong assignments are warnings.  Without a GDS file the step only aligns.
+    **Markers are picked on the plot**: *Pick* (one Global marker), *Pick all on the plot…*
+    (marker 1, 2, … in turn) and, for Local markers, *Pick on the plot…* (each click adds one,
+    Esc ends).  A click snaps to the nearest corner or centre of any polygon of the Exposure's
+    GDS – every layer, exposed or not, also shapes in the top cell itself – within 12 screen
+    pixels (ringed in yellow while the mouse moves; nothing near: nothing taken); Shift-click
+    takes the clicked point itself; Esc or a right click ends picking.
 
   *Validate* (and Run) warns about: patterns outside the field of view, markers in no field or
-  two in one, Global markers not in one field, unknown chips or beam presets, missing beam or
-  field calibrations, calibration positions without a height, chips without a usable height, Z
-  below 0.  Schedules are JSON files (`*.ebls.json`, version 4: the WD, the steps' calibration
-  settings, the chips' heights) with the chips; GDS paths are stored relative to the file.
-  Version 3 files open with the fixed steps inserted (their stage positions need a height).
+  two in one, Global markers not in one field, unknown chips, beam presets or field sizes, the
+  Microscope window at another field size, missing beam or field calibrations, no WD1, chips
+  without a usable height or recorded at another Z, WD2 more than 1 mm from WD1.  A run is
+  refused (with the reasons) at another field size than the Microscope window's, without WD1, or
+  with a chip height recorded at another Z than Z_cal.  Schedules are JSON files (`*.ebls.json`,
+  version 5: the field size, the Beam calibration settings, the chips' heights) with the chips;
+  GDS paths are stored relative to the file.  Version 3 and 4 files open with their WD, heights
+  and Field calibration steps dropped and the magnification turned into the default field size
+  with it (none if no default has it).
 * **Run** starts by putting the SEM in RUN mode on Slow scan 1 (left so afterwards), then runs
-  every step from the first.  When it finishes, the stage goes to the calibration grid (the fixed
-  Beam calibration step's position), in focus; after a failure or Abort it stays.  **Run from selected** skips the fixed steps and starts
-  at the selected step – only when the column is at the schedule's WD and a beam and a field
-  calibration of the column condition now are in force (e.g. from an earlier run or *Run the
-  fixed steps only*); otherwise it is refused with the reason.
-* **Running** an Exposure, field by field: the stage goes to the field's target; for each marker
-  the SEM imaging window zooms its scan onto the predicted position (beam shift and scan width)
-  (magenta cross).  **Each click centres the scan on the clicked point** (beam shift, clamped at
-  the field edge), so the marker comes under the green centre cross; click again to refine, as
-  often as you like.  The bar above the image shows the scan centre, its offset from the
-  prediction and the clicks; **Confirm** (Enter) takes the scan centre as the marker position,
-  *Reset* goes back to the prediction, *Cancel* (Esc) aborts the run.  Then the SEM scan stops
-  and the pattern is written through the chain.  A pattern outside the field is skipped or aborts, as set in
-  *Schedule settings*.
+  every step from the first.  When it finishes, the stage goes back to the calibration sample
+  (Z_cal, the focus at WD1); after a failure or Abort it stays.  **Run from selected** skips the
+  fixed steps and starts at the selected step – only when the column is at the field size's
+  magnification, the stage at Z_cal and a beam calibration of the field size is stored;
+  otherwise it is refused with the reason.
+* **Running** an Exposure, field by field: the stage goes to the field's target (X, Y) and the
+  focus to the chip's WD there; for each marker the SEM imaging window zooms its scan onto the
+  predicted position (beam shift and scan width) (magenta cross).  **Each click centres the scan
+  on the clicked point** (beam shift, clamped at the field edge), so the marker comes under the
+  green centre cross; click again to refine, as often as you like.  The bar above the image shows
+  the scan centre, its offset from the prediction and the clicks; **Confirm** (Enter) takes the
+  scan centre as the marker position, *Reset* goes back to the prediction, *Cancel* (Esc) aborts
+  the run.  Then the SEM scan stops and the pattern is written through the chain.  A pattern
+  outside the field is skipped or aborts, as set in *Schedule settings*.
 * **Demo files**: `python -m easyebl.litho.demo` writes them to `examples/litho/`:
   `multifield_demo.gds` (3 × 3 fields of 80 µm on a 100 µm pitch; layer 1 the pattern, layer 2
-  alignment crosses at (±45, ±45) µm), `multifield_demo.ebls.json` (chip at stage (5000, 5000) µm,
-  the fixed steps at the stage positions *Calibration grid* and *Faraday cup* – add them in
-  Stage Positions –, one Exposure with Global Align in the first field and a Local marker in
-  every other) and `dummy_demo.ebls.json` (the GDS without alignment, then an alignment-only
-  Exposure).
+  alignment crosses at (±45, ±45) µm), `multifield_demo.ebls.json` (field size 250 µm, chip at
+  stage (5000, 5000) µm, the fixed steps – record the calibration sample and its WD1 –, one
+  Exposure of layer 1 with Global Align in the first field and a Local marker in every other) and
+  `dummy_demo.ebls.json` (the GDS without alignment, then an alignment-only Exposure).
 
-Not implemented yet: automatic marker finding (markers are clicked), autofocus for the heights
-(they are focused by hand) and a measured beam current.  On the simulators the SEM image follows
+Not implemented yet: automatic marker finding (markers are clicked), autofocus for WD1 / WD2
+(focused by hand) and a measured beam current.  On the simulators the SEM image follows
 the simulated stage through a hidden stage → beam map (0.35° and +0.6 %), so a field calibration has something to find.
 
 ## Lithography and debug tools
@@ -601,7 +646,7 @@ tests/        unit/, system/ (simulator pipelines), gui/ (offscreen Qt); data/ r
   litho/      dose maths, geometry, fills, VectorScanCompiler, LithoWriter, GDS import;
               coords (SCS/WCS/BCS), schedule, fracture (importer), runner, settings, demo; module/ (window)
   gui/        shared widgets (DataclassForm, ImageView, WaveformView) for the tools
-  app/        the easyEBL program: SystemConfig, SystemBackend (all hardware), menu window + tray
+  app/        the easyEBL program: SystemConfig, SystemBackend (all hardware), main window, menu window + tray
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the design rationale (timing model,

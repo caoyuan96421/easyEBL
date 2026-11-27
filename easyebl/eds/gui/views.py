@@ -270,8 +270,6 @@ class ElectronImageView(pg.GraphicsLayoutWidget):
             txt = pg.TextItem(label, color=color, anchor=(0, 1))
             f = QtGui.QFont(txt.textItem.font())
             f.setBold(bold)
-            if bold:
-                f.setPointSizeF(f.pointSizeF() * 1.3)
             txt.setFont(f)
             px, py = (params[0], params[1]) if kind != "line" else (params[2], params[3])
             if kind in ("rect", "ellipse", "map"):

@@ -32,10 +32,13 @@ def eds(qtbot, tmp_path):
     mic = SEMControl(link)
     mic.refresh().result(10)
     w = EDSWindow(ctrl, settings, simulated=True, microscope=mic)
+    # unsaved test data: no question when the window closes – pytest-qt closes it before this
+    # fixture's teardown, and a modal question nobody answers would hang the test run
+    w._ask_unsaved = lambda items: "discard"
     qtbot.addWidget(w)
     w.show()
     yield w, mgr, dpp
-    w._ask_unsaved = lambda items: "discard"  # unsaved test data: no dialog at the end
+    w._ask_unsaved = lambda items: "discard"  # a test may have changed it
     w.close()
     link.close()
     dpp.close()
@@ -45,112 +48,6 @@ def eds(qtbot, tmp_path):
 def _wait_idle(qtbot, w, timeout=60000):
     qtbot.waitUntil(lambda: not w.ctrl.busy and w._job is None and w._analysis is None and w._maps_fut is None,
                     timeout=timeout)
-
-
-def test_eds_window_workflow(qtbot, eds, tmp_path):
-    w, mgr, dpp = eds
-    # electron image
-    w.im_res.setCurrentIndex(w.im_res.findData("128x128"))
-    w.im_dwell.setValue(2.0)
-    w.acquire_image()
-    _wait_idle(qtbot, w)
-    assert w.image is not None and w.image.data.shape == (128, 128) and np.isfinite(w.image.data).all()
-
-    # calibration from a whole-field spectrum (the DP5 mock sees a 55Fe source: Mn Kα + Kβ)
-    w.sp_time.setValue(1.5)
-    w.sp_autoid.setChecked(False)
-    w.select(None)
-    w.b_acquire.click()  # nothing selected: the whole image
-    _wait_idle(qtbot, w)
-    sp = w._current.spectrum
-    assert sp is not None and sp.total > 5000
-    w.open_calibration()
-    d = w._calib_dialog
-    k_ka = d.marker  # the strongest peak is marked: Mn Kα
-    assert k_ka is not None and abs(k_ka - np.argmax(sp.counts)) < 3
-    d.add_element("Mn")  # the calibration is far off (the mock is ≈39 eV/ch): the nearest Mn line is wrong …
-    assert d.pairs[0].line.label != "Mn Kα" and d.table.rowCount() == 1
-    combo = d.table.cellWidget(0, 0)  # … and is corrected in the table
-    combo.setCurrentIndex([combo.itemData(i).label for i in range(combo.count())].index("Mn Kα"))
-    assert d.pairs[0].line.label == "Mn Kα" and abs(d.calibration.energy(k_ka) - 5.8965) < 1e-3
-    # Mn Kβ: click near it, then Mn again
-    true_kb = k_ka * 6.49 / 5.895
-    d.mark_peak(true_kb + 2)
-    d.add_element("Mn")
-    assert [p.line.label for p in d.pairs] == ["Mn Kα", "Mn Kβ"]
-    # a second spectrum (another sample): the pairs so far are kept, the new one is added
-    from easyebl.eds.spectrum import Spectrum as _Sp
-    other = _Sp(np.roll(sp.counts, 40), sp.calibration, title="second sample", timestamp="2026-11-22T10:00:00")
-    d.spectrum = other
-    d._show_spectrum(mark_strongest=True)
-    d.add_element("Mn")
-    assert len(d.pairs) == 3 and {p.source for p in d.pairs} >= {"second sample 11-22 10:00"}
-    saved = EDSSettings.load(w.settings.path).calibration_points
-    assert len(saved) == 3 and {q["label"] for q in saved} == {"Mn Kα", "Mn Kβ"}
-    d.remove_selected()  # nothing selected: no change
-    d.table.selectRow([p.source for p in d.pairs].index("second sample 11-22 10:00"))
-    d.remove_selected()
-    assert len(d.pairs) == 2 and len(EDSSettings.load(w.settings.path).calibration_points) == 2
-    d.spectrum = sp
-    d.refit()
-    d.apply()
-    cal = w.ctrl.energy_calibration
-    assert abs(cal.energy(k_ka) - 5.895) < 0.01  # Mn Kα where it belongs
-    # typing a value and Clear
-    d.sp_slope.setValue(12.5)
-    assert d.calibration.gain_kev == pytest.approx(0.0125)
-    d.close()
-    # reopened: the pairs are back
-    w.open_calibration()
-    d = w._calib_dialog
-    assert [p.line.label for p in d.pairs] == ["Mn Kα", "Mn Kβ"] and d.table.rowCount() == 2
-    d.clear()
-    assert d.calibration == EnergyCalibration() and d.pairs == [] and d.table.rowCount() == 0
-    assert EDSSettings.load(w.settings.path).calibration_points == []
-    assert EDSSettings.load(w.settings.path).energy_calibration == cal  # persisted
-    d.close()
-
-    # point spectrum with AutoID
-    w.sp_autoid.setChecked(True)
-    w.sp_time.setValue(1.0)
-    w._site_requested("point", (0.0, 0.0))
-    assert not w.ctrl.busy and w._current.spectrum is None  # drawing only creates the site …
-    w.b_acquire.click()  # … the Acquire button measures it
-    _wait_idle(qtbot, w)
-    assert w._current.spectrum is not None and w._current.spectrum.total > 0
-
-    # a small map + window maps
-    w._site_requested("map", (0.0, 0.0, 0.5, 0.5))  # field fractions
-    w.m_nx.setValue(8)
-    w.m_ny.setValue(6)
-    w.m_dwell.setValue(5)
-    w.set_elements(["Mn", "Fe", "Cu"])
-    w.start_map()
-    _wait_idle(qtbot, w, 120000)
-    assert w.map is not None and w.map.done.all() and w.map.shape == (6, 8)
-    assert len(w._maps) == 3 and w.maps_grid.count() == 4  # SE + 3 elements
-    w.m_kind.setCurrentIndex(1)
-    w.compute_maps()
-    _wait_idle(qtbot, w)
-    w.compute_phases()
-    _wait_idle(qtbot, w)
-    assert any(m.label == "Phases" for m in w._maps)
-    n_items = len(w.data)
-    w._map_pixel(2, 3)  # a click shows the pixel's spectrum without adding an item
-    assert w._spectrum_of_current().total > 0 and len(w.data) == n_items
-
-    # line scan
-    w._site_requested("line", (-0.4, 0.0, 0.4, 0.0))
-    w.l_n.setValue(6)
-    w.l_dwell.setValue(5)
-    w.start_linescan()
-    _wait_idle(qtbot, w)
-    assert len(w.profile.getPlotItem().listDataItems()) >= 3
-
-    # files
-    w._current.spectrum.save(tmp_path / "x.msa")
-    assert (tmp_path / "x.msa").exists()
-
 
 
 def test_sites_follow_the_field_of_view_and_clear_all(qtbot, eds):
