@@ -51,7 +51,7 @@ class MoveFieldsDialog(QtWidgets.QDialog):
 
     def __init__(self, anchors: dict, stage=None, click=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Move the chip")
+        self.setWindowTitle("Move pattern")
         self.anchors = anchors
         self.targets = {"stage": ("current stage position", stage), "click": ("the clicked position", click),
                         "abs": ("stage coordinate", None)}

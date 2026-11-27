@@ -77,6 +77,15 @@ def test_sem_window_live_controls_capture(qtbot, sem, tmp_path):
     assert hi > lo
     w.image.s_con.setValue(800)
     assert w.levels()[1] - w.levels()[0] < hi - lo
+    assert w.image.b_acb.text() == "Auto levels" and w.image.avg.value() == eng.options.averaging
+    # the tools at the top: icon + text
+    texts = [a.text() for a in w.tools.actions() if a.text()]
+    assert texts[0] in ("Run", "Stop")  # Stop while scanning
+    for t in ("Single", "Capture", "Full FoV", "Autofocus", "Auto stigmation", "Auto gun align", "Auto C/B",
+              "Crosshair", "Scan line", "Field inset", "Advanced…", "Full screen"):
+        assert t in texts, t
+    assert all(not a.icon().isNull() for a in w.tools.actions() if a.text())
+    assert w.tools.toolButtonStyle() == QtCore.Qt.ToolButtonTextUnderIcon
     # console-style change from another thread is reflected in the panels
     import threading
 

@@ -151,9 +151,11 @@ class TestFill:
         f = raster_fill(u, 0.1)
         top_row = [r for r in f.runs if r[0, 1] > 2]
         assert len(top_row) == 2 * 10  # two separate spans per row in the upper part
-        from easyebl.litho.gui_vector import _ring
+        from easyebl.litho.geometry import regular_polygon
 
-        ring = Polygon(_ring(6, 3, 64))
+        o = regular_polygon(0, 0, 6, 64).points
+        i = regular_polygon(0, 0, 3, 64).points
+        ring = Polygon(np.vstack([o, o[:1], i[:1], i[1:][::-1], i[:1]]))  # annulus as one keyhole polygon
         pts = raster_fill(ring, 0.1).all_points()
         r = np.hypot(*pts.T)
         assert r.min() > 2.9 and r.max() < 6.0

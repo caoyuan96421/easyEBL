@@ -144,8 +144,11 @@ class EDSWindow(QtWidgets.QMainWindow):
         self.data_tabs = QtWidgets.QTabWidget()
         self.data_tabs.addTab(self._data_tab(), "Data Manager")
 
+        from ...gui.icons import icon
+
         tools = QtWidgets.QToolBar()
-        tools.setIconSize(QtCore.QSize(16, 16))
+        tools.setIconSize(QtCore.QSize(18, 18))
+        tools.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
         self._tool_group = QtGui.QActionGroup(self)
         for key, label, tip in [("pan", "Pan", "drag / wheel: move and zoom the image"),
                                 ("point", "Point", "click: spectrum at a point"),
@@ -153,7 +156,7 @@ class EDSWindow(QtWidgets.QMainWindow):
                                 ("ellipse", "Ellipse", "drag: spectrum averaged over an ellipse"),
                                 ("line", "Line", "drag: line for a line scan"),
                                 ("map", "Map area", "drag: region for maps (default: the whole image)")]:
-            a = tools.addAction(label)
+            a = tools.addAction(icon(key), label)
             a.setCheckable(True)
             a.setToolTip(tip)
             a.setData(key)

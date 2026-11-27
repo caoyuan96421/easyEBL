@@ -127,10 +127,10 @@ class StagePositionsTab(QtWidgets.QWidget):
         g.addWidget(b_cur, 0, 0)
         g.addWidget(b_add, 0, 1)
         g.addWidget(self.b_replace, 0, 2)
+        g.addWidget(self.b_record, 0, 3)
         g.addWidget(self.b_go, 1, 0)
         g.addWidget(self.b_go_xy, 1, 1)
         g.addWidget(self.b_del, 1, 2)
-        g.addWidget(self.b_record, 2, 0)
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(self.table, 1)
         lay.addWidget(self.l_cal)
@@ -349,7 +349,7 @@ class ChipsTab(QtWidgets.QWidget):
 
     changed = QtCore.Signal()
     resetRequested = QtCore.Signal(str)  # forget the chip's Global Align
-    moveRequested = QtCore.Signal(str)  # Move the chip… dialog
+    moveRequested = QtCore.Signal(str)  # Move pattern… dialog
     heightRequested = QtCore.Signal(str)  # Height… dialog
     selectionChanged = QtCore.Signal(str)
 
@@ -1020,6 +1020,7 @@ class OpEditor(QtWidgets.QWidget):
             self.readout = QtWidgets.QLabel()
             self.readout.setWordWrap(True)
             self.readout.setStyleSheet("color:#9aa")
+            f.addRow("dose factor from", self._dose_source(op))
             d = self._spin_for(f, "dwell / point", "dwell_us", lo=0.001, hi=1e6, decimals=3, suffix=" µs", step=0.1)
             st = self._spin_for(f, "point step", "step_nm", lo=0.1, hi=1e5, decimals=2, suffix=" nm", step=1)
             d.valueChanged.connect(self._readout)
@@ -1097,6 +1098,46 @@ class OpEditor(QtWidgets.QWidget):
                          "within this, else repeat / continue / abort")
         v.addLayout(g)
         self.refresh_info()
+
+    def _dose_source(self, op) -> QtWidgets.QComboBox:
+        """Which GDS property gives each shape's dose factor (× the dwell); the properties holding a
+        number in the file are offered."""
+        from ..gds import GDSDoseMapping, dose_properties
+
+        box = QtWidgets.QComboBox()
+        box.setToolTip("the dose factor of each shape (× the dwell per point): a property of the GDS "
+                       "polygons, or none (all 1)")
+        try:
+            props = dose_properties(op.path)
+        except Exception as e:  # noqa: BLE001
+            props = {}
+            self.msg.setText(f"GDS properties: {type(e).__name__}: {e}")
+        box.addItem("none (all 1)", ("none", None))
+        box.addItem("any property with a number", ("property", None))
+        for attr, (n, lo, hi) in props.items():
+            rng = f"{lo:g}" if lo == hi else f"{lo:g} … {hi:g}"
+            box.addItem(f"property {attr} ({n} shapes, {rng})", ("property", attr))
+        m = op.dose
+        cur = (m.mode, m.property_attr if m.mode == "property" else None)
+        if m.mode == "auto":
+            box.addItem("auto (any property, else the datatype table)", ("auto", m.property_attr))
+            cur = ("auto", m.property_attr)
+        elif m.mode in ("datatype", "layer"):
+            box.addItem(f"{m.mode} table (from an older schedule)", (m.mode, None))
+            cur = (m.mode, None)
+        i = next((k for k in range(box.count()) if tuple(box.itemData(k)) == cur), -1)
+        if i < 0 and m.mode == "property":
+            box.addItem(f"property {m.property_attr} (not in the file)", cur)
+            i = box.count() - 1
+        box.setCurrentIndex(max(0, i))
+
+        def chosen(k):
+            mode, attr = box.itemData(k)
+            self._set("dose", GDSDoseMapping(mode=mode, property_attr=attr, table=dict(m.table), default=m.default,
+                                             value_scale=m.value_scale))
+        box.currentIndexChanged.connect(chosen)
+        self.dose_box = box
+        return box
 
     def _readout(self, *_):
         op = self.op

@@ -11,7 +11,7 @@ pytest.importorskip("PySide6")
 pytest.importorskip("gdstk")
 pytestmark = pytest.mark.gui
 
-from PySide6 import QtWidgets  # noqa: E402
+from PySide6 import QtCore, QtWidgets  # noqa: E402
 
 from easyebl.app.config import SystemConfig  # noqa: E402
 from easyebl.litho.beamcal import BeamCalConfig, BeamCalibration  # noqa: E402
@@ -309,7 +309,7 @@ def test_move_chip(win, demo, qtbot, monkeypatch):
     assert win.anchors("Demo chip")["bbox"][1] == pytest.approx((7000.0, 6000.0))
     assert win.schedule.chips[0].origin == pytest.approx((7100.0, 6100.0))
     win.view.contextRequested.emit(5.0, 6.0, win.mapToGlobal(win.rect().center()))
-    assert [x.text() for x in win._last_menu.actions() if x.text()][:2] == ["Move stage…", "Move the chip…"]
+    assert [x.text() for x in win._last_menu.actions() if x.text()][:2] == ["Move stage…", "Move pattern…"]
     win._last_menu.close()
 
 
@@ -552,6 +552,87 @@ def test_every_gds_layer_is_drawn_gray(win, tmp_path):
     win.replan()
     x, y = win.view._other.getData()
     assert np.nanmax(x) == pytest.approx(5000.0 + 200.0) and np.nanmin(y) == pytest.approx(4800.0)
+
+
+def _dose_gds(tmp_path):
+    """Two fields (cells A, B) of squares with dose factors as GDS property 7 (1.0, 1.5, 2.0) and
+    property 3 holding text."""
+    import gdstk
+
+    lib = gdstk.Library(unit=1e-6, precision=1e-9)
+    top = lib.new_cell("TOP")
+    for k, (name, x) in enumerate((("A", 0.0), ("B", 120.0))):
+        c = lib.new_cell(name)
+        for j, d in enumerate((1.0, 1.5, 2.0)):
+            r = gdstk.rectangle((-30 + 20 * j, -5), (-20 + 20 * j, 5), layer=1)
+            r.set_gds_property(7, f"{d:g}")
+            r.set_gds_property(3, "no number")
+            c.add(r)
+        top.add(gdstk.Reference(c, (x, 0)))
+    path = str(tmp_path / "dose.gds")
+    lib.write_gds(path)
+    return path
+
+
+def test_the_toolbar_and_the_drawing_modes(win, tmp_path, qtbot):
+    path = _dose_gds(tmp_path)
+    s = Schedule([ColumnSetting(field_size="250 µm"), Exposure(chip="A", path=path, step_nm=500.0)],
+                 chips=[Chip("A", ORIGIN)])
+    win.set_schedule(s)
+    win.tab_schedule.select(0)
+    win.replan()
+    texts = [a.text() for a in win.tools.actions() if a.text()]
+    assert texts == ["Zoom to pattern", "Move pattern", "Move stage", "Color by Field", "Color by Dose",
+                     "Writing order", "Show dots"]
+    assert win.tools.toolButtonStyle() == QtCore.Qt.ToolButtonTextUnderIcon
+    v = win.view
+    # by field: each field its colour
+    win.a_color_field.setChecked(True)
+    filled = [it for it in v._colored if it.xData is not None and len(it.xData)]
+    assert v.color_mode == "field" and len(filled) == 2 and not len(v._patterns.xData or [])
+    # by dose (exclusive with by field): the dose factors of the GDS property
+    s.exposures[0].dose.mode = "property"
+    s.exposures[0].dose.property_attr = 7
+    win.a_color_dose.setChecked(True)
+    assert not win.a_color_field.isChecked() and v.color_mode == "dose"
+    assert v.dose_range == pytest.approx((1.0, 2.0)) and v.legend.isVisibleTo(v)
+    filled = [it for it in v._colored if it.xData is not None and len(it.xData)]
+    assert len(filled) == 3  # the lowest, middle and highest bins
+    win.a_color_dose.setChecked(False)
+    assert v.color_mode == "plain" and len(v._patterns.xData)
+    # the writing order: the field centres in turn, numbered
+    win.a_order.setChecked(True)
+    assert len(v._order.xData) == 2 and len(v._order_labels) == 2
+    # the exposure points: 3 squares of 10 µm at 0.5 µm per field
+    win.a_dots.setChecked(True)
+    n = len(v._dots.xData)
+    assert n == pytest.approx(2 * 3 * 20 * 20, rel=0.15) and "exposure points" in v.dots_note
+    win.a_dots.setChecked(False)
+    win.a_order.setChecked(False)
+    assert v._dots.xData is None or len(v._dots.xData) == 0
+    assert not v._order_labels
+    # Move pattern (was Move the chip): menu, toolbar and the plot's right-click menu
+    assert win.a_move.text() == "Move pattern…"
+
+
+def test_the_dose_factor_property_is_chosen(win, tmp_path):
+    from easyebl.litho.gds import dose_properties
+
+    path = _dose_gds(tmp_path)
+    assert dose_properties(path) == {7: (6, 1.0, 2.0)}  # property 3 holds no number
+    s = Schedule([Exposure(chip="A", path=path)], chips=[Chip("A", ORIGIN)])
+    win.set_schedule(s)
+    ed = win.tab_schedule.editor
+    ed.set_op(s.exposures[0])
+    box = ed.dose_box
+    items = [box.itemText(i) for i in range(box.count())]
+    assert items[:3] == ["none (all 1)", "any property with a number", "property 7 (6 shapes, 1 … 2)"]
+    box.setCurrentIndex(2)
+    d = s.exposures[0].dose
+    assert d.mode == "property" and d.property_attr == 7
+    win.replan()
+    box.setCurrentIndex(0)
+    assert s.exposures[0].dose.mode == "none"
 
 
 def _marks_gds(tmp_path):

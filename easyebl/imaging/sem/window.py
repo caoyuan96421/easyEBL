@@ -13,6 +13,7 @@ from .advanced import AdvancedDialog, SaveSettings
 from .display import ContrastBrightness, format_length
 from ...microscope.control import MicroscopeControl, StubMicroscope
 from .panels import CapturePanel, ColumnPanel, FieldOfViewPanel, ImagePanel, ScanPanel
+from ...gui.icons import icon, tool_bar
 from .view import SEMImageView, render_annotated
 
 __all__ = ["SEMWindow", "apply_dark_theme"]
@@ -65,6 +66,9 @@ class SEMWindow(QtWidgets.QMainWindow):
     display timer (fixed refresh, so a busy GUI can never back up the scan).
     """
 
+    #: an automatic function of the SEM ended (on any thread): (kind, message, ok)
+    autoFinished = QtCore.Signal(str, str, bool)
+
     REFRESH_MS = 16  # display poll (≈60 Hz); frames are shown as soon as they are published
 
     def __init__(
@@ -97,8 +101,10 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.cb = ContrastBrightness(ai_range_v=self._ai_range())
         self._last_seq = 0
         self._capture_future = None
-        self._acb_pending = True  # auto contrast on the first image
         self._adv: AdvancedDialog | None = None
+        self._acb_pending = True  # auto contrast on the first image
+        self._abc = None  # the SEM's ABC in progress: {"resume": bool, "esc": bool}
+        self.busy = None  # the modal window of a running automatic function (easyebl.gui.busy.BusyDialog)
         self._disp_times: list = []
         self._sub = engine.subscribe(maxlen=200)
 
@@ -170,6 +176,10 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.view.contextRequested.connect(self._context_menu)
         self.view.pointerMoved.connect(self._pointer)
         self.view.measureChanged.connect(self._measure_changed)
+        self.autoFinished.connect(self._auto_finished)
+        self.column.tune_handler = lambda what: (self.auto_stigmate() if what == "stig" else
+                                                 self.focus_and_stigmate() if what == "both" else self.auto_focus(what))
+        self.column.tuneEvent.connect(self._tune_busy)
 
         self.timer = QtCore.QTimer(self)
         self.timer.setTimerType(QtCore.Qt.PreciseTimer)
@@ -185,27 +195,153 @@ class SEMWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------- UI
     def _make_toolbar(self):
-        tb = self.addToolBar("Main")
-        tb.setObjectName("main")
-        tb.setMovable(False)
-        a = tb.addAction("Crosshair")
-        a.setCheckable(True)
-        a.toggled.connect(lambda on: (setattr(self.view, "show_crosshair", on), self.view.update()))
-        a = tb.addAction("Scan line")
-        a.setCheckable(True)
-        a.setChecked(True)
-        a.toggled.connect(lambda on: setattr(self.view, "show_scan_line", on))
-        a = tb.addAction("Field inset")
-        a.setCheckable(True)
-        a.setChecked(True)
-        a.setToolTip("lower-left corner: the scanned region within the full field of view")
-        a.toggled.connect(lambda on: (setattr(self.view, "show_fov_inset", on), self.view.update()))
+        """SEM tools (icon, text under it): scan, capture, the field, our auto functions; the overlays,
+        Advanced… and Full screen."""
+        tb = tool_bar("sem_tools", self)
+        self.addToolBar(QtCore.Qt.TopToolBarArea, tb)
+        self.tools = tb
+
+        def act(name, text, fn, tip, checkable=False):
+            a = tb.addAction(icon(name), text)
+            a.setToolTip(tip)
+            a.setCheckable(checkable)
+            if checkable:
+                a.toggled.connect(fn)
+            else:
+                a.triggered.connect(lambda _=False: fn())
+            return a
+
+        self.a_run = act("run", "Run", lambda: self.scan._run_freeze(),
+                         "Run / Stop the live scan (F5); Stop freezes at the end of the frame, again: at once")
+        self.a_single = act("single", "Single", lambda: self.scan._do(self.engine.single),
+                            "scan one frame, then freeze (F6)")
+        self.a_capture = act("capture", "Capture", self.capture.request, "photo scan with the Capture settings (F9)")
+        self.a_full = act("full_fov", "Full FoV", lambda: self.fov._do(self.engine.full_field),
+                          "the whole field of view, no shift or rotation (Ctrl+0)")
         tb.addSeparator()
-        tb.addAction("Advanced…", self.open_advanced)
-        if self.bundle is not None and self.bundle.connected:
-            tb.addAction("Microscope…", self.bundle.show_window).setToolTip(
-                "SEM column settings and stage control (RS-232)")
-        tb.addAction("Full screen", lambda: self.showNormal() if self.isFullScreen() else self.showFullScreen())
+        self.a_af = act("focus", "Autofocus", lambda: self.auto_focus("auto"),
+                        "our auto focus: test images of this scan field (coarse focus only when needed)")
+        b = tb.widgetForAction(self.a_af)
+        if isinstance(b, QtWidgets.QToolButton):
+            m = QtWidgets.QMenu(b)
+            m.addAction("Fine focus only (FOCUS F)", lambda: self.auto_focus("fine"))
+            m.addAction("Coarse focus only (FOCUS C)", lambda: self.auto_focus("coarse"))
+            m.addAction("Focus + stigmation", self.focus_and_stigmate)
+            b.setMenu(m)
+            b.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+        self.a_as = act("stig", "Auto stigmation", self.auto_stigmate, "our auto stigmation: stigmator X, then Y")
+        self.a_aga = act("gun", "Auto gun align", self.auto_gun_alignment,
+                         "the SEM's automatic gun alignment (asks first; holds the port until it ends)")
+        self.a_acb = act("acb", "Auto C/B", self.auto_contrast_brightness,
+                         "the SEM's own auto brightness / contrast (ABC): the scan goes back to the SEM "
+                         "while it runs, then the live scan resumes")
+        tb.addSeparator()
+        self.a_cross = act("crosshair", "Crosshair",
+                           lambda on: (setattr(self.view, "show_crosshair", on), self.view.update()),
+                           "a cross at the image centre", True)
+        self.a_line = act("scan_line", "Scan line", lambda on: setattr(self.view, "show_scan_line", on),
+                          "the line being scanned", True)
+        self.a_line.setChecked(True)
+        self.a_inset = act("inset", "Field inset",
+                           lambda on: (setattr(self.view, "show_fov_inset", on), self.view.update()),
+                           "lower-left corner: the scanned region within the full field of view", True)
+        self.a_inset.setChecked(True)
+        tb.addSeparator()
+        self.a_adv = act("advanced", "Advanced…", self.open_advanced, "scan timing, calibration, inputs, saving")
+        self.a_fullscreen = act("full_screen", "Full screen",
+                                lambda: self.showNormal() if self.isFullScreen() else self.showFullScreen(),
+                                "this window full screen")
+        self.a_fullscreen.setObjectName("full_screen")
+        self.a_mic = None
+        if self.bundle is not None and self.bundle.connected:  # (the main window has it in its side bar)
+            self.a_mic = act("column", "Microscope…", self.bundle.show_window,
+                             "SEM column settings and stage control (RS-232)")
+            self.a_mic.setObjectName("microscope_window")
+        self.tune_actions = (self.a_af, self.a_as)
+
+    #: the Auto gun alignment question (tests: replaced)
+    def confirm(self, text: str) -> bool:
+        return QtWidgets.QMessageBox.question(self, "easyEBL SEM", text) == QtWidgets.QMessageBox.Yes
+
+    def _busy(self, title: str, text: str, **kw):
+        """The modal window of an automatic function (the program waits until it closes)."""
+        from ...gui.busy import BusyDialog
+
+        if self.busy is not None and not self.busy.is_done:
+            self.busy.finish(False)
+        self.busy = BusyDialog(title, text, self, **kw).show_busy()
+        return self.busy
+
+    def _end_busy(self, ok: bool = True) -> None:
+        if self.busy is not None:
+            self.busy.finish(ok)
+            self.busy = None
+
+    def auto_gun_alignment(self):
+        """The SEM's automatic gun alignment (asks first): a modal window until the SEM has finished
+        (it answers ``AGA ON`` then; it cannot be interrupted).  Returns the future (None: not started)."""
+        if not self.confirm("Run the SEM's automatic gun alignment? It holds the port until the SEM has finished."):
+            return None
+        try:
+            fut = self.mic.alignment("gun")
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"auto gun alignment: {e}")
+            return None
+        self.notify("auto gun alignment started")
+        self._busy("Auto gun alignment", "The SEM's automatic gun alignment is running – easyEBL waits until "
+                   "the SEM has finished (it cannot be interrupted).")
+        if hasattr(fut, "add_done_callback"):
+            fut.add_done_callback(lambda f: self.autoFinished.emit(
+                "aga", "auto gun alignment: " + ("cancelled" if f.cancelled() else "done" if f.exception() is None
+                                                 else f"failed – {f.exception()}"),
+                not f.cancelled() and f.exception() is None))
+        return fut
+
+    def _auto_finished(self, kind: str, msg: str, ok: bool) -> None:
+        """GUI thread: an automatic function of the SEM ended."""
+        self._end_busy(ok)
+        self.notify(msg)
+        if kind == "abc":
+            st = self._abc or {}
+            self._abc = None
+            if st.get("resume"):
+                try:
+                    self.engine.run()
+                except Exception as e:  # noqa: BLE001
+                    self.notify(f"Auto C/B: the live scan did not restart: {e}")
+            elif ok and not st.get("esc"):
+                try:
+                    self.engine.single()  # an image for Auto levels
+                except Exception as e:  # noqa: BLE001
+                    self.notify(f"Auto C/B: no image for Auto levels: {e}")
+            if ok and not st.get("esc"):
+                self._acb_pending = True  # Auto levels (the Image group) on the next image
+
+    def _tune_busy(self, ev: dict) -> None:
+        """Our auto focus / stigmation: progress in the modal window; it closes at the end."""
+        b = self.busy
+        if b is None or getattr(b, "kind", "") != "tune":
+            return
+        if ev.get("type") == "progress":
+            b.set_progress(ev.get("text", ""))
+        elif ev.get("type") == "done":
+            r = ev.get("result")
+            self._end_busy(bool(getattr(r, "ok", True)))
+
+    def _sync_tools(self, st) -> None:
+        live = st in (EngineState.LIVE, EngineState.STARTING, EngineState.FREEZING, EngineState.SINGLE,
+                      EngineState.CAPTURE)
+        a = self.a_run
+        if live != getattr(self, "_tools_live", None):
+            self._tools_live = live
+            a.setText("Stop" if live else "Run")
+            a.setIcon(icon("stop" if live else "run"))
+        t = self.autotune
+        ok = t is not None and t.available and not t.busy
+        for x in self.tune_actions:
+            x.setEnabled(ok)
+        self.a_aga.setEnabled(bool(getattr(self.mic, "connected", False)))
+        self.a_acb.setEnabled(self.abc_available)
 
     def _make_status(self):
         sb = self.statusBar()
@@ -258,9 +394,6 @@ class SEMWindow(QtWidgets.QMainWindow):
     def notify(self, msg: str) -> None:
         self.log.appendPlainText(time.strftime("%H:%M:%S  ") + msg)
 
-    def levels(self):
-        return self.cb.levels()
-
     # ---------------------------------------------------------------- display
     def _tick(self):
         f = self.engine.latest()
@@ -299,7 +432,65 @@ class SEMWindow(QtWidgets.QMainWindow):
         if f is not None:
             self.view.set_frame(f, self.levels())
 
+    def levels(self):
+        return self.cb.levels()
+
+    # ------------------------------------------------------------- the SEM's ABC
+    @property
+    def abc_available(self) -> bool:
+        return bool(getattr(self.mic, "connected", False)) and hasattr(self.mic, "auto_brightness_contrast") \
+            and self._abc is None
+
+    @property
+    def abc_running(self) -> bool:
+        return self._abc is not None
+
+    def auto_contrast_brightness(self):
+        """The SEM's own auto brightness / contrast (``ABC ON``).  The SEM needs its own scan for it:
+        our scan stops (the engine gives the scan back to the SEM), ABC runs – the S-3000 answers
+        ``ABC ON`` when it has finished, which ends the request – CONT / BRT are read back, and a
+        live scan resumes (unless stopped meanwhile, e.g. Esc).  Returns the thread (None: not
+        started)."""
+        import threading
+
+        if not self.abc_available:
+            self.notify("Auto C/B (ABC) needs the microscope's remote control" if self._abc is None
+                        else "Auto C/B is already running")
+            return None
+        st = self.engine.state
+        self._abc = {"resume": st in (EngineState.LIVE, EngineState.STARTING, EngineState.FREEZING), "esc": False}
+        self.notify("Auto C/B: the SEM's ABC – the scan goes back to the SEM until it has finished")
+        self._busy("Auto C/B", "The SEM's auto brightness / contrast (ABC) is running on the SEM's own scan – "
+                   "easyEBL waits until the SEM has finished, then Auto levels.",
+                   esc=self.cancel_abc_resume, esc_text="Esc: the scan stays stopped after ABC (no Auto levels)")
+
+        def job():
+            msg, ok = "Auto C/B: done", True
+            try:
+                self.engine.stop()
+                if hasattr(self.engine, "wait_idle"):
+                    self.engine.wait_idle(10.0)
+                fut = self.mic.auto_brightness_contrast()
+                got = fut.result(240.0)
+                if isinstance(got, dict) and got:
+                    msg += " – " + ", ".join(f"{k} {v}" for k, v in got.items())
+            except Exception as e:  # noqa: BLE001
+                msg, ok = f"Auto C/B failed: {e}", False
+            self.autoFinished.emit("abc", msg, ok)
+
+        t = threading.Thread(target=job, name="easyebl-sem-abc", daemon=True)
+        self._abc_thread = t
+        t.start()
+        return t
+
+    def cancel_abc_resume(self) -> None:
+        """Esc during ABC: the SEM finishes its ABC, but our live scan does not restart."""
+        if self._abc is not None:
+            self._abc["resume"] = False
+            self._abc["esc"] = True
+
     def auto_contrast(self, frame=None, quiet: bool = False):
+        """Display stretch to the image's levels (not used by the GUI: the display is direct)."""
         f = frame if frame is not None and not isinstance(frame, bool) else self.engine.latest()
         if f is None:
             return
@@ -317,6 +508,7 @@ class SEMWindow(QtWidgets.QMainWindow):
         col = STATE_COLORS.get(s.state, "#ccc")
         self.l_state.setText(f"<b style='color:{col}'>{s.state.value.upper()}</b>")
         self.scan.sync_state(s.state)
+        self._sync_tools(s.state)
         disp = 0.0
         ts = self._disp_times
         if len(ts) > 2 and time.perf_counter() - ts[-1] < 2.0:
@@ -654,16 +846,28 @@ class SEMWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ close
     # ------------------------------------------------------------- auto focus / stigmation
+    def _tune(self, what: str, title: str):
+        fut = self.column.start_tune(what)
+        if fut is not None:
+            b = self._busy(title, f"{title}: test images of this scan field – easyEBL waits until it has "
+                                  f"finished.  Cancel (Esc) sets the start values again.",
+                           cancel=self.column.cancel_tune)
+            b.kind = "tune"
+            if fut.done():  # (ended before the window was there)
+                self._end_busy(fut.exception() is None and bool(getattr(fut.result(), "ok", True)))
+        return fut
+
     def auto_focus(self, mode: str = "auto"):
-        """Our auto focus (``"auto"``, ``"fine"``, ``"coarse"``) with progress in the Column panel;
-        returns a future of :class:`~easyebl.imaging.autotune.AutoTuneResult` (None if not started)."""
-        return self.column.start_tune(mode)
+        """Our auto focus (``"auto"``, ``"fine"``, ``"coarse"``) in a modal window with progress and
+        Cancel; returns a future of :class:`~easyebl.imaging.autotune.AutoTuneResult` (None if not
+        started)."""
+        return self._tune(mode, "Auto focus" + ("" if mode == "auto" else f" ({mode})"))
 
     def auto_stigmate(self):
-        return self.column.start_tune("stig")
+        return self._tune("stig", "Auto stigmation")
 
     def focus_and_stigmate(self):
-        return self.column.start_tune("both")
+        return self._tune("both", "Auto focus + stigmation")
 
     def closeEvent(self, ev):  # noqa: N802
         self.cancel_pick()

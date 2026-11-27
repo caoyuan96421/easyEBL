@@ -135,6 +135,23 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             w.setContentsMargins(6, 0, 10, 0)
 
     # ================================================================ SEM panel
+    def _hv_button(self, hv_on) -> None:
+        """The HV button offers the other state: OFF (red) while on, ON (green) while off or unknown."""
+        if getattr(self, "_hv_shown", "x") == hv_on:
+            return
+        self._hv_shown = hv_on
+        on = bool(hv_on)
+        self.b_hv.setText("HV OFF" if on else "HV ON")
+        self.b_hv.setStyleSheet("QPushButton{background:%s;color:white;font-weight:bold}"
+                                % ("#8a2c2c" if on else "#2e7d32"))
+
+    def toggle_hv(self) -> None:
+        sem = self.sem
+        if sem.state.get("hv_on"):
+            self._confirmed("Switch the high voltage OFF?", sem.hv_off, "HV OFF")
+        else:
+            self._confirmed("Switch the high voltage ON?", sem.hv_on, "HV ON")
+
     def _sem_panel(self):
         """The column, compact (it fits the left side bar of the main window at 1080p): every
         control in a grid, explanations in the tooltips."""
@@ -164,18 +181,15 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.hv_set.setToolTip("setpoint: 0.30–9.99 kV in 0.01 kV, 10.0–30.0 kV in 0.1 kV steps")
         self.b_hv_set = QtWidgets.QPushButton("Set")
         self.b_hv_set.clicked.connect(self.apply_hv)
-        self.b_hv_on = QtWidgets.QPushButton("HV ON")
-        self.b_hv_on.setStyleSheet("QPushButton{background:#2e7d32;color:white;font-weight:bold}")
-        self.b_hv_on.clicked.connect(lambda: self._confirmed("Switch the high voltage ON?", sem.hv_on, "HV ON"))
-        self.b_hv_off = QtWidgets.QPushButton("HV OFF")
-        self.b_hv_off.setStyleSheet("QPushButton{background:#8a2c2c;color:white;font-weight:bold}")
-        self.b_hv_off.clicked.connect(lambda: self._confirmed("Switch the high voltage OFF?", sem.hv_off, "HV OFF"))
+        self.b_hv = QtWidgets.QPushButton("HV ON")  # one button: switches to the other state (asks first)
+        self.b_hv.setToolTip("switch the high voltage on / off (asks first)")
+        self.b_hv.clicked.connect(self.toggle_hv)
+        self._hv_button(None)
         f.addWidget(self.l_hv, 0, 0)
         f.addWidget(self.l_emi, 0, 1, 1, 3)
         f.addWidget(self.hv_set, 1, 0)
         f.addWidget(self.b_hv_set, 1, 1)
-        f.addWidget(self.b_hv_on, 1, 2)
-        f.addWidget(self.b_hv_off, 1, 3)
+        f.addWidget(self.b_hv, 1, 2, 1, 2)
 
         # --- exposure field size (the Lithography's) and magnification
         g, f = grid("Field size && magnification")
@@ -257,9 +271,6 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.cont.valueChanged.connect(lambda v: self._user(sem.set_contrast, v))
         self.brt = _spin(0, 4095, 2048, 16)
         self.brt.valueChanged.connect(lambda v: self._user(sem.set_brightness, v))
-        b_abc = QtWidgets.QPushButton("ABC")
-        b_abc.setToolTip("automatic brightness / contrast of the SEM's own display")
-        b_abc.clicked.connect(lambda: self._call(sem.auto_brightness_contrast))
         self.scan_combo = QtWidgets.QComboBox()
         self.scan_combo.addItem("unknown", None)  # until the first read
         for k, v in SCAN_MODES.items():
@@ -274,7 +285,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.b_run.setCheckable(True)
         self.b_run.setToolTip("RUN OFF / RUN ON – freezes the SEM's own display (does not blank the beam)")
         self.b_run.toggled.connect(lambda on: self._user(sem.set_running, not on))
-        self.sem_poll = QtWidgets.QCheckBox("Read SEM settings in the background")
+        self.sem_poll = QtWidgets.QCheckBox("Read in background")
         self.sem_poll.setChecked(sem.polling)
         self.sem_poll.setToolTip("Reads the SEM settings one after another without pause (MAG / HV most "
                                  "often), so changes on the SEM panel reach imaging and EDS")
@@ -287,9 +298,8 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         f.addWidget(self.scan_combo, 1, 1)
         f.addWidget(QtWidgets.QLabel("Detector"), 1, 2)
         f.addWidget(self.det_combo, 1, 3)
-        f.addWidget(b_abc, 2, 0, 1, 2)
-        f.addWidget(self.b_run, 2, 2, 1, 2)
-        f.addWidget(self.sem_poll, 3, 0, 1, 4)
+        f.addWidget(self.b_run, 2, 0, 1, 2)
+        f.addWidget(self.sem_poll, 2, 2, 1, 2)
         f.setColumnStretch(1, 1)
         f.setColumnStretch(3, 1)
         lay.addStretch(1)
@@ -309,15 +319,6 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.b_stop.clicked.connect(self.stop_all)
         QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self.stop_all)
         lay.addWidget(self.b_stop)
-
-        # --- who has the stage: the SEM PC, except during an easyEBL move (#STAGE ON … #STAGE OFF)
-        self.l_move = QtWidgets.QLabel()
-        self.l_move.setMinimumHeight(20)
-        self.l_move.setAlignment(QtCore.Qt.AlignCenter)
-        self.l_move.setToolTip("Between moves the SEM PC has the stage (#STAGE OFF: its trackball works and it\n"
-                               "decides about motor power).  A move switches #STAGE ON, moves, waits until every\n"
-                               "axis has stopped and switches #STAGE OFF; meanwhile SEM settings wait in line.")
-        lay.addWidget(self.l_move)
 
         # --- DRO
         g = QtWidgets.QGroupBox("Position")
@@ -612,10 +613,6 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
 
     def _show_move_state(self):
         busy = self.stage.busy
-        self.l_move.setText("STAGE MOVING – easyEBL has the stage (#STAGE ON)" if busy else
-                            "STAGE: SEM PC (trackball) – a move takes it for its duration")
-        self.l_move.setStyleSheet("font-weight:bold;"
-                                  + ("background:#ef6c00;color:white" if busy else "background:#455a64;color:#ddd"))
         self.g_jog.setEnabled(not busy)
 
     def open_move_dialog(self, axis: str):
@@ -669,6 +666,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             hv_on, kv = s.get("hv_on"), s.get("hv_kv")
             self.l_hv.setText(f"{kv:g} kV  ON" if hv_on and kv else ("HV OFF" if hv_on is False else "—"))
             self.l_hv.setStyleSheet(_BIG + (";color:#7d7" if hv_on else ";color:#bbb"))
+            self._hv_button(hv_on)
             emi = s.get("emission")
             self.l_emi.setText(f"emission {emi} (raw)" if emi is not None else "emission —")
             sp = s.get("hv_setpoint_kv")

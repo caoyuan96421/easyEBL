@@ -55,7 +55,7 @@ def test_beamer_like_gds_doses(make_manager, calibration, tmp_path, mode):
 
 
 def test_demo_gds_generator_roundtrip(tmp_path, make_manager, calibration):
-    from easyebl.litho.gui_gds import make_demo_gds
+    from easyebl.litho.demo import make_demo_gds
 
     path = make_demo_gds(str(tmp_path / "demo.gds"))
     pat = read_gds(path)

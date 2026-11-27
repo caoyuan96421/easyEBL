@@ -80,13 +80,10 @@ def _draw_data_bar(p: QtGui.QPainter, rect: QtCore.QRectF, frame, info: dict) ->
     p.setPen(QtGui.QColor(235, 235, 235))
     fm = QtGui.QFontMetrics(font)
     y = rect.center().y() + fm.ascent() / 2 - 2
-    items = [
-        info.get("kv", "-- kV"),
-        info.get("wd", "WD --"),
-        display_magnification(image_magnification(info.get("column_mag"), info.get("field_um"), cfg.width_um)
-                              if cfg else None),
-        info.get("detector", "SE"),
-    ]
+    mag = display_magnification(image_magnification(info.get("column_mag"), info.get("field_um"), cfg.width_um)
+                                if cfg else None)
+    simple = bool(info.get("simple"))  # the small view: total magnification and scale bar only
+    items = [mag] if simple else [info.get("kv", "-- kV"), info.get("wd", "WD --"), mag, info.get("detector", "SE")]
     x = rect.left() + 8
     for t in items:
         p.drawText(QtCore.QPointF(x, y), t)
@@ -99,7 +96,7 @@ def _draw_data_bar(p: QtGui.QPainter, rect: QtCore.QRectF, frame, info: dict) ->
         bar_px = L / um_per_px
         label = format_length(L)
         lw = fm.horizontalAdvance(label)
-        right = rect.right() - 10 - fm.horizontalAdvance("0000-00-00 00:00") - 16
+        right = rect.right() - 10 - (0 if simple else fm.horizontalAdvance("0000-00-00 00:00") + 16)
         x1 = right
         x0 = x1 - bar_px
         if x0 > x + lw + 10:
@@ -113,6 +110,8 @@ def _draw_data_bar(p: QtGui.QPainter, rect: QtCore.QRectF, frame, info: dict) ->
                 xt = x0 + bar_px * k / 10
                 p.drawLine(QtCore.QPointF(xt, yb - (5 if k in (0, 10) else 3)), QtCore.QPointF(xt, yb - 1))
             p.drawText(QtCore.QPointF(x0 - lw - 8, y), label)
+        if simple:
+            return
         p.setPen(QtGui.QColor(200, 200, 200))
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(frame.timestamp))
         p.drawText(QtCore.QPointF(rect.right() - 8 - fm.horizontalAdvance(ts), y), ts)
@@ -195,6 +194,11 @@ class SEMImageView(QtWidgets.QWidget):
         self._pick_prompt: str | None = None  # pick mode on when not None
         self._pick_targets: list = []  # crosses (field µm)
         self._pick_centre_cross = False  # a cross at the image centre (centring pick)
+        #: the small view: drag = beam shift and wheel = scan zoom without Shift, a click (no drag)
+        #: picks; no measuring, no digital zoom, a data bar with the magnification and scale bar only
+        self.simple = False
+        self._press = None
+        self._moved = False
 
     # ---------------------------------------------------------------- data
     def set_frame(self, frame, levels) -> None:
@@ -426,7 +430,7 @@ class SEMImageView(QtWidgets.QWidget):
         else:
             p.setPen(QtGui.QColor(120, 120, 120))
             p.drawText(self.rect().adjusted(0, 0, 0, -BAR_H), QtCore.Qt.AlignCenter, "No image – press Run")
-        if self._pick_prompt is not None:
+        if self._pick_prompt is not None and not self.simple:  # (the small view: in its own bar)
             font = QtGui.QFont("Segoe UI", 11, QtGui.QFont.Bold)
             p.setFont(font)
             box = QtCore.QRectF(8, 8, self.width() - 16, QtGui.QFontMetrics(font).height() * 2 + 12)
@@ -449,7 +453,27 @@ class SEMImageView(QtWidgets.QWidget):
         px = self._to_pixel(pos)
         return None if px is None or self._frame is None else _pixel_to_field(self._frame.config, *px)
 
+    def _simple_press(self, ev) -> None:
+        if ev.button() == QtCore.Qt.LeftButton and self._frame is not None:
+            self._press = ev.position()
+            self._drag = ev.position()
+            self._moved = False
+
+    def _simple_release(self, ev) -> None:
+        press, moved = self._press, self._moved
+        self._press = None
+        self._drag = None
+        self._moved = False
+        self.setCursor(QtCore.Qt.CrossCursor)
+        if press is not None and not moved and self._pick_prompt is not None:
+            xy = self._field_at(press)
+            if xy is not None:
+                self.pointPicked.emit(*xy)
+
     def mousePressEvent(self, ev):  # noqa: N802
+        if self.simple:
+            self._simple_press(ev)
+            return
         btn, shift = ev.button(), bool(ev.modifiers() & QtCore.Qt.ShiftModifier)
         if btn == QtCore.Qt.RightButton:
             self.contextRequested.emit(self._field_at(ev.position()), ev.globalPosition().toPoint())
@@ -487,6 +511,11 @@ class SEMImageView(QtWidgets.QWidget):
         elif self._drag is not None and f is not None:
             d = ev.position() - self._drag
             r = self.image_rect()
+            if self.simple and not self._moved:
+                if abs(d.x()) + abs(d.y()) < 4:
+                    return
+                self._moved = True
+                self.setCursor(QtCore.Qt.ClosedHandCursor)
             if r.width() > 0 and (abs(d.x()) + abs(d.y())) >= 3:
                 cfg = f.config
                 um_x = -d.x() / r.width() * cfg.width_um
@@ -504,6 +533,9 @@ class SEMImageView(QtWidgets.QWidget):
         self.pointerMoved.emit(self._field_at(ev.position()))
 
     def mouseReleaseEvent(self, ev):  # noqa: N802
+        if self.simple:
+            self._simple_release(ev)
+            return
         if self._drawing:
             self._drawing = False
             if (self.measure_length_um() or 0.0) <= 0.0:
@@ -519,7 +551,7 @@ class SEMImageView(QtWidgets.QWidget):
         steps = int(round(delta / 120))
         if not steps:
             return
-        if ev.modifiers() & QtCore.Qt.ShiftModifier:
+        if self.simple or ev.modifiers() & QtCore.Qt.ShiftModifier:
             self.zoomSteps.emit(steps)  # the scanned region
         else:
             self.set_digital_zoom(self._dz * (2 ** (steps / 3)), ev.position())  # three notches: ×2

@@ -57,34 +57,43 @@ It opens the **main window** (laid out for a 1920 × 1080 screen, one font size 
 an **icon in the system tray**:
 
 * **Centre – tabs SEM, EDS, Lithography**: the SEM image, the EDS electron image and spectrum,
-  the lithography stage plot.
-* **Left – the microscope**: *Column* (HV, exposure field size and magnification, focus and
-  stigmator, beam current, SEM display), *Stage* (STOP ALL AXES, position, jog, stage positions)
-  and, below, the **beam monitor** (the scan monitor described below).
-* **Right – the active tab's settings**: SEM scan / capture / image / field of view / column;
-  EDS acquire / map / composition; lithography chips and exposure schedule.
-* **Bottom – data**: *Messages* (of the active tab), *Stage positions* (the lithography's, with
-  ΔZ, Record WD, Go to), *Calibration* (per field size: magnification, nominal WD, WD1, Z_cal,
-  the stored beam and field calibrations), *Alignment* (each chip: Global Align result, height),
-  *SEM view* (a small live SEM image: a marker pick asked by the lithography shows there and in
-  the SEM tab – click, Confirm or Cancel in either; the SEM tab has the full magnification and
-  field-of-view controls), *EDS data* (the Data Manager), *EDS live spectrum*, *Microscope log*.
-* **Menus and toolbar**: *easyEBL*, *Hardware*, *Panels* (show / hide the side bars, reset the
-  layout), *Windows* (a separate SEM or Microscope window, the tools) – and the active tab's own
-  menus and toolbar.  A tab's keyboard shortcuts (F5, Ctrl+S, …) work only while it is shown.
-* **Esc stops everything** (also the red *STOP ALL* button): every stage axis, a running exposure
-  schedule (and a marker pick), EDS acquisitions and the SEM scan.
+  the lithography stage plot – each with its tools at the top (icon, text under it):
+  - *SEM*: Run / Stop, Single, Capture, Full FoV, Autofocus (fine / coarse / with stigmation in its
+    menu), Auto stigmation, Auto gun align (asks first), **Auto C/B** (the SEM's ABC), Crosshair, Scan
+    line, Field inset, Advanced…, Full screen;
+  - *EDS*: the electron-image tools Pan, Point, Rectangle, Ellipse, Line, Map area;
+  - *Lithography*: Zoom to pattern, Move pattern, Move stage, Color by Field, Color by Dose,
+    Writing order, Show dots.
+* **Left – the microscope**: *Column* (one HV ON / OFF button, exposure field size and
+  magnification, focus and stigmator, beam current, SEM display), *Stage* (STOP ALL AXES,
+  position, jog), the lithography's **Stage positions** (ΔZ, Record WD, Go to) and the **beam
+  monitor** (the scan monitor described below).
+* **Right – the active tab's settings**: SEM scan / capture / image / field of view / column; EDS acquire /
+  map / composition with the **Data Manager** under them; lithography chips and exposure schedule.
+* **Bottom – three side by side**: **Messages** of every subsystem in one list (the source in its
+  colour, warnings orange, errors red); *Calibration* (per field size: magnification, nominal WD,
+  WD1, Z_cal, the stored beam and field calibrations), *Alignment* (each chip: Global Align result,
+  height) and the **SEM view** (a small live SEM image with Zoom in / out, Run / Stop, Single and
+  Auto C/B; drag = beam shift, wheel = zoom, a click answers a marker pick; its data bar shows the
+  total magnification and the scale bar.  A marker pick asked by the lithography brings it forward,
+  outlined in magenta – click, Confirm or Cancel here or in the SEM tab); the **EDS live spectrum**.
+* **Menus**: *easyEBL*, *Hardware*, *Panels* (show / hide the side bars, reset the layout), *Windows*
+  (a separate SEM or Microscope window) – and the active tab's own menus.  A tab's keyboard
+  shortcuts (F5, Ctrl+S, …) work only while it is shown.
+* **Esc stops everything**: every stage axis, a running exposure schedule (and a marker pick), EDS
+  acquisitions, a running auto function and the SEM scan.
 * The side bars can be moved, floated and resized; the layout is saved in
-  `%APPDATA%\easyEBL\mainwindow.ini`.  Closing the window hides it to the tray.
-* The status bar shows, for the scan DAQ, the EDS pulse processor and the microscope, whether it
-  is connected (green), simulated (blue), waiting or needing attention (orange) or failed (red;
-  the tooltip says why).
+  `%APPDATA%\easyEBL\mainwindow.ini`.  **Closing the main window shuts easyEBL down** (it asks first;
+  the hardware is disconnected).  With `easyebl --background` (or `--tray`) closing hides it to the tray
+  instead and easyEBL keeps running; *easyEBL → Hide to tray* always just hides it.
+* The status bar has a light for the scan DAQ, the EDS pulse processor and the microscope:
+  connected (green), simulated (blue), waiting or needing attention (orange) or failed (red; the
+  tooltip says why).
 
 The **classic menu window** (*easyEBL → Classic menu window*, the tray menu, or `--classic`) shows
 the same status, one line per device, and opens each subsystem in a window of its own:
 
-* **Open** starts a subsystem: SEM imaging, EDS, Microscope (column & stage), and under *Tools*
-  vector and GDS lithography, the dose calculator, alignment, the raster debug GUI and HAL debug.
+* **Open** starts a subsystem: SEM imaging, EDS, Microscope (column & stage) and Lithography.
   A subsystem whose hardware is missing is greyed out (the tooltip says why).
 * **Hardware → Configure…** chooses each device and its address: NI-DAQmx device name or the
   simulator, wiring preset or a DAQConfig JSON, scan orientation (invert / swap X/Y), sample clock,
@@ -102,7 +111,8 @@ the same status, one line per device, and opens each subsystem in a window of it
   (decimated or skipped when full, never waited for); binning and drawing run in their own thread.
 * **The hardware stays connected in the background.**  All subsystems share the one backend (one
   DAQ manager, one DP5, one serial port), so SEM and EDS share the DAQ through the HAL lease.
-  Closing a subsystem window, or the menu window itself, does not disconnect anything.
+  Closing a subsystem window, or the classic menu window, does not disconnect anything (the main
+  window does, unless `--background`).
 * **Tray icon:** click it to bring the window back; right-click it for the menu, any subsystem,
   *Hardware…* and **Shut down easyEBL**, which closes every window and disconnects all hardware.
   The icon shows a coloured dot when a device needs attention.
@@ -156,8 +166,19 @@ Open → *SEM imaging*.  The window looks and works like a commercial SEM screen
   their own, so whole-image work (an 8000 × 8000 frame is 256 MB) never holds up the DAQ output buffer;
   partial frames of a large scan are published less often (copying kept under 10 % of the time).
 * **Capture** (F9): photo scan at its own size, speed and integration. Saved automatically as a 16‑bit TIFF (raw volts), a PNG, a PNG with the data bar, and JSON metadata.
-* **Contrast / Brightness**, **Auto C/B** (Ctrl+A, one-shot or continuous), and running **averaging**.
-* **Field of view** group: **size** (the swept range), **position** (beam shift) and **rotation**.  The
+* **Image** group: display **contrast / brightness**, **Auto levels** (Ctrl+A, one-shot or continuous: the
+  display stretched to the image), and running **averaging**.
+* **Auto C/B** (toolbar, also in the small SEM view of the main window) runs the **SEM's own ABC**
+  (`ABC ON`).  The SEM needs its own scan for it, so our scan stops first (the engine gives the scan back to
+  the SEM); the S-3000 answers `ABC ON` when it has finished – that reply ends the request (at most 240 s) –
+  then contrast / brightness are read back, a live scan resumes (else one Single scan is taken) and **Auto
+  levels** (the Image group) runs on the first image.  Esc meanwhile: the SEM finishes its ABC, our scan
+  stays stopped and Auto levels is skipped.
+* **Auto C/B, Auto gun align, Autofocus and Auto stigmation wait in a modal window**: the program is blocked
+  until they end, the window shows the progress and closes by itself.  Our autofocus / stigmation have
+  *Cancel* (also Esc: the start values are set again); the SEM's own routines (ABC, AGA) cannot be
+  interrupted.
+* **Field of view** group: **size** (the swept range, down to 0.1 % of the full field: ×1000), **position** (beam shift) and **rotation**.  The
   inset in the lower-left corner shows the scanned region within the full field.
 * **Mouse on the image**:
   - **left drag** – the measuring line: its length is shown on the line and, with Δx, Δy and the
@@ -266,18 +287,6 @@ it, writes the safe state (blanked, parked), selects the SEM's internal scan, an
 static lines for handles that still hold them. The engine shows **DISCONNECTED**, keeps its mode and settings, and
 resumes scanning by itself. A capture in progress fails, and an interrupted single frame is rescanned. The programs also start
 without the device and connect when it appears. Simulator tests: `tests/system/test_disconnect_system.py`.
-
-### Raster debug GUI
-
-Open → Tools → *Raster imaging (debug)*.
-
-* **External scan control** switches the SEM to DAQ scanning (HAL external control).
-  Unchecking it returns the SEM to internal scan.
-* **Live** runs one continuous hardware-timed stream. The frame waveform is looped through the
-  DAQ output buffer, so frames follow each other with no restart gap. Changing any setting
-  while live restarts the stream.
-* **Single scan** takes one frame. **Average frames** sets a running average over about N frames.
-* **Save image** writes a PNG (contrast-stretched) and an `.npy` file with the raw values.
 
 ## EDS (Amptek DP5)
 
@@ -391,8 +400,8 @@ S-3000. On top of it:
   - the raw TX/RX log.
 
   On the real instrument, HV switching, the automatic routines and moves ask for confirmation.  The
-  SEM's own routines left in the window are ABC and **Auto gun alignment** (`AGA ON`, in the beam
-  current group).  Auto focus and stigma are in the SEM imaging window.  The SEM's own scan mode is read back (`R SCAN`: answered by the S-3000
+  SEM's own routine left in the window is **Auto gun alignment** (`AGA ON`, in the beam current
+  group; also in the SEM toolbar).  HV is one button: *HV ON* while off, *HV OFF* while on.  Auto focus and stigma are in the SEM imaging window.  The SEM's own scan mode is read back (`R SCAN`: answered by the S-3000
   although its manual does not list it) and shown in the display group.
 * **Beam presets** (*Beam presets…* in the toolbar or *Presets…* in the beam group): any number of
   named settings of beam 1 coarse / fine, stigmator X / Y and contrast / brightness.  *Save current…*
@@ -416,6 +425,11 @@ image*).  It shows:
   it, and the selected step's fields highlighted; the whole GDS – every layer, also shapes in no
   field such as markers placed in the top cell itself – is drawn gray underneath, so what the
   Exposure does not write stays gray;
+- with the toolbar's drawing modes: the patterns **coloured by field** or **by dose factor** (a
+  colour scale from the lowest to the highest factor, shown top right), the **writing order** (the
+  fields numbered in turn, ▲ the first, and dotted lines through the shapes of each field in the
+  order they are written) and the **exposure points** themselves (*Show dots*; above 400 000 points
+  every n-th is drawn);
 - the alignment markers (Global: magenta, Local: cyan);
 - the named stage positions, and the stage with its current field of view: the full deflection
   field (green) and, when the SEM imaging window scans a reduced or shifted area, that area (red).
@@ -561,7 +575,9 @@ step.  When nothing could be fitted at all (no grid found) there is nothing to u
   - *Exposure*: a chip and a whole GDS file (top cell, layers, offset of the GDS origin in CCS).
     Each top-level cell (the references placed by the top cell, array elements included) is one
     field; its centre is the cell's bounding-box centre, or (checkbox) the cell's origin.
-    Dwell per point and point step (GDS dose factors multiply the dwell).  Markers are CCS
+    Dwell per point and point step (GDS dose factors multiply the dwell).  *Dose factor from*: none
+    (all 1), any property with a number, or one GDS property – the properties holding numbers in the
+    file are listed with their shape count and range.  Markers are CCS
     points: **Global Align** 2–4 markers, all inside one field's field of view – that field is
     written first; they are measured twice (1 → 2 → 1 → 2), the second pass predicted from the
     first, and the two passes must agree within the *alignment tolerance* (default 0.5 µm; the
@@ -612,16 +628,6 @@ Not implemented yet: automatic marker finding (markers are clicked), autofocus f
 (focused by hand) and a measured beam current.  On the simulators the SEM image follows
 the simulated stage through a hidden stage → beam map (0.35° and +0.6 %), so a field calibration has something to find.
 
-## Lithography and debug tools
-
-Open → Tools: *Vector lithography* (single polygon with raster fill, lines and dots), *GDS
-lithography* (dose mapping), *Dose calculator*, *Alignment* (automatic marker alignment; on the
-simulator it misplaces the specimen), *Raster imaging (debug)* and *HAL debug* (handles, claims,
-static beam, test waveforms).  They use the same DAQ as SEM imaging.
-
-On the simulator, the litho GUIs show the resulting **dose map**, and the alignment GUI
-compares the fitted transform with the deliberately misplaced specimen.
-
 ## Architecture
 
 ```
@@ -645,7 +651,7 @@ tests/        unit/, system/ (simulator pipelines), gui/ (offscreen Qt); data/ r
   alignment/  templates + NCC matching, transform fitting, MarkerAligner
   litho/      dose maths, geometry, fills, VectorScanCompiler, LithoWriter, GDS import;
               coords (SCS/WCS/BCS), schedule, fracture (importer), runner, settings, demo; module/ (window)
-  gui/        shared widgets (DataclassForm, ImageView, WaveformView) for the tools
+  gui/        the DAQ output (scan) monitor widget
   app/        the easyEBL program: SystemConfig, SystemBackend (all hardware), main window, menu window + tray
 ```
 

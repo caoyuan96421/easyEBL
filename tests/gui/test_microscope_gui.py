@@ -56,7 +56,7 @@ def test_microscope_window(qtbot, bundle):
     assert len(bundle.link.session.simulator.received) == n_sent + 1  # only the R FOCUS C read
     # stage: the SEM PC has it (#STAGE OFF) between moves; no enable button any more
     sim = bundle.link.session.simulator
-    assert sim.sem["STAGE"] == "OFF" and not bundle.stage.busy and w.g_jog.isEnabled() and "SEM PC" in w.l_move.text()
+    assert sim.sem["STAGE"] == "OFF" and not bundle.stage.busy and w.g_jog.isEnabled()
     assert not hasattr(w, "b_enable")
     x0 = bundle.stage.positions["X"]
     assert w.dro["X"].text() == f"{x0:,.1f}"
@@ -88,10 +88,10 @@ def test_microscope_window(qtbot, bundle):
     d.val.setValue(3000.0)
     d.accept()
     qtbot.waitUntil(lambda: bundle.stage.moving, timeout=5000)
-    qtbot.waitUntil(lambda: not w.g_jog.isEnabled() and "MOVING" in w.l_move.text(), timeout=2000)
+    qtbot.waitUntil(lambda: not w.g_jog.isEnabled(), timeout=2000)
     assert w.move({"X": 10}, relative=True) is None and w.open_move_dialog("X") is None
     qtbot.waitUntil(lambda: not bundle.stage.busy and sim.sem["STAGE"] == "OFF", timeout=20000)
-    qtbot.waitUntil(lambda: w.g_jog.isEnabled() and "SEM PC" in w.l_move.text(), timeout=2000)
+    qtbot.waitUntil(lambda: w.g_jog.isEnabled(), timeout=2000)
     # stage auto-read on / off (stored)
     w.cb_poll.setChecked(True)
     assert bundle.stage.polling and bundle.settings.stage_polling is True

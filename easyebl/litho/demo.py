@@ -24,7 +24,7 @@ import sys
 
 from .schedule import BeamCalibrationStep, Chip, ColumnSetting, Exposure, Schedule
 
-__all__ = ["make_multifield_gds", "make_demo_files", "DEMO_ORIGIN", "FIELD_PITCH", "DEMO_FIELD_SIZE"]
+__all__ = ["make_demo_gds", "make_multifield_gds", "make_demo_files", "DEMO_ORIGIN", "FIELD_PITCH", "DEMO_FIELD_SIZE"]
 
 DEMO_ORIGIN = (5000.0, 5000.0)  # stage position of the CCS (layout) origin
 DEMO_FIELD_SIZE = "250 µm"  # ×500
@@ -105,6 +105,28 @@ def make_demo_files(folder: str) -> dict:
                  name="dummy demo", chips=[Chip("Demo chip", DEMO_ORIGIN)])
     d.save(os.path.join(folder, "dummy_demo.ebls.json"))
     return {"gds": gds, "schedule": s.path, "dummy": d.path}
+
+
+def make_demo_gds(path: str) -> str:
+    import numpy as np
+
+    from .gds import write_gds
+    from .geometry import Pattern, Polygon, rectangle, regular_polygon
+
+    """Electrode-like demo layout with per-polygon dose factors (as properties and datatypes)."""
+    els = []
+    # four contact pads with tapered leads converging on a 2 µm gap
+    for k, (sx, sy) in enumerate([(-1, -1), (1, -1), (1, 1), (-1, 1)]):
+        px, py = sx * 30, sy * 25
+        els.append(rectangle(px - 8, py - 8, px + 8, py + 8, dose_factor=1.0, layer=1, datatype=0))
+        tip = np.array([sx * 1.0, sy * 1.0])
+        base = np.array([px - sx * 8, py])
+        lead = Polygon(np.array([[base[0], base[1] - 1.5], [base[0], base[1] + 1.5], [tip[0], tip[1] + 0.2],
+                                 [tip[0], tip[1] - 0.2]]), dose_factor=1.25, layer=1, datatype=1)
+        els.append(lead)
+    els.append(regular_polygon(0, 0, 0.6, 32, dose_factor=1.6, layer=1, datatype=2))
+    write_gds(Pattern(els), path, datatype_from_dose={1.0: 0, 1.25: 1, 1.6: 2})
+    return path
 
 if __name__ == "__main__":  # pragma: no cover
     out = make_demo_files(sys.argv[1] if len(sys.argv) > 1 else os.path.join("examples", "litho"))

@@ -16,6 +16,8 @@ single-pass lines (if the reader keeps them).
 """
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 import re
 from typing import Iterable
@@ -148,6 +150,35 @@ def read_gds(
     pat = pattern_from_cell(src, layers, dose, stats)
     pat.source = str(path)
     return pat
+
+
+_PROPS_CACHE: dict = {}
+
+
+def dose_properties(path: str) -> dict:
+    """The GDS properties (attribute numbers) that hold a number in the polygons and paths of
+    *path*: {attribute: (shapes with it, lowest, highest)} – the choices of a dose source."""
+    p = str(path)
+    try:
+        key = (p, os.path.getmtime(p))
+    except OSError:
+        key = (p, None)
+    if key in _PROPS_CACHE:
+        return _PROPS_CACHE[key]
+    found: dict = {}
+    lib = _gdstk().read_gds(p, unit=1e-6)
+    for c in lib.cells:
+        for obj in list(c.polygons) + list(c.paths):
+            for entry in getattr(obj, "properties", None) or []:
+                if len(entry) >= 3 and entry[0] == "S_GDS_PROPERTY":
+                    v = parse_dose_value(entry[2])
+                    if v is None:
+                        continue
+                    n, lo, hi = found.get(entry[1], (0, v, v))
+                    found[entry[1]] = (n + 1, min(lo, v), max(hi, v))
+    out = dict(sorted(found.items()))
+    _PROPS_CACHE[key] = out
+    return out
 
 
 def load_library(path: str):

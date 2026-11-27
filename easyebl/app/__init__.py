@@ -8,9 +8,10 @@
 Starting it opens the main window - SEM, EDS and Lithography tabs, the microscope
 on the left, the active subsystem's settings on the right, data at the bottom
 (``--classic``: the small menu window and one window per subsystem instead) - and
-puts an icon in the system tray.  The hardware stays connected in the background
-when windows are closed; *Shut down easyEBL* in the tray menu ends it.  A second
-start only brings the running program's window forward.
+puts an icon in the system tray.  Closing the main window shuts easyEBL down (it asks
+first); with ``--background`` (or ``--tray``) it keeps running in the tray instead, the
+hardware connected, until *Shut down easyEBL* in the tray menu.  A second start only
+brings the running program's window forward.
 
 * :mod:`.config`  – :class:`SystemConfig` (``%APPDATA%\\easyEBL\\system.json``)
 * :mod:`.backend` – :class:`SystemBackend`: DAQ + imaging engine, DP5 + EDS controller, microscope port
@@ -27,7 +28,7 @@ from .config import SystemConfig
 
 __all__ = ["SystemConfig", "SystemBackend", "ComponentStatus", "main", "instance_name"]
 
-SUBSYSTEM_KEYS = ("sem", "eds", "microscope", "litho", "vector", "gds", "dose", "alignment", "raster", "hal")
+SUBSYSTEM_KEYS = ("sem", "eds", "microscope", "litho")
 
 
 def instance_name() -> str:
@@ -44,7 +45,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None, help="hardware configuration JSON (default: per-user file)")
     p.add_argument("--open", default="", metavar="LIST",
                    help="open these subsystems at start, comma separated: " + ", ".join(SUBSYSTEM_KEYS))
-    p.add_argument("--tray", action="store_true", help="start in the tray (no window)")
+    p.add_argument("--tray", action="store_true", help="start in the tray (no window; implies --background)")
+    p.add_argument("--background", action="store_true",
+                   help="keep running in the tray when the main window is closed (default: closing it shuts "
+                        "easyEBL down)")
     p.add_argument("--classic", action="store_true",
                    help="the small menu window and one window per subsystem instead of the main window")
     return p
@@ -141,7 +145,8 @@ def main(argv=None) -> int:
     from .config import default_config_path
 
     layout = os.path.join(os.path.dirname(args.config or default_config_path()), "mainwindow.ini")
-    ui = EasyEBLApp(config, persistent=not args.sim, main_window=not args.classic, layout_path=layout)
+    ui = EasyEBLApp(config, persistent=not args.sim, main_window=not args.classic, layout_path=layout,
+                    background=args.background or args.tray)
     server = _listen(name, ui)
     ui.start(show_menu=not args.tray)
     for k in opens:

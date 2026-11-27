@@ -72,20 +72,6 @@ def test_subsystem_windows_share_the_backend(ui, qtbot):
     _flush(app)
 
 
-def test_tools_open_and_release_their_handles(ui):
-    app = QtWidgets.QApplication.instance()
-    mgr = ui.backend.manager
-    for key in ("vector", "dose", "alignment", "raster", "hal"):
-        w = ui.open(key)
-        assert type(w).__name__ == "ToolWindow", key
-    owners = {h.owner for h in mgr.handles() if not h.closed}
-    assert {"hal-debug", "imaging", "alignment", "litho-vector"} <= owners
-    ui.close_windows()
-    _flush(app)
-    left = {h.owner for h in mgr.handles() if not h.closed}
-    assert not left & {"hal-debug", "imaging", "alignment", "litho-vector"}
-
-
 def test_closing_the_menu_keeps_the_system_running(ui):
     ui.menu.close()
     assert not ui.closing and ui.backend.started and ui.backend.manager.is_open
@@ -99,8 +85,8 @@ def test_tray_menu(ui):
     texts = [a.text() for a in m.actions() if a.text()]
     assert texts[0] == "Show easyEBL menu" and "SEM imaging" in texts and "EDS" in texts
     assert texts[-1] == "Shut down easyEBL…" and "Hardware…" in texts
-    tools = [a.menu() for a in m.actions() if a.menu() is not None]
-    assert tools and "GDS lithography" in [a.text() for a in tools[0].actions()]
+    assert not [a for a in m.actions() if a.menu() is not None]  # no Tools submenu any more
+    assert "Lithography" in texts
 
 
 def test_reconfigure_reconnects(ui, tmp_path):
@@ -310,3 +296,10 @@ def test_scan_monitor_follows_the_scan_orientation(ui):
     mon.worker.step()  # the worker applies the setting
     assert mon.worker.acc.orientation == (True, False, True)
     assert ui.backend.engine.calibration.swap_xy and ui.backend.engine.calibration.invert_x
+
+
+def test_only_the_four_subsystems():
+    """The old debug / tool windows (vector, GDS, dose, alignment, raster, HAL) are gone."""
+    from easyebl.app.gui import SUBSYSTEMS
+
+    assert [s.key for s in SUBSYSTEMS] == ["sem", "eds", "microscope", "litho"]

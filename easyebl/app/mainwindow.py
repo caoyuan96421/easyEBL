@@ -1,17 +1,22 @@
 """The easyEBL main window: every subsystem in one window (sized for a 1920 × 1080 screen).
 
-* **Centre** – tabs *SEM*, *EDS*, *Lithography*: the image / spectrum / stage plot of each.
+* **Centre** – tabs *SEM*, *EDS*, *Lithography*: the image / spectrum / stage plot of each, with
+  its tools at the top (icon, text under it).
 * **Left** – the microscope: column (HV, field size, magnification, focus, stigmator, beam, display)
-  and stage (STOP, position, moves), and the beam monitor (the scan coils' X / Y as an
-  oscilloscope in XY mode).
-* **Right** – the settings of the subsystem of the active tab (SEM scan / image / field of view,
-  EDS acquire / map / composition, lithography chips and exposure schedule).
-* **Bottom** – messages, stage positions, calibration and alignment data, a small SEM view (for
-  picking markers without leaving the Lithography tab), the EDS Data Manager and live spectrum,
-  the microscope log.
-* **Menus and toolbar** – the active subsystem's appear next to the program's own; its keyboard
-  shortcuts work only while its tab is shown.  **Esc stops everything**: the stage (every axis),
-  a running exposure schedule, EDS acquisitions and the SEM scan.
+  and stage (STOP, position, moves), the stage positions, and the beam monitor (the scan coils'
+  X / Y as an oscilloscope in XY mode).
+* **Right** – the settings of the subsystem of the active tab (SEM scan / field of view / column,
+  EDS acquire / map / composition with the Data Manager under them, lithography chips and
+  exposure schedule).
+* **Bottom** – three side by side: the messages of every subsystem (coloured by source, warnings
+  and errors marked); calibration, alignment and a small SEM view (for picking markers without
+  leaving the Lithography tab – brought forward and highlighted while a pick waits); the EDS
+  live spectrum.
+* **Status bar** – a light per piece of hardware (green connected, blue simulator, orange waiting
+  or check, red failed).
+* **Menus** – the active subsystem's appear next to the program's own; its keyboard shortcuts work
+  only while its tab is shown.  **Esc stops everything**: the stage (every axis), a running
+  exposure schedule, EDS acquisitions, the auto functions and the SEM scan.
 
 The subsystem windows are built as before (:class:`~easyebl.imaging.sem.window.SEMWindow`,
 :class:`~easyebl.eds.gui.window.EDSWindow`, :class:`~easyebl.litho.module.LithoWindow`,
@@ -27,12 +32,16 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .backend import COMPONENTS
 
-__all__ = ["MainWindow", "ModuleHost", "SEMMiniView", "CalibrationView", "AlignmentView", "UI_POINT_SIZE"]
+__all__ = ["MainWindow", "ModuleHost", "MessageLog", "SEMMiniView", "CalibrationView", "AlignmentView",
+           "UI_POINT_SIZE"]
 
 #: the one font size of the program (points) – small enough for everything to fit a 1080p screen
 UI_POINT_SIZE = 8.0
 
 TABS = (("sem", "SEM"), ("eds", "EDS"), ("litho", "Lithography"))
+#: margins inside the panels' group boxes: the top one clears the title (the theme draws it in the
+#: box's margin, 8 px)
+_BOX_MARGINS = (3, 12, 3, 3)
 _STATE_COLORS = {"ok": "#4c4", "sim": "#6af", "waiting": "#fb4", "warn": "#fb4", "error": "#f55", "off": "#777"}
 
 
@@ -111,9 +120,9 @@ class ModuleHost:
         mb.hide()
 
     def take_toolbars(self) -> None:
+        """The window's toolbars stay in it (the top of its tab); their keys are switched per tab."""
         for tb in self.window.findChildren(QtWidgets.QToolBar):
             if tb.parent() is self.window:
-                self.window.removeToolBar(tb)
                 self.toolbars.append(tb)
 
     def collect_shortcuts(self) -> None:
@@ -142,80 +151,193 @@ class ModuleHost:
     def set_active(self, on: bool) -> None:
         for m in self.menus:
             m.menuAction().setVisible(on)
-        for tb in self.toolbars:
-            tb.setVisible(on)
         for s in self.shortcuts:
             s.setEnabled(on)
         for a, keys in self.action_keys.items():
             a.setShortcuts(keys if on else [])
 
 
+class MessageLog(QtWidgets.QPlainTextEdit):
+    """Every subsystem's messages in one list: the source in its colour, warnings orange,
+    errors red.  :meth:`follow` copies what a subsystem writes into its own message box."""
+
+    COLORS = {"easyEBL": "#e6e6e6", "SEM": "#8ecbff", "EDS": "#9be29b", "Lithography": "#ffc27a",
+              "Microscope": "#d6b4ff"}
+    ERROR_WORDS = ("error", "failed", "fail:", "cannot", "not available", "stop (esc)", "disconnected", "aborted")
+    WARN_WORDS = ("warning", "warn:", "check ", "not changed", "no improvement", "outside", "too ")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setMaximumBlockCount(3000)
+        self.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        self._followed: list = []
+
+    def kind(self, line: str) -> str:
+        low = line.lower()
+        if any(w in low for w in self.ERROR_WORDS):
+            return "error"
+        if any(w in low for w in self.WARN_WORDS):
+            return "warning"
+        return "info"
+
+    def add(self, source: str, text: str) -> None:
+        import html
+
+        src = self.COLORS.get(source, "#cccccc")
+        for line in str(text).splitlines():
+            if not line.strip():
+                continue
+            k = self.kind(line)
+            style = {"error": "color:#ff6b6b;font-weight:bold", "warning": "color:#ffd04d"}.get(k, f"color:{src}")
+            self.appendHtml(f"<span style='color:{src}'>[{html.escape(source)}]</span> "
+                            f"<span style='{style}'>{html.escape(line)}</span>")
+
+    def follow(self, source: str, box: QtWidgets.QPlainTextEdit) -> None:
+        """Copy *box*'s lines here (those already in it, then every new one)."""
+        doc = box.document()
+        self.add(source, box.toPlainText())
+
+        def changed(pos, _removed, added, doc=doc, source=source):
+            if added <= 0:
+                return
+            c = QtGui.QTextCursor(doc)
+            c.setPosition(min(pos, doc.characterCount() - 1))
+            c.setPosition(min(pos + added, doc.characterCount() - 1), QtGui.QTextCursor.KeepAnchor)
+            self.add(source, c.selectedText().replace(" ", "\n"))
+
+        doc.contentsChange.connect(changed)
+        self._followed.append((doc, changed))
+
+    def unfollow_all(self) -> None:
+        for doc, fn in self._followed:
+            try:
+                doc.contentsChange.disconnect(fn)
+            except (RuntimeError, TypeError):
+                pass
+        self._followed = []
+
+
 # ==================================================================== bottom-bar pages
 class SEMMiniView(QtWidgets.QWidget):
-    """A small live SEM image of the SEM tab's window – also for picking: a marker pick asked by
-    the lithography shows here and in the SEM tab (click / Confirm / Cancel in either); the
-    wheel zooms the scan, a click outside a pick centres the beam there."""
+    """A small live SEM image of the SEM tab's window, with its own tools: zoom in / out (the
+    scanned region, with the beam), Run / Stop, Single, Auto C/B.  Drag: beam shift, wheel: zoom,
+    a click (no drag) answers a marker pick – a pick asked by the lithography shows here and in
+    the SEM tab (click / Confirm / Cancel in either), and this view is brought forward and
+    highlighted while it waits.  The data bar: the total magnification and the scale bar."""
 
     REFRESH_MS = 100
+    HIGHLIGHT = "QFrame#sem_mini_frame{border:2px solid #ff50c8}"
 
     def __init__(self, sem_window, parent=None):
         super().__init__(parent)
+        from ..gui.icons import icon, tool_bar
         from ..imaging.sem.view import SEMImageView
 
         self.sem = sem_window
         self.view = SEMImageView()
+        self.view.simple = True
+        self.view.show_fov_inset = False
         self.view.setMinimumSize(160, 120)
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(2)
+        v.setSpacing(1)
+        tb = tool_bar("sem_mini_tools", self, size=14)
+        self.toolbar = tb
+
+        def act(name, text, fn, tip):
+            a = tb.addAction(icon(name), text)
+            a.setToolTip(tip)
+            a.triggered.connect(lambda _=False: fn())
+            return a
+
+        self.a_zoom_in = act("zoom_in", "Zoom in", lambda: sem_window.fov.zoom(+1),
+                             "a smaller scanned region (the beam; the wheel too)")
+        self.a_zoom_out = act("zoom_out", "Zoom out", lambda: sem_window.fov.zoom(-1), "a larger scanned region")
+        self.a_run = act("run", "Run", lambda: sem_window.scan._run_freeze(), "Run / Stop the live scan")
+        self.a_single = act("single", "Single", lambda: sem_window.scan._do(sem_window.engine.single),
+                            "one frame, then freeze")
+        self.a_acb = act("acb", "Auto C/B", sem_window.auto_contrast_brightness,
+                         "the SEM's own auto brightness / contrast (ABC; the scan goes back to the SEM meanwhile)")
+        v.addWidget(tb)
         bar = QtWidgets.QHBoxLayout()
-        self.l_pick = QtWidgets.QLabel("SEM imaging – the SEM tab has every control")
-        self.l_pick.setWordWrap(True)
-        self.b_run = QtWidgets.QPushButton("Run / freeze")
-        self.b_run.clicked.connect(lambda: sem_window.scan._run_freeze())
-        self.b_full = QtWidgets.QPushButton("Full field")
-        self.b_full.clicked.connect(lambda: sem_window.fov._do(sem_window.engine.full_field))
+        bar.setContentsMargins(2, 0, 2, 0)
+        self.l_pick = QtWidgets.QLabel("")
+        self.l_pick.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.l_pick.setStyleSheet("color:#ff9be4;font-weight:bold")
         self.b_confirm = QtWidgets.QPushButton("Confirm (Enter)")
         self.b_confirm.setStyleSheet("QPushButton{background:#2e7d32;color:white;font-weight:bold}")
         self.b_confirm.clicked.connect(sem_window.confirm_pick)
         self.b_cancel = QtWidgets.QPushButton("Cancel")
         self.b_cancel.clicked.connect(sem_window.cancel_pick)
         bar.addWidget(self.l_pick, 1)
-        for b in (self.b_run, self.b_full, self.b_confirm, self.b_cancel):
-            bar.addWidget(b)
-        v.addLayout(bar)
-        v.addWidget(self.view, 1)
+        bar.addWidget(self.b_confirm)
+        bar.addWidget(self.b_cancel)
+        self.pick_row = QtWidgets.QWidget()
+        self.pick_row.setLayout(bar)
+        v.addWidget(self.pick_row)
+        self.frame = QtWidgets.QFrame()
+        self.frame.setObjectName("sem_mini_frame")
+        fl = QtWidgets.QVBoxLayout(self.frame)
+        fl.setContentsMargins(2, 2, 2, 2)
+        fl.addWidget(self.view)
+        v.addWidget(self.frame, 1)
         self.view.pointPicked.connect(self._picked)
-        self.view.centerRequested.connect(lambda x, y: sem_window._center_at(x, y))
         self.view.shiftDragged.connect(lambda dx, dy: sem_window._drag_shift(dx, dy))
         self.view.zoomSteps.connect(sem_window.fov.zoom)
         self._seq = 0
         self._pick_key = None
+        self._live = None
+        self.on_pick = None  # called when a pick starts (the main window brings this view forward)
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(self.REFRESH_MS)
         self.refresh()
+
+    @property
+    def highlighted(self) -> bool:
+        return self.frame.styleSheet() == self.HIGHLIGHT
 
     def _picked(self, x: float, y: float) -> None:
         if getattr(self.sem, "_pick_cb", None) is not None:
             self.sem._picked(x, y)
 
     def refresh(self) -> None:
+        from ..imaging.engine import EngineState
+        from ..gui.icons import icon
+
         sv = self.sem.view
         key = (sv._pick_prompt, tuple(sv._pick_targets), sv._pick_centre_cross) if sv.pick_mode else None
         if key != self._pick_key:
+            started = key is not None and self._pick_key is None
             self._pick_key = key
             if key is None:
                 self.view.stop_pick()
             else:
                 self.view.start_pick(key[0], key[1], centre_cross=key[2])
+            if started and self.on_pick is not None:
+                self.on_pick()
         picking = key is not None
+        self.frame.setStyleSheet(self.HIGHLIGHT if picking else "")
+        self.pick_row.setVisible(picking)
         self.b_confirm.setVisible(picking and getattr(self.sem, "_pick_centre", False))
-        self.b_cancel.setVisible(picking)
         if picking:
             self.l_pick.setText(self.sem.l_pick.text() or key[0])
-        else:
-            self.l_pick.setText("SEM imaging – the SEM tab has every control")
+            self.l_pick.setToolTip(self.l_pick.text())
+        st = self.sem.engine.state
+        live = st in (EngineState.LIVE, EngineState.STARTING, EngineState.FREEZING, EngineState.SINGLE,
+                      EngineState.CAPTURE)
+        if live != self._live:
+            self._live = live
+            self.a_run.setText("Stop" if live else "Run")
+            self.a_run.setIcon(icon("stop" if live else "run"))
+        self.a_acb.setEnabled(self.sem.abc_available)
+        info = self.view.info
+        src = sv.info
+        new = {"simple": True, "column_mag": src.get("column_mag"), "field_um": src.get("field_um")}
+        if any(info.get(k) != v for k, v in new.items()):
+            info.update(new)
+            self.view.update()
         if not self.isVisible():
             return
         f = self.sem.engine.latest()
@@ -361,7 +483,7 @@ class MainWindow(QtWidgets.QMainWindow):
     """See module docstring.  *app* is the :class:`~easyebl.app.gui.EasyEBLApp`; :meth:`build`
     creates the subsystems from its backend, :meth:`teardown` closes them (before a reconnect)."""
 
-    STATE_VERSION = 1
+    STATE_VERSION = 2
 
     def __init__(self, app, settings_path: str | None = None):
         super().__init__()
@@ -376,10 +498,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hosts: dict[str, ModuleHost] = {}
         self.mic = None  # MicroscopeWindow (its panels are in the left dock)
         self.sem_mini: SEMMiniView | None = None
+        self.live_spectrum = None
         self._hint_shown = False
         self._restored = False
 
-        # --- centre: one tab per subsystem
+        # --- centre: one tab per subsystem (each with its own tools at the top)
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
         self.setCentralWidget(self.tabs)
@@ -396,40 +519,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_dock = self._dock("Microscope", "main_left", QtCore.Qt.LeftDockWidgetArea)
         self.right_dock = self._dock("Settings", "main_right", QtCore.Qt.RightDockWidgetArea)
         self.bottom_dock = self._dock("Data", "main_bottom", QtCore.Qt.BottomDockWidgetArea)
+        # left: the microscope's tools, Column / Stage, the stage positions, the beam monitor
         self.left = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(self.left)
         lv.setContentsMargins(2, 2, 2, 2)
         lv.setSpacing(2)
+        self.left_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.left_split.setChildrenCollapsible(False)
         self.left_tabs = QtWidgets.QTabWidget()
-        lv.addWidget(self.left_tabs, 1)
+        self.positions_box = QtWidgets.QGroupBox("Stage positions")
+        QtWidgets.QVBoxLayout(self.positions_box).setContentsMargins(*_BOX_MARGINS)
         self.monitor_box = QtWidgets.QGroupBox("Beam monitor")
-        QtWidgets.QVBoxLayout(self.monitor_box).setContentsMargins(2, 2, 2, 2)
-        lv.addWidget(self.monitor_box)
+        QtWidgets.QVBoxLayout(self.monitor_box).setContentsMargins(*_BOX_MARGINS)
+        for w in (self.left_tabs, self.positions_box, self.monitor_box):
+            self.left_split.addWidget(w)
+        self.left_split.setStretchFactor(0, 1)
+        self.left_split.setStretchFactor(2, 1)
+        lv.addWidget(self.left_split, 1)
         self.left_dock.setWidget(self.left)
+        # right: the active subsystem's settings
         self.right_stack = QtWidgets.QStackedWidget()
         self.right_dock.setWidget(self.right_stack)
-        self.bottom = QtWidgets.QTabWidget()
-        self.bottom_dock.setWidget(self.bottom)
-        self.messages = QtWidgets.QStackedWidget()  # the active subsystem's messages
-        self.log = QtWidgets.QPlainTextEdit()  # the program's own
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(1000)
-        self.messages.addWidget(self.log)
-        self.bottom.addTab(self.messages, "Messages")
+        # bottom: messages | calibration, alignment, small SEM view | EDS live spectrum
+        self.bottom_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.bottom_split.setChildrenCollapsible(False)
+        self.log = MessageLog()  # every subsystem's messages
+        self.messages_box = self._box("Messages", self.log)
+        self.bottom = QtWidgets.QTabWidget()  # calibration, alignment, small SEM view
+        self.spectrum_box = QtWidgets.QWidget()  # the EDS live spectrum (its own titled box)
+        QtWidgets.QVBoxLayout(self.spectrum_box).setContentsMargins(0, 0, 0, 0)
+        for w in (self.messages_box, self.bottom, self.spectrum_box):
+            self.bottom_split.addWidget(w)
+        self.bottom_dock.setWidget(self.bottom_split)
+        self.messages = self.log  # (older name)
         self.monitor = None
 
-        # --- toolbar, menus, status
-        self.toolbar = self.addToolBar("easyEBL")
-        self.toolbar.setObjectName("main_toolbar")
-        self.toolbar.setMovable(False)
-        self.b_stop = QtWidgets.QPushButton("STOP ALL (Esc)")
-        self.b_stop.setStyleSheet("QPushButton{background:#c62828;color:white;font-weight:bold;padding:2px 10px}"
-                                  "QPushButton:pressed{background:#8e0000}")
-        self.b_stop.setToolTip("stop everything: every stage axis, a running exposure schedule, EDS "
-                               "acquisitions and the SEM scan (Esc, anywhere in this window)")
-        self.b_stop.clicked.connect(self.stop_everything)
-        self.toolbar.addWidget(self.b_stop)
-        self.toolbar.addSeparator()
+        # --- Esc, menus, status
         self.esc = QtGui.QShortcut(QtGui.QKeySequence("Esc"), self)
         self.esc.setContext(QtCore.Qt.WindowShortcut)
         self.esc.activated.connect(self.stop_everything)
@@ -437,6 +562,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_status()
 
     # ------------------------------------------------------------------ construction
+    @staticmethod
+    def _box(title: str, widget) -> QtWidgets.QGroupBox:
+        g = QtWidgets.QGroupBox(title)
+        lay = QtWidgets.QVBoxLayout(g)
+        lay.setContentsMargins(*_BOX_MARGINS)
+        lay.addWidget(widget)
+        return g
+
     def _dock(self, title: str, name: str, area) -> QtWidgets.QDockWidget:
         d = QtWidgets.QDockWidget(title)
         d.setObjectName(name)
@@ -448,7 +581,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_menus(self):
         mb = self.menuBar()
         m = mb.addMenu("&easyEBL")
-        m.addAction("Hide to tray", self.close)
+        m.addAction("Hide to tray", self.hide_to_tray)
         m.addAction("Classic menu window", self.app.show_classic_menu)
         m.addSeparator()
         m.addAction("Shut down easyEBL…", self.app.shutdown)
@@ -465,45 +598,58 @@ class MainWindow(QtWidgets.QMainWindow):
         self._window_actions = []
         from .gui import SUBSYSTEMS
 
-        tools = None
         for sub in SUBSYSTEMS:
             if sub.key in ("eds", "litho"):
                 continue  # once only: they are the tabs
-            if sub.tool and tools is None:
-                self.m_windows.addSeparator()
-                tools = self.m_windows.addMenu("Tools")
-            title = sub.title + (" (separate window)" if not sub.tool else "")
-            a = (tools or self.m_windows).addAction(title, lambda k=sub.key: self.app.open_window(k))
+            a = self.m_windows.addAction(sub.title + " (separate window)", lambda k=sub.key: self.app.open_window(k))
             a.setData(sub.key)
             self._window_actions.append(a)
 
     def _build_status(self):
         sb = self.statusBar()
         self.status_labels: dict = {}
+        self.status_lights: dict = {}
         for key, name in COMPONENTS.items():
-            lab = QtWidgets.QLabel(f"● {name}")
-            lab.setContentsMargins(4, 0, 8, 0)
-            sb.addPermanentWidget(lab)
+            box = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(box)
+            h.setContentsMargins(6, 0, 8, 0)
+            h.setSpacing(4)
+            light = QtWidgets.QLabel()
+            light.setFixedSize(11, 11)
+            light.setStyleSheet(self._light_style("off"))
+            lab = QtWidgets.QLabel(name)
+            h.addWidget(light)
+            h.addWidget(lab)
+            sb.addPermanentWidget(box)
             self.status_labels[key] = lab
+            self.status_lights[key] = light
 
     def update_status(self, status: dict, config) -> None:
         for key, lab in self.status_labels.items():
             s = status.get(key)
             if s is None:
                 continue
-            lab.setText(f"<span style='color:{_STATE_COLORS.get(s.state, '#ccc')}'>●</span> {COMPONENTS[key]}")
-            lab.setToolTip(s.text)
+            light = self.status_lights[key]
+            light.setStyleSheet(self._light_style(s.state))
+            light.setProperty("state", s.state)
+            for w in (lab, light):
+                w.setToolTip(f"{COMPONENTS[key]}: {s.text}")
         for a in self._window_actions:
             ok, why = self.app.available(a.data(), status)
             a.setEnabled(ok)
             a.setToolTip(why)
 
+    @staticmethod
+    def _light_style(state: str) -> str:
+        c = _STATE_COLORS.get(state, "#777")
+        return f"background:{c};border:1px solid #111;border-radius:5px"
+
     def notify(self, msg: str) -> None:
-        self.log.appendPlainText(time.strftime("%H:%M:%S  ") + msg)
+        self.log.add("easyEBL", time.strftime("%H:%M:%S  ") + msg)
 
     # ------------------------------------------------------------------ subsystems
     def build(self) -> None:
-        """Create the subsystems the backend can run (a tab says why one cannot)."""
+        """Create the subsystems of the backend (a tab each; a placeholder where one is missing)."""
         app = self.app
         st = app.backend.status()
         for key, title in TABS:
@@ -520,10 +666,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._install_monitor()
         if self.hosts.get("sem") and self.hosts["sem"].window is not None:
             self.sem_mini = SEMMiniView(self.hosts["sem"].window)
+            self.sem_mini.on_pick = self._pick_started
             self.bottom.addTab(self.sem_mini, "SEM view")
         self._order_bottom()
+        if self.positions_box.layout().count() == 0:
+            self._fill(self.positions_box, _placeholder("Stage positions: the Lithography is not available"))
+        if self.spectrum_box.layout().count() == 0:
+            self._fill(self.spectrum_box, _placeholder("EDS not available"))
         self._activate()
         self._uniform_font()
+
+    def _fill(self, box: QtWidgets.QWidget, widget) -> None:
+        widget.setParent(None)
+        box.layout().addWidget(widget)
+        widget.show()  # (a page taken from a tab widget is hidden)
+        self._filled.append(widget)
+
+    @property
+    def _filled(self) -> list:
+        if not hasattr(self, "_filled_list"):
+            self._filled_list = []
+        return self._filled_list
 
     def _install(self, key: str, title: str, win, why: str) -> None:
         page = self._pages[key]
@@ -546,42 +709,52 @@ class MainWindow(QtWidgets.QMainWindow):
         before = self.m_panels.menuAction()
         for m in host.menus:
             self.menuBar().insertAction(before, m.menuAction())
-        for tb in host.toolbars:
-            self.addToolBar(tb)
         if host.right is None:
             host.right = _placeholder("")
         self.right_stack.addWidget(host.right)
         host.moved.append(host.right)
-        if host.log is not None:
-            self.messages.addWidget(host.log)
+        if host.log is not None:  # its messages: copied into the one list, its own box not shown
+            boxes = [host.log] if isinstance(host.log, QtWidgets.QPlainTextEdit) else \
+                host.log.findChildren(QtWidgets.QPlainTextEdit)
+            for b in boxes[:1]:
+                self.log.follow(title, b)
+            host.log.setParent(self)
+            host.log.hide()
             host.moved.append(host.log)
         page.layout().addWidget(win)
         win.show()
-
-    def _bottom_page(self, host: ModuleHost, widget, title: str) -> None:
-        if widget is None:
-            return
-        widget.setParent(None)
-        self.bottom.addTab(widget, title)
-        host.moved.append(widget)
 
     def _take_sem(self, host: ModuleHost) -> None:
         w = host.window
         host.right = _take_dock(w, "controls")
         host.log = _take_dock(w, "messages")
-        for tb in host.toolbars:  # the window's own full screen: not as a tab
-            for a in tb.actions():
-                if a.text() == "Full screen":
-                    a.setVisible(False)
+        for a in (w.a_fullscreen, getattr(w, "a_mic", None)):  # a tab is not full screen; the column is here
+            if a is not None:
+                a.setVisible(False)
 
     def _take_eds(self, host: ModuleHost) -> None:
         w = host.window
         side = _take_dock(w, "eds_controls")  # the tabs + the live MCA panel
         host.log = _take_dock(w, "eds_messages")
         live = side.layout().itemAt(1).widget() if side is not None and side.layout().count() > 1 else None
-        host.right = side
-        self._bottom_page(host, w.data_tabs, "EDS data")
-        self._bottom_page(host, live, "EDS live spectrum")
+        right = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        right.setChildrenCollapsible(False)
+        if side is not None:
+            right.addWidget(side)
+        data = w.data_tabs  # the Data Manager: under the EDS settings
+        data.setParent(None)
+        right.addWidget(data)
+        right.setStretchFactor(0, 3)
+        right.setStretchFactor(1, 2)
+        host.right = right
+        host.moved.append(data)
+        self.eds_right = right
+        if live is not None:
+            if isinstance(live, QtWidgets.QGroupBox):
+                live.setTitle("EDS live spectrum")
+            self._fill(self.spectrum_box, live)
+            host.moved.append(live)
+            self.live_spectrum = live
 
     def _take_litho(self, host: ModuleHost) -> None:
         w = host.window
@@ -591,12 +764,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if i >= 0:
             tabs.removeTab(i)
         host.right = tabs
-        self._bottom_page(host, w.tab_positions, "Stage positions")
+        self._fill(self.positions_box, w.tab_positions)
+        host.moved.append(w.tab_positions)
         cal = CalibrationView(w)
         self._bottom_page(host, cal, "Calibration")
         al = AlignmentView(w)
         self._bottom_page(host, al, "Alignment")
         self.calibration_view, self.alignment_view = cal, al
+
+    def _bottom_page(self, host: ModuleHost, widget, title: str) -> None:
+        if widget is None:
+            return
+        widget.setParent(None)
+        self.bottom.addTab(widget, title)
+        host.moved.append(widget)
 
     def _install_microscope(self, st) -> None:
         b = self.app.backend
@@ -623,6 +804,7 @@ class MainWindow(QtWidgets.QMainWindow):
             p.setParent(None)
         for p, title in zip(panels, ("Column", "Stage")):
             self.left_tabs.addTab(p, title)
+        self._hide_stage_position_copy(panels[1] if len(panels) > 1 else None)
         for tb in mic.findChildren(QtWidgets.QToolBar):
             if tb.parent() is mic:
                 mic.removeToolBar(tb)
@@ -631,10 +813,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.left.layout().insertWidget(0, tb)
                 tb.show()
                 self._mic_toolbar = tb
-        log = _take_dock(mic, "mic_messages")
-        if log is not None:
-            self.bottom.addTab(log, "Microscope log")
-            self._mic_log = log
+        mic_log = getattr(mic, "log", None)  # its messages (not the port log)
+        if isinstance(mic_log, QtWidgets.QPlainTextEdit):
+            self.log.follow("Microscope", mic_log)
         for s in mic.findChildren(QtGui.QShortcut):  # Esc: the main window's (stop everything)
             if s.key() == QtGui.QKeySequence("Esc"):
                 s.setEnabled(False)
@@ -644,6 +825,14 @@ class MainWindow(QtWidgets.QMainWindow):
             lab.show()
         self.left_tabs.setCurrentIndex(0)
 
+    def _hide_stage_position_copy(self, stage_panel) -> None:
+        """The Stage tab's own copy of the stage positions: the Stage positions panel has them."""
+        if stage_panel is None:
+            return
+        for g in stage_panel.findChildren(QtWidgets.QGroupBox):
+            if g.title().replace("&", "").lower().startswith("stage positions"):
+                g.hide()
+
     def _install_monitor(self) -> None:
         from ..gui.scanmonitor import ScanMonitorWidget
 
@@ -652,12 +841,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.monitor = ScanMonitorWidget(app.scan_tap, mc.resolution, mc.retention_s, mc.fade,
                                          on_settings=app.set_monitor_settings,
                                          orientation=(d.invert_x, d.invert_y, d.swap_xy))
-        self.monitor.setFixedHeight(250)
+        # it gives way first when the screen is short (the left bar never runs under the status bar)
+        self.monitor.setMinimumHeight(150)
+        self.monitor.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
         self.monitor_box.layout().addWidget(self.monitor)
 
     def _order_bottom(self) -> None:
-        order = ["Messages", "Stage positions", "Calibration", "Alignment", "SEM view", "EDS data",
-                 "EDS live spectrum", "Microscope log"]
+        order = ["Calibration", "Alignment", "SEM view"]
         bar = self.bottom.tabBar()
         for target, title in enumerate(order):
             for i in range(self.bottom.count()):
@@ -666,20 +856,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     break
         self.bottom.setCurrentIndex(0)
 
+    def _pick_started(self) -> None:
+        """A marker pick (lithography alignment) waits: the small SEM view forward, highlighted,
+        unless the SEM tab is in front (the pick is there)."""
+        if self.sem_mini is None or self.tabs.currentWidget() is self._pages["sem"]:
+            return
+        self.bottom_dock.show()
+        self.bottom.setCurrentWidget(self.sem_mini)
+
     def teardown(self) -> bool:
         """Close the subsystems (False: one refused, e.g. unsaved data kept)."""
         for key in ("litho", "eds", "sem"):
             h = self.hosts.get(key)
             if h is not None and h.window is not None and not h.window.close():
                 return False
+        self.log.unfollow_all()
         if self.sem_mini is not None:
             self.sem_mini.timer.stop()
             self.sem_mini.deleteLater()
             self.sem_mini = None
         for h in self.hosts.values():
-            for tb in h.toolbars:
-                self.removeToolBar(tb)
-                tb.deleteLater()
             for m in h.menus:
                 self.menuBar().removeAction(m.menuAction())
             for w in h.moved:
@@ -687,6 +883,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if h.window is not None:
                 h.window.deleteLater()
         self.hosts.clear()
+        for w in self._filled:
+            w.setParent(None)
+            w.deleteLater()
+        self._filled.clear()
+        for box in (self.positions_box, self.spectrum_box):
+            while box.layout().count():
+                box.layout().takeAt(0)
+        self.live_spectrum = None
         if self.mic is not None:
             self.mic.close()
             self.mic.deleteLater()
@@ -696,7 +900,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.monitor.deleteLater()
             self.monitor = None
         for tabs in (self.left_tabs, self.bottom):
-            while tabs.count() > (1 if tabs is self.bottom else 0):
+            while tabs.count():
                 w = tabs.widget(tabs.count() - 1)
                 tabs.removeTab(tabs.count() - 1)
                 w.deleteLater()
@@ -746,9 +950,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sem = self.sem
         if sem is None:
             return None
-        if self.sem_mini is not None and self.tabs.currentWidget() is not self._pages["sem"]:
-            self.bottom_dock.show()
-            self.bottom.setCurrentWidget(self.sem_mini)
+        self._pick_started()
         return sem
 
     def bring_up(self) -> None:
@@ -768,10 +970,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if h is not None and h.right is not None:
             self.right_stack.setCurrentWidget(h.right)
             self.right_dock.setWindowTitle(f"{dict(TABS)[key]} settings")
-        if h is not None and h.log is not None:
-            self.messages.setCurrentWidget(h.log)
-        else:
-            self.messages.setCurrentWidget(self.log)
 
     # ------------------------------------------------------------------ emergency stop
     def stop_everything(self) -> list:
@@ -799,8 +997,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if ew is not None:
             attempt("EDS", ew.stop)
         sw = self.sem
+        tuner = getattr(sw, "autotune", None) if sw is not None else None
+        if tuner is not None and tuner.busy:
+            attempt("auto function", tuner.cancel)
         if sw is not None:
-            attempt("SEM scan", lambda: (sw.cancel_pick(), sw.engine.stop()))
+            attempt("SEM scan", lambda: (sw.cancel_pick(), sw.cancel_abc_resume(), sw.engine.stop()))
         elif self.app.backend.engine is not None:
             attempt("SEM scan", self.app.backend.engine.stop)
         self.notify("STOP (Esc): " + (", ".join(done) or "nothing to stop"))
@@ -853,7 +1054,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return ok
 
     def default_layout(self) -> None:
-        """Left 340 px, right 420 px, bottom 230 px on the available screen (maximised)."""
+        """Left 340 px, right 420 px, bottom 230 px (messages | data | spectrum) on the available screen."""
         for d in (self.left_dock, self.right_dock, self.bottom_dock):
             d.setFloating(False)
             d.show()
@@ -865,17 +1066,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCorner(QtCore.Qt.BottomRightCorner, QtCore.Qt.RightDockWidgetArea)
         self.resizeDocks([self.left_dock, self.right_dock], [340, 420], QtCore.Qt.Horizontal)
         self.resizeDocks([self.bottom_dock], [230], QtCore.Qt.Vertical)
+        w = max(900, self.width() - 760)
+        self.bottom_split.setSizes([int(w * 0.38), int(w * 0.32), int(w * 0.30)])
+        self.left_split.setSizes([480, 300, 260])
 
     def reset_layout(self) -> None:
         self.default_layout()
 
     # ------------------------------------------------------------------ closing
     def closeEvent(self, ev):  # noqa: N802
-        """Closing hides the window: the backend keeps running in the tray."""
+        """Closing shuts easyEBL down (it asks first); with ``background`` (``--background``) it hides
+        the window instead and the backend keeps running in the tray."""
         self.save_layout()
         if self.app.closing:
             return super().closeEvent(ev)
         ev.ignore()
+        if not getattr(self.app, "background", False):
+            QtCore.QTimer.singleShot(0, self.app.shutdown)  # asks; declined: the window stays
+            return
+        self.hide_to_tray()
+
+    def hide_to_tray(self) -> None:
+        """Hide the window; easyEBL keeps running in the tray (no tray: minimised)."""
         if not self.app.has_tray:
             self.showMinimized()
             return

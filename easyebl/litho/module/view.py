@@ -10,7 +10,10 @@
 * marker picking (:meth:`StageView.start_pick`): the corners and centres of every polygon of the
   Exposure's GDS snap, the nearest one under the cursor is ringed;
 * named stage positions, the stage (white ○) and its current field of view (green: the full
-  deflection field; red: the SEM imaging scan when it is reduced or shifted).
+  deflection field; red: the SEM imaging scan when it is reduced or shifted);
+* drawing modes (:meth:`StageView.set_modes`): the patterns coloured by field or by dose factor
+  (from the GDS, see the Exposure's dose source), the writing order (fields in turn, and the
+  shapes in a field) and the exposure points themselves (dots).
 """
 from __future__ import annotations
 
@@ -24,8 +27,23 @@ from ..coords import StageAxes
 from ..geometry import Dot, Polygon
 from ...core.transforms import AffineTransform
 from ..schedule import Exposure, PatternSpec, exposure_fields
+from ..writer import build_runs, order_elements
 
-__all__ = ["StageView", "outline_arrays", "nice_step", "snap_targets", "SNAP_PX"]
+
+def _exposure_params(op, schedule):
+    from ..runner import params_for_dwell
+
+    return params_for_dwell(op.dwell_us * 1e-6, op.step_nm * 1e-3, getattr(schedule, "settings", None))
+
+__all__ = ["StageView", "outline_arrays", "nice_step", "snap_targets", "SNAP_PX", "MAX_DOTS", "FIELD_COLORS"]
+
+#: at most this many exposure points drawn (Show dots); more: every n-th
+MAX_DOTS = 400_000
+#: Color by Field: the fields in turn
+FIELD_COLORS = ((90, 190, 255), (255, 150, 60), (120, 220, 110), (230, 110, 220), (250, 230, 90),
+                (80, 220, 220), (255, 110, 110), (170, 140, 255), (200, 200, 120), (120, 170, 255))
+#: Color by Dose: bins from the lowest to the highest dose factor
+DOSE_BINS = 9
 
 #: a pick snaps to a target nearer than this (screen pixels)
 SNAP_PX = 12.0
@@ -56,6 +74,25 @@ def outline_arrays(pieces, max_points: int = 2_000_000) -> tuple[np.ndarray, np.
         return np.zeros(0), np.zeros(0)
     a = np.vstack(parts)
     return a[:, 0], a[:, 1]
+
+
+def _dose_color(t: float) -> tuple:
+    """viridis-like colour of *t* in 0 … 1."""
+    stops = ((0.0, (68, 1, 84)), (0.25, (59, 82, 139)), (0.5, (33, 145, 140)), (0.75, (94, 201, 98)),
+             (1.0, (253, 231, 37)))
+    t = min(1.0, max(0.0, float(t)))
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t <= t1:
+            f = (t - t0) / (t1 - t0)
+            return tuple(int(round(a + (b - a) * f)) for a, b in zip(c0, c1))
+    return stops[-1][1]
+
+
+def _element_centre(e) -> np.ndarray:
+    if isinstance(e, Dot):
+        return np.array([e.x, e.y], float)
+    pts = np.asarray(e.points, float)
+    return _centroid(np.vstack([pts, pts[:1]])) if isinstance(e, Polygon) else pts.mean(0)
 
 
 def _shapes(pattern) -> list:
@@ -194,6 +231,26 @@ class StageView(pg.PlotWidget):
         self._chip_labels: list = []
         for it in (self._origins, self._global, self._local, self._positions, self._stage, self._chips):
             self.addItem(it)
+        # drawing modes
+        self.color_mode = "plain"  # "plain" | "field" | "dose"
+        self.show_order = False
+        self.show_dots = False
+        self._colored: list = []  # PlotDataItems of the coloured patterns (one per colour)
+        self._order = item((255, 255, 255, 170), 1.2)  # field centres in writing order
+        self._order_in = item((255, 255, 255, 80), 1.0, QtCore.Qt.DotLine)  # shapes in a field, in order
+        self._order_start = pg.ScatterPlotItem(symbol="t1", size=11, pen=None, brush=pg.mkBrush(255, 220, 40))
+        self.addItem(self._order_start)
+        self._order_labels: list = []
+        self._dots = pg.PlotDataItem(pen=None, symbol="o", symbolSize=2, symbolPen=None,
+                                     symbolBrush=pg.mkBrush(90, 190, 255, 200), pxMode=True)
+        self._dots.setZValue(-1)
+        self.addItem(self._dots)
+        self.dots_note = ""
+        self.dose_range = None  # (lowest, highest) dose factor drawn
+        self.legend = QtWidgets.QLabel(self)
+        self.legend.setStyleSheet("background:rgba(20,20,26,210);color:#ddd;padding:3px")
+        self.legend.hide()
+        self._ctx = None  # the last set_schedule arguments (a mode change redraws with them)
         self._labels: list = []
         self._fov_label = pg.TextItem("FoV", color=C_FOV, anchor=(0, 1))
         self.addItem(self._fov_label)
@@ -227,10 +284,34 @@ class StageView(pg.PlotWidget):
         self.setLabel("left", "stage Y (SCS)" + ("  ↓ increasing" if fy else ""), "µm")
 
     # ---------------------------------------------------------------- schedule
+    def set_modes(self, color: str | None = None, order: bool | None = None, dots: bool | None = None) -> None:
+        """Drawing modes: *color* "plain" / "field" / "dose", the writing *order*, the exposure *dots*."""
+        if color is not None:
+            if color not in ("plain", "field", "dose"):
+                raise ValueError("color must be plain, field or dose")
+            self.color_mode = color
+        if order is not None:
+            self.show_order = bool(order)
+        if dots is not None:
+            self.show_dots = bool(dots)
+        if self._ctx is not None:
+            self.set_schedule(*self._ctx)
+
+    def _color_items(self, n: int) -> list:
+        while len(self._colored) < n:
+            it = pg.PlotDataItem(pen=pg.mkPen((255, 255, 255), width=1.2), connect="finite")
+            self.addItem(it)
+            self._colored.append(it)
+        return self._colored
+
     def set_schedule(self, schedule, library, plans, axes: StageAxes, selected: int | None = None,
                      chips: dict | None = None) -> None:
         """*chips*: {chip name: measured ChipTransform} (else nominal)."""
+        self._ctx = (schedule, library, plans, axes, selected, chips)
         normal, warned, sel, fovs, origins, glob, loc, axes_lines = [], [], [], [], [], [], [], []
+        by_field, by_dose = [], []  # (field number, shape), (dose factor, shape)
+        order_pts, order_in, dots = [], [], []
+        n_field = 0
         other = []  # every layer of the GDS, gray: the exposed ones are drawn over them
         boxes = []
         chip_pts = []
@@ -263,16 +344,35 @@ class StageView(pg.PlotWidget):
                 origins.append(tgt)
                 if op.alignment_only or fp.index >= len(defs):
                     continue
+                order_pts.append(tgt)
                 try:
                     pat = library.get(defs[fp.index].spec(op))
                 except Exception:  # noqa: BLE001
                     pat = []
                 c = np.asarray(fp.centre_ccs, float)
                 shapes = [g.to_scs(s_ + c) for s_ in _shapes(pat)]
-                (sel if i == selected else warned if fp.warnings else normal).extend(shapes)
+                if i == selected:
+                    sel.extend(shapes)
+                elif self.color_mode == "field":
+                    by_field.extend((n_field, s_) for s_ in shapes)
+                elif self.color_mode == "dose":
+                    by_dose.extend((float(e.dose_factor), s_) for e, s_ in zip(pat, shapes))
+                else:
+                    (warned if fp.warnings else normal).extend(shapes)
+                n_field += 1
+                if self.show_order or self.show_dots:
+                    params = _exposure_params(op, schedule)
+                if self.show_order and len(pat) > 1:
+                    els = order_elements(list(pat), params.order)
+                    order_in.append(g.to_scs(np.array([_element_centre(e) for e in els]) + c))
+                if self.show_dots:
+                    pts = self._field_dots(pat, params)
+                    if len(pts):
+                        dots.append(g.to_scs(pts + c))
             if op.path:  # the whole GDS, every layer, also what is in no field (e.g. in the top cell itself)
                 other.extend(g.to_scs(s_) for s_ in _shapes(_whole_gds(op, library)))
         self._other.setData(*outline_arrays(other))
+        self._draw_modes(by_field, by_dose, order_pts, order_in, dots)
         self._patterns.setData(*outline_arrays(normal))
         self._warn.setData(*outline_arrays(warned))
         self._selected.setData(*outline_arrays(sel))
@@ -288,6 +388,106 @@ class StageView(pg.PlotWidget):
         if not self._fitted and boxes:
             self._fitted = True
             self.zoom_all()
+
+    def _field_dots(self, pat, params) -> np.ndarray:
+        """The exposure points of one field's pattern (field µm), kept per pattern and fill."""
+        cache = self.__dict__.setdefault("_dots_cache", {})
+        key = (id(pat), params.area_step_um, params.line_step_um, params.fill_direction, params.serpentine,
+               params.order)
+        hit = cache.get(key)
+        if hit is not None and hit[0] is pat:  # the library hands out the same pattern while it is cached
+            return hit[1]
+        try:
+            runs = build_runs(pat, params)
+            pts = np.vstack([np.asarray(r.points_um, float) for r in runs]) if runs else np.zeros((0, 2))
+        except Exception:  # noqa: BLE001
+            pts = np.zeros((0, 2))
+        if len(cache) > 64:
+            cache.clear()
+        cache[key] = (pat, pts)
+        return pts
+
+    def _draw_modes(self, by_field, by_dose, order_pts, order_in, dots) -> None:
+        items = self._color_items(max(len(FIELD_COLORS), DOSE_BINS))
+        groups: list = [[] for _ in items]
+        colors: list = [None] * len(items)
+        legend = ""
+        self.dose_range = None
+        if self.color_mode == "field":
+            for k, s_ in by_field:
+                groups[k % len(FIELD_COLORS)].append(s_)
+            colors[:len(FIELD_COLORS)] = FIELD_COLORS
+        elif self.color_mode == "dose" and by_dose:
+            lo = min(d for d, _ in by_dose)
+            hi = max(d for d, _ in by_dose)
+            self.dose_range = (lo, hi)
+            span = hi - lo
+            for d, s_ in by_dose:
+                b = 0 if span <= 1e-12 else min(DOSE_BINS - 1, int((d - lo) / span * DOSE_BINS))
+                groups[b].append(s_)
+            for b in range(DOSE_BINS):
+                colors[b] = _dose_color(b / (DOSE_BINS - 1))
+            sw = "".join(f"<span style='color:rgb{_dose_color(b / (DOSE_BINS - 1))}'>■</span>"
+                         for b in range(DOSE_BINS))
+            legend = f"dose factor {lo:.3g} {sw} {hi:.3g}" if span > 1e-12 else f"dose factor {lo:.3g} (all)"
+        for it, grp, col in zip(items, groups, colors):
+            if col is not None:
+                it.setPen(pg.mkPen(col, width=1.2))
+            it.setData(*outline_arrays(grp))
+        # writing order: the fields in turn (▲ the first), the shapes in each field
+        for t in self._order_labels:
+            self.removeItem(t)
+        self._order_labels = []
+        if self.show_order and order_pts:
+            pts = np.asarray(order_pts, float)
+            self._order.setData(pts[:, 0], pts[:, 1])
+            self._order_start.setData(pos=pts[:1])
+            for k, pt in enumerate(pts[:300]):
+                t = pg.TextItem(str(k + 1), color=(255, 255, 255), anchor=(-0.2, 1.1))
+                t.setPos(*pt)
+                self.addItem(t)
+                self._order_labels.append(t)
+            self._order_in.setData(*outline_arrays(order_in))
+        else:
+            self._order.setData([], [])
+            self._order_in.setData([], [])
+            self._order_start.clear()
+        # exposure points
+        self.dots_note = ""
+        if self.show_dots and dots:
+            a = np.vstack(dots)
+            if len(a) > MAX_DOTS:
+                k = int(np.ceil(len(a) / MAX_DOTS))
+                self.dots_note = f"{len(a):,} exposure points: every {k}th drawn"
+                a = a[::k]
+            else:
+                self.dots_note = f"{len(a):,} exposure points"
+            self._dots.setData(a[:, 0], a[:, 1])
+        else:
+            self._dots.setData([], [])
+        notes = [x for x in (legend, self.dots_note) if x]
+        if notes:
+            self.legend.setText("<br>".join(notes))
+            self.legend.adjustSize()
+            self.legend.move(self.width() - self.legend.width() - 12, 8)
+            self.legend.show()
+        else:
+            self.legend.hide()
+
+    def zoom_pattern(self) -> None:
+        """Zoom to the patterns (every field's, the GDS drawn gray around them)."""
+        items = [i for i in (self._patterns, self._warn, self._selected, self._other, *self._colored)
+                 if i.boundingRect().isValid() and not i.boundingRect().isNull()]
+        if items:
+            self.getPlotItem().getViewBox().autoRange(items=items)
+        else:
+            self.zoom_all()
+
+    def resizeEvent(self, ev):  # noqa: N802
+        super().resizeEvent(ev)
+        legend = getattr(self, "legend", None)  # (a resize during construction)
+        if legend is not None and legend.isVisible():
+            self.legend.move(self.width() - self.legend.width() - 12, 8)
 
     def _draw_chips(self, chips) -> None:
         for t in self._chip_labels:

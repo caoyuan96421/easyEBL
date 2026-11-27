@@ -641,19 +641,27 @@ class ImagingEngine:
         return self.set_beam_shift(0.0, 0.0)
 
     # ---------------------------------------------------------------- zoom (scan range)
+    #: zooming in (the swept range) stops at this fraction of the full field of view (0.1 %: ×1000)
+    MIN_FIELD_FRACTION = 1e-3
+
+    def min_width_um(self) -> float:
+        """The smallest scan width of a zoom: :attr:`MIN_FIELD_FRACTION` of the full field of view."""
+        return self.MIN_FIELD_FRACTION * self.calibration.field_size_um
+
     def zoom(self, factor: float) -> RasterConfig:
         """Zoom in (*factor* > 1) or out by changing the swept range – the column is not
-        touched.  Zooming out stops at the full field of view; the scan position moves
-        towards the centre where the larger scan would not fit."""
+        touched.  Zooming in stops at 0.1 % of the full field of view (:meth:`min_width_um`),
+        zooming out at the full field of view; the scan position moves towards the centre where
+        the larger scan would not fit."""
         cfg = self.config
         w = min(cfg.width_um / float(factor), self.max_width_um(cfg))
         return self.set_field_of_view(w)
 
     def set_field_of_view(self, width_um: float, center_um=None) -> RasterConfig:
         """Scan size (width, µm) at *center_um* (default: the current scan position), clamped:
-        the size to the full field of view, the position so that the scan fits."""
+        the size to 0.1 % … 100 % of the full field of view, the position so that the scan fits."""
         cfg = self.config
-        w = min(max(float(width_um), 1e-6 * self.calibration.field_size_um), self.max_width_um(cfg))
+        w = min(max(float(width_um), self.min_width_um()), self.max_width_um(cfg))
         c = np.asarray(cfg.center_um if center_um is None else center_um, float)
         trial = cfg.with_(width_um=w, height_um=None if cfg.height_um is None else cfg.height_um * w / cfg.width_um)
         if not self._fits(trial.with_(center_um=tuple(c))):

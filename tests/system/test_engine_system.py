@@ -415,3 +415,15 @@ def test_partial_frames_are_published_less_often_when_large(make_engine, quiet_p
     eng.wait_frame(complete=True, timeout=20)
     run = eng._run
     assert run.pub_cost_s > 0  # measured: the next partial publish waits ≥ 10 × this
+
+
+def test_zoom_in_stops_at_a_thousandth_of_the_field(make_engine):
+    """The beam zoom (the swept range) stops at 0.1 % of the full field of view."""
+    eng, _ = make_engine()
+    field = eng.calibration.field_size_um
+    assert eng.min_width_um() == pytest.approx(field * 1e-3)
+    for _ in range(40):
+        eng.zoom(2)
+    assert eng.config.width_um == pytest.approx(field * 1e-3) and eng.zoom_factor == pytest.approx(1000)
+    eng.set_field_of_view(field * 1e-6)
+    assert eng.config.width_um == pytest.approx(field * 1e-3)

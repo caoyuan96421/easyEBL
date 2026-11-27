@@ -186,9 +186,9 @@ class ScanPanel(QtWidgets.QGroupBox):
         lay.addWidget(self.info, 3, 0, 1, 3)
         self.sync()
 
-    def _do(self, fn, *a):
+    def _do(self, fn, *a, **k):
         try:
-            fn(*a)
+            fn(*a, **k)
         except Exception as e:  # noqa: BLE001
             self.notify(f"error: {e}")
 
@@ -353,8 +353,9 @@ class ImagePanel(QtWidgets.QGroupBox):
         lay.addWidget(QtWidgets.QLabel("Brightness"), 1, 0)
         lay.addWidget(self.s_bri, 1, 1)
         lay.addWidget(self.l_bri, 1, 2)
-        self.b_acb = QtWidgets.QPushButton("Auto C/B")
-        self.b_acb.setToolTip("Auto contrast & brightness from the current image (Ctrl+A)")
+        self.b_acb = QtWidgets.QPushButton("Auto levels")
+        self.b_acb.setToolTip("Display contrast & brightness from the current image (Ctrl+A); the SEM's own "
+                              "contrast / brightness: Auto C/B in the toolbar (the SEM's ABC)")
         self.cb_auto = QtWidgets.QCheckBox("Continuous")
         self.cb_auto.setToolTip("Re-adjust contrast/brightness on every frame")
         row = QtWidgets.QHBoxLayout()
@@ -515,7 +516,10 @@ class FieldOfViewPanel(QtWidgets.QGroupBox):
                 sp.setSingleStep(10 ** -dec * 10)
             sp.setValue(v)
             sp.blockSignals(False)
+        self.size.blockSignals(True)  # (the range only: no new scan size from here)
         self.size.setMaximum(self.engine.max_width_um())
+        self.size.setMinimum(self.engine.min_width_um())
+        self.size.blockSignals(False)
         self.l_zoom.setText(f"zoom ×{self.engine.zoom_factor:.3g} of the full field ({field:.4g} µm)")
 
 
@@ -559,9 +563,13 @@ class ColumnPanel(QtWidgets.QGroupBox):
         lay.addWidget(btn("+", lambda: self.mic.focus(+1), "Focus (fine) +"), 1, 3)
 
         lay.addWidget(QtWidgets.QLabel("Stigma X"), 2, 0)
+        self.l_stx = QtWidgets.QLabel("—")
+        lay.addWidget(self.l_stx, 2, 1)
         lay.addWidget(btn("−", lambda: self.mic.stigmate(-1, 0)), 2, 2)
         lay.addWidget(btn("+", lambda: self.mic.stigmate(+1, 0)), 2, 3)
         lay.addWidget(QtWidgets.QLabel("Stigma Y"), 3, 0)
+        self.l_sty = QtWidgets.QLabel("—")
+        lay.addWidget(self.l_sty, 3, 1)
         lay.addWidget(btn("−", lambda: self.mic.stigmate(0, -1)), 3, 2)
         lay.addWidget(btn("+", lambda: self.mic.stigmate(0, +1)), 3, 3)
 
@@ -572,18 +580,19 @@ class ColumnPanel(QtWidgets.QGroupBox):
         self.b_af.setToolTip("search the objective focus with test images of the present scan field; the step "
                              "follows the magnification (coarse focus first only when needed).  Falls back to "
                              "the start values when no clear optimum is found")
-        self.b_af.clicked.connect(lambda: self.start_tune("auto"))
+        self.tune_handler = None  # what the buttons call (the SEM window: with its modal window)
+        self.b_af.clicked.connect(lambda: self._tune_clicked("auto"))
         m = QtWidgets.QMenu(self.b_af)
-        m.addAction("Fine focus only (FOCUS F)", lambda: self.start_tune("fine"))
-        m.addAction("Coarse focus only (FOCUS C)", lambda: self.start_tune("coarse"))
+        m.addAction("Fine focus only (FOCUS F)", lambda: self._tune_clicked("fine"))
+        m.addAction("Coarse focus only (FOCUS C)", lambda: self._tune_clicked("coarse"))
         self.b_af.setMenu(m)
         self.b_as = QtWidgets.QToolButton(text="Auto stigma")
         self.b_as.setToolTip("full-range search of stigmator X, then Y, with test images; falls back to the "
                              "start values when no clear optimum is found")
-        self.b_as.clicked.connect(lambda: self.start_tune("stig"))
+        self.b_as.clicked.connect(lambda: self._tune_clicked("stig"))
         self.b_fs = QtWidgets.QToolButton(text="Focus + stig")
         self.b_fs.setToolTip("auto focus, auto stigma, then fine focus again")
-        self.b_fs.clicked.connect(lambda: self.start_tune("both"))
+        self.b_fs.clicked.connect(lambda: self._tune_clicked("both"))
         self.b_tune_cancel = QtWidgets.QToolButton(text="Cancel")
         self.b_tune_cancel.setToolTip("stop the search and set the start values again")
         self.b_tune_cancel.clicked.connect(self.cancel_tune)
@@ -646,6 +655,9 @@ class ColumnPanel(QtWidgets.QGroupBox):
         self._tune_buttons(busy=True)
         return fut
 
+    def _tune_clicked(self, what: str):
+        return (self.tune_handler or self.start_tune)(what)
+
     def cancel_tune(self) -> None:
         if self.autotune is not None:
             self.autotune.cancel()
@@ -681,3 +693,7 @@ class ColumnPanel(QtWidgets.QGroupBox):
         self.l_mag.setText(f"×{mag:g}" if mag else "×—")
         wd = self.mic.working_distance_mm()
         self.l_wd.setText(f"WD {wd:.2f} mm" if wd else "WD —")
+        st = getattr(self.mic, "state", None) or {}
+        for lab, key in ((self.l_stx, "stig_x"), (self.l_sty, "stig_y")):
+            v = st.get(key)
+            lab.setText(str(v) if isinstance(v, int) else "—")

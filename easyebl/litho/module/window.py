@@ -138,6 +138,7 @@ class LithoWindow(QtWidgets.QMainWindow):
         self.log_dock = ld
 
         self._make_menus()
+        self._make_toolbar()
         self._make_status()
         self._replan_timer = QtCore.QTimer(self)
         self._replan_timer.setSingleShot(True)
@@ -194,7 +195,7 @@ class LithoWindow(QtWidgets.QMainWindow):
         self.a_up = act(m, "Move up", lambda: tab.move(-1), "Ctrl+Up")
         self.a_down = act(m, "Move down", lambda: tab.move(+1), "Ctrl+Down")
         m.addSeparator()
-        self.a_move = act(m, "Move the chip…", lambda: self.move_chip_dialog(), "Ctrl+M")
+        self.a_move = act(m, "Move pattern…", lambda: self.move_chip_dialog(), "Ctrl+M")
         self.field_actions = [self.a_add_exp, self.a_add_gds, self.a_add_column, self.a_add_beam,
                               self.a_dup,
                               self.a_del, self.a_up, self.a_down, self.a_move]
@@ -225,6 +226,47 @@ class LithoWindow(QtWidgets.QMainWindow):
         act(m, "Add the stage position to Stage Positions…", self.tab_positions.add_current)
         m.addSeparator()
         act(m, "Stage settings…", self.edit_axes)
+
+    def _make_toolbar(self):
+        """Plot tools (icon, text under it): zoom, move the pattern or the stage, the drawing modes."""
+        from ...gui.icons import icon, tool_bar
+
+        tb = tool_bar("litho_tools", self)
+        self.addToolBar(QtCore.Qt.TopToolBarArea, tb)
+        self.tools = tb
+
+        def act(name, text, tip, fn=None, checkable=False):
+            a = tb.addAction(icon(name), text)
+            a.setToolTip(tip)
+            a.setCheckable(checkable)
+            if fn is not None:
+                (a.toggled if checkable else a.triggered).connect(fn if checkable else (lambda _=False: fn()))
+            return a
+
+        self.a_zoom_pattern = act("zoom_pattern", "Zoom to pattern", "zoom the plot to the patterns",
+                                  self.view.zoom_pattern)
+        self.a_move_pattern = act("move_pattern", "Move pattern", "move the selected chip's pattern (its CCS) on "
+                                  "the stage (Ctrl+M)", lambda: self.move_chip_dialog())
+        self.a_move_stage = act("move_stage", "Move stage", "move the stage to a position, a marker or a stage "
+                                "position", lambda: self.move_stage_dialog())
+        tb.addSeparator()
+        self.a_color_field = act("color_field", "Color by Field", "each field's patterns in a colour of its own",
+                                 lambda on: self._color_mode("field", on), True)
+        self.a_color_dose = act("color_dose", "Color by Dose", "the patterns coloured by their dose factor (from the "
+                                "GDS: the Exposure's dose source)", lambda on: self._color_mode("dose", on), True)
+        self.a_order = act("order", "Writing order", "the fields in the order they are written (numbers), and "
+                           "the shapes in each field", lambda on: self.view.set_modes(order=on), True)
+        self.a_dots = act("dots", "Show dots", "the exposure points themselves (every n-th when there are very many)",
+                          lambda on: self.view.set_modes(dots=on), True)
+        self.field_actions = list(self.field_actions) + [self.a_move_pattern]
+
+    def _color_mode(self, mode: str, on: bool) -> None:
+        other = self.a_color_dose if mode == "field" else self.a_color_field
+        if on and other.isChecked():
+            other.blockSignals(True)
+            other.setChecked(False)
+            other.blockSignals(False)
+        self.view.set_modes(color=mode if on else "plain")
 
     def _make_status(self):
         sb = self.statusBar()
@@ -602,7 +644,7 @@ class LithoWindow(QtWidgets.QMainWindow):
         return out
 
     def anchors(self, name: str) -> dict:
-        """Reference points for Move the chip (stage µm, through the chip's present map; None where none)."""
+        """Reference points for Move pattern (stage µm, through the chip's present map; None where none)."""
         chip = self.schedule.chip(name)
         if chip is None:
             return {}
@@ -632,7 +674,7 @@ class LithoWindow(QtWidgets.QMainWindow):
             self.log("no chip to move (Chips tab)")
             return False
         d = MoveFieldsDialog(self.anchors(name), self.hw.stage_position(), click, self)
-        d.setWindowTitle(f"Move chip {name}")
+        d.setWindowTitle(f"Move pattern – chip {name}")
         self._move_dialog = d
         if d.exec() != QtWidgets.QDialog.Accepted or d.value() is None:
             return False
@@ -806,7 +848,7 @@ class LithoWindow(QtWidgets.QMainWindow):
         a = m.addAction("Move stage…")
         a.triggered.connect(lambda: self.move_stage_dialog(click=(x, y)))
         a.setEnabled(not self._running())
-        a = m.addAction("Move the chip…")
+        a = m.addAction("Move pattern…")
         a.triggered.connect(lambda: self.move_chip_dialog(click=(x, y)))
         a.setEnabled(not self._running() and bool(self.schedule.chips))
         m.addSeparator()

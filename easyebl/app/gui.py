@@ -37,7 +37,6 @@ class Subsystem:
     key: str
     title: str
     needs: str  # backend component it uses ("daq", "eds", "microscope")
-    tool: bool = False  # listed under "Tools"
 
 
 SUBSYSTEMS = (
@@ -45,12 +44,6 @@ SUBSYSTEMS = (
     Subsystem("eds", "EDS", "eds"),
     Subsystem("microscope", "Microscope (column && stage)", "microscope"),
     Subsystem("litho", "Lithography", "daq"),
-    Subsystem("vector", "Vector lithography", "daq", tool=True),
-    Subsystem("gds", "GDS lithography", "daq", tool=True),
-    Subsystem("dose", "Dose calculator", "daq", tool=True),
-    Subsystem("alignment", "Alignment", "daq", tool=True),
-    Subsystem("raster", "Raster imaging (debug)", "daq", tool=True),
-    Subsystem("hal", "HAL debug", "daq", tool=True),
 )
 _BY_KEY = {s.key: s for s in SUBSYSTEMS}
 
@@ -88,36 +81,6 @@ def _overall(status: dict[str, ComponentStatus]) -> str:
         if s in states:
             return s
     return "ok"
-
-
-# ==================================================================== tool windows
-class ToolWindow(QtWidgets.QMainWindow):
-    """A lithography / debug widget as a window of its own; its DAQ handles close with it."""
-
-    def __init__(self, widget: QtWidgets.QWidget, title: str):
-        super().__init__()
-        self.widget = widget
-        self.setCentralWidget(widget)
-        self.setWindowTitle(f"easyEBL – {title}")
-
-    def closeEvent(self, ev):  # noqa: N802
-        from ..hal.manager import DAQHandle
-
-        self.widget.close()  # its own clean-up (stop streams, release external control)
-        # every DAQ handle the tool holds: on its widgets, also panels kept as attributes only
-        todo, seen = [self.widget, *self.widget.findChildren(QtWidgets.QWidget)], set()
-        while todo:
-            w = todo.pop()
-            if id(w) in seen:
-                continue
-            seen.add(id(w))
-            for v in list(vars(w).values()):
-                if isinstance(v, DAQHandle):
-                    if not v.closed:
-                        v.close()
-                elif isinstance(v, QtWidgets.QWidget):
-                    todo.append(v)
-        super().closeEvent(ev)
 
 
 # ==================================================================== hardware dialog
@@ -540,8 +503,11 @@ class EasyEBLApp(QtCore.QObject):
     def __init__(self, config: SystemConfig, persistent: bool = True, eds_settings_path: str | None = None,
                  microscope_settings=None, microscope_delay_s: float = 0.25, use_tray: bool = True,
                  confirm: Callable[[str, str], bool] | None = None, main_window: bool = False,
-                 layout_path: str | None = None):
+                 layout_path: str | None = None, background: bool = False):
         super().__init__()
+        #: closing the main window keeps easyEBL running in the tray (``--background``); by default it
+        #: shuts easyEBL down (after asking)
+        self.background = bool(background)
         self.config = config
         self.persistent = persistent
         self._backend_kw = dict(eds_settings_path=eds_settings_path, microscope_settings=microscope_settings,
@@ -717,12 +683,8 @@ class EasyEBLApp(QtCore.QObject):
     # ------------------------------------------------------------------ menus
     def fill_open_menu(self, menu: QtWidgets.QMenu):
         self._open_actions = getattr(self, "_open_actions", [])
-        tools = None
         for sub in SUBSYSTEMS:
-            if sub.tool and tools is None:
-                menu.addSeparator()
-                tools = menu.addMenu("Tools")
-            a = (tools or menu).addAction(sub.title, lambda k=sub.key: self.open(k))
+            a = menu.addAction(sub.title, lambda k=sub.key: self.open(k))
             a.setData(sub.key)
             self._open_actions.append(a)
 
@@ -779,7 +741,7 @@ class EasyEBLApp(QtCore.QObject):
 
     def open(self, key: str):
         """Show subsystem *key*: with the main window its tab (SEM, EDS, Lithography) or panel
-        (microscope), the tools in their own windows; else its own window (:meth:`open_window`)."""
+        (microscope); else its own window (:meth:`open_window`)."""
         if self.main is not None:
             if key in ("sem", "eds", "litho"):
                 return self.main.show_tab(key)
@@ -858,30 +820,7 @@ class EasyEBLApp(QtCore.QObject):
             w = LithoWindow(hardware)
             w.resize(1500, 950)
             return w
-        from ..gui.common import Session
-
-        session = Session(b.manager, b.engine.calibration)  # never closed here: the backend owns the manager
-        title = _BY_KEY[key].title
-        if key == "vector":
-            from ..litho.gui_vector import VectorLithoWidget as cls
-        elif key == "gds":
-            from ..litho.gui_gds import GDSWidget as cls
-        elif key == "dose":
-            from ..litho.gui_dose import DoseCalculatorWidget as cls
-        elif key == "alignment":
-            from ..alignment.gui import AlignmentWidget as cls
-        elif key == "raster":
-            from ..imaging.gui import ImagingWidget as cls
-        elif key == "hal":
-            from ..hal.gui import HALDebugWidget as cls
-        else:
-            raise KeyError(key)
-        widget = cls(session)
-        if key == "alignment" and session.simulator is not None:
-            widget._apply_sim()
-        w = ToolWindow(widget, f"{title} [{b.manager.capabilities().name}]")
-        w.resize(1300, 850)
-        return w
+        raise KeyError(key)
 
     def _sem_for_litho(self):
         """The SEM window the lithography picks markers in (the main window's SEM tab)."""
