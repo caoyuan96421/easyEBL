@@ -1,0 +1,119 @@
+{
+ "format": "easyebl-schedule",
+ "version": 3,
+ "name": "multifield demo",
+ "settings": {
+  "fill_direction": "x",
+  "serpentine": false,
+  "order": "as_is",
+  "on_out_of_field": "ask"
+ },
+ "vector_settings": {},
+ "chips": [
+  {
+   "name": "Demo chip",
+   "origin": [
+    56242.23150147962,
+    31003.58064681817
+   ],
+   "note": ""
+  }
+ ],
+ "operations": [
+  {
+   "type": "column",
+   "label": "",
+   "enabled": true,
+   "preset": "",
+   "magnification": 1000,
+   "current_pa": 60.0
+  },
+  {
+   "type": "field_correction",
+   "label": "",
+   "enabled": false,
+   "position": "",
+   "notes": ""
+  },
+  {
+   "type": "exposure",
+   "label": "",
+   "enabled": true,
+   "chip": "Demo chip",
+   "path": "multifield_demo.gds",
+   "top": "",
+   "layers": [
+    [
+     1,
+     0
+    ]
+   ],
+   "dose": {
+    "mode": "auto",
+    "property_attr": null,
+    "table": {},
+    "default": 1.0,
+    "value_scale": 1.0
+   },
+   "offset": [
+    0.0,
+    0.0
+   ],
+   "cell_origin": false,
+   "order": "raster",
+   "dwell_us": 20.0,
+   "step_nm": 20.0,
+   "global_align": true,
+   "global_markers": [
+    [
+     -45.0,
+     -45.0
+    ],
+    [
+     45.0,
+     45.0
+    ]
+   ],
+   "local_align": true,
+   "local_markers": [
+    [
+     -45.0,
+     45.0
+    ],
+    [
+     55.0,
+     45.0
+    ],
+    [
+     155.0,
+     45.0
+    ],
+    [
+     -45.0,
+     -55.0
+    ],
+    [
+     55.0,
+     -55.0
+    ],
+    [
+     155.0,
+     -55.0
+    ],
+    [
+     -45.0,
+     -155.0
+    ],
+    [
+     55.0,
+     -155.0
+    ],
+    [
+     155.0,
+     -155.0
+    ]
+   ],
+   "view_um": 10.0
+  }
+ ]
+}
