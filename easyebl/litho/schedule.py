@@ -40,6 +40,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 import json
 import os
+import re
 from typing import ClassVar
 
 import numpy as np
@@ -49,12 +50,12 @@ from ..microscope.s3000.commands import ALLOWED_MAGNIFICATIONS
 from . import dose as dosemod
 from .beamcal import BeamCalConfig
 from .coords import S3000_AXES, ChipTransform, FieldMap, StageAxes, check_field, stage_rotation
-from .gds import GDSDoseMapping, load_library, pattern_from_cell
+from .gds import dose_summary, dose_warnings, encoded_layers, load_library, pattern_from_cell
 from .geometry import Dot, Pattern, Polyline, rectangle
 from .height import WD_WARN_MM, ChipHeight
 
 __all__ = ["Operation", "ColumnSetting", "BeamCalibrationStep", "Exposure", "Chip", "PatternSpec", "PatternLibrary",
-           "FieldDef", "MarkerAssignment", "exposure_fields", "assign_markers", "ScheduleSettings", "Schedule",
+           "FieldDef", "MarkerAssignment", "exposure_fields", "assign_markers", "FIELD0_NAME", "field_name_order", "ScheduleSettings", "Schedule",
            "StepPlan", "FieldPlan", "plan", "OP_TYPES", "SCHEDULE_FORMAT", "ScheduleError", "dummy_pattern",
            "KEEP_AS_IS", "position_problem", "dose_readout", "MAGNIFICATIONS", "nearest_magnification", "op_from_dict", "find_beamcal",
            "FIXED_STEPS", "field_size_of", "calibration_problem", "wd_far_problem"]
@@ -95,19 +96,6 @@ def dummy_pattern(size_um: float = 20.0) -> Pattern:
     return Pattern(els, name=f"dummy {s:g} µm")
 
 
-def _mapping_to_dict(m: GDSDoseMapping) -> dict:
-    d = asdict(m)
-    d["table"] = {str(k): v for k, v in m.table.items()}
-    return d
-
-
-def _mapping_from_dict(d: dict | None) -> GDSDoseMapping:
-    d = dict(d or {})
-    d["table"] = {int(k): float(v) for k, v in (d.get("table") or {}).items()}
-    known = {f.name for f in fields(GDSDoseMapping)}
-    return GDSDoseMapping(**{k: v for k, v in d.items() if k in known})
-
-
 def _layers_from(v):
     if v is None:
         return None
@@ -117,14 +105,13 @@ def _layers_from(v):
 @dataclass
 class PatternSpec:
     """A pattern to load: ``"gds"`` – *cell* of GDS file *path*, flattened, *layers* kept (None: all),
-    doses from *dose*, then *placement* (cell → wanted coordinates); ``"dummy"`` –
+    doses from the datatypes (:mod:`~easyebl.litho.gds`), then *placement* (cell → wanted coordinates); ``"dummy"`` –
     :func:`dummy_pattern` of *size_um*; ``"none"`` – nothing."""
 
     kind: str = "dummy"
     path: str = ""
     cell: str = ""
     layers: list | None = None
-    dose: GDSDoseMapping = field(default_factory=GDSDoseMapping)
     placement: AffineTransform = field(default_factory=AffineTransform.identity)
     size_um: float = 20.0
 
@@ -138,6 +125,7 @@ class PatternLibrary:
 
     def __init__(self):
         self._libs: dict = {}
+        self._encoded: dict = {}
         self._cells: dict = {}
         self._fields: dict = {}
 
@@ -154,6 +142,17 @@ class PatternLibrary:
         tops = [c.name for c in lib.top_level()]
         return tops + [c.name for c in lib.cells if c.name not in tops]
 
+    def encoded(self, path: str) -> frozenset:
+        """The layers of GDS *path* whose datatype is the dose (:func:`~easyebl.litho.gds.encoded_layers`)."""
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in self._encoded:
+            self._encoded[key] = encoded_layers(self.library(path))
+        return self._encoded[key]
+
+    def dose_summary(self, path: str, layers=None) -> dict:
+        """:func:`~easyebl.litho.gds.dose_summary` of GDS *path* (its layers kept by *layers*)."""
+        return dose_summary(self.library(path), layers)
+
     def top_cells(self, path: str) -> list:
         return [c.name for c in self.library(path).top_level()]
 
@@ -165,15 +164,14 @@ class PatternLibrary:
         if not spec.path or not spec.cell:
             raise ScheduleError("no GDS file / cell chosen")
         key = (os.path.normcase(os.path.abspath(spec.path)), spec.cell,
-               None if spec.layers is None else tuple(spec.layers), json.dumps(_mapping_to_dict(spec.dose),
-                                                                                sort_keys=True))
+               None if spec.layers is None else tuple(spec.layers))
         pat = self._cells.get(key)
         if pat is None:
             lib = self.library(spec.path)
             found = [c for c in lib.cells if c.name == spec.cell]
             if not found:
                 raise ScheduleError(f"cell {spec.cell!r} not in {os.path.basename(spec.path)}")
-            pat = pattern_from_cell(found[0], spec.layers, spec.dose)
+            pat = pattern_from_cell(found[0], spec.layers, self.encoded(spec.path))
             pat.source = spec.path
             self._cells[key] = pat
         if not spec.placement.is_identity():
@@ -185,8 +183,18 @@ class PatternLibrary:
             self._fields[key] = make()
         return self._fields[key]
 
+    def forget(self, path: str) -> None:
+        """Drop everything cached from the GDS file *path*: the next use reads it again from disk."""
+        key = os.path.normcase(os.path.abspath(path))
+        self._libs.pop(key, None)
+        self._encoded.pop(key, None)
+        for d in (self._cells, self._fields):
+            for k in [k for k in d if k[0] == key]:
+                del d[k]
+
     def clear(self) -> None:
         self._libs.clear()
+        self._encoded.clear()
         self._cells.clear()
         self._fields.clear()
 
@@ -329,9 +337,6 @@ class BeamCalibrationStep(_CalibrationStep):
         return "on the calibration sample" + (", stored one if there is" if self.reuse else "")
 
 
-ORDERS = ("file", "raster", "serpentine")
-
-
 @dataclass
 class Exposure(Operation):
     TYPE: ClassVar[str] = "exposure"
@@ -339,11 +344,9 @@ class Exposure(Operation):
     chip: str = ""  # Chip.name
     path: str = ""  # GDS file ("": alignment only); relative paths: relative to the schedule file
     top: str = ""  # the top cell placing the fields ("": the only top-level cell)
-    layers: list | None = None  # [(layer, datatype)] or [layer]; None: all
-    dose: GDSDoseMapping = field(default_factory=GDSDoseMapping)
+    layers: list | None = None  # [(layer, datatype)] or [layer]; None: all  (the dose: the datatype, per layer)
     offset: tuple = (0.0, 0.0)  # GDS origin in CCS
     cell_origin: bool = False  # field centre = the cell's origin (else its bounding-box centre)
-    order: str = "file"  # file | raster | serpentine (after the Global Align field)
     dwell_us: float = 1.0  # per exposure point (× the GDS dose factor)
     step_nm: float = 20.0  # point spacing (area fill and lines)
     global_align: bool = False
@@ -358,10 +361,6 @@ class Exposure(Operation):
         self.global_markers = [_xy(m) for m in self.global_markers]
         self.local_markers = [_xy(m) for m in self.local_markers]
         self.layers = _layers_from(self.layers)
-        if isinstance(self.dose, dict):
-            self.dose = _mapping_from_dict(self.dose)
-        if self.order not in ORDERS:
-            raise ScheduleError(f"order must be one of {', '.join(ORDERS)}")
         if not self.dwell_us > 0 or not self.step_nm > 0:
             raise ScheduleError("dwell and step must be positive")
         if not self.align_tolerance_um > 0:
@@ -390,7 +389,6 @@ class Exposure(Operation):
             except ValueError:  # another drive
                 pass
         d["path"] = path.replace("\\", "/")
-        d["dose"] = _mapping_to_dict(self.dose)
         d["layers"] = [list(x) if isinstance(x, (tuple, list)) else x for x in self.layers] \
             if self.layers is not None else None
         d["global_markers"] = [list(m) for m in self.global_markers]
@@ -403,7 +401,6 @@ class Exposure(Operation):
         path = d.get("path", "")
         if base_dir and path and not os.path.isabs(path):
             d["path"] = os.path.normpath(os.path.join(base_dir, path))
-        d["dose"] = _mapping_from_dict(d.get("dose"))
         return super().from_dict(d, base_dir)
 
 
@@ -458,7 +455,7 @@ class FieldDef:
         if not self.path:
             return PatternSpec("none")
         cx, cy = self.centre_gds
-        return PatternSpec("gds", self.path, self.cell, exp.layers, exp.dose,
+        return PatternSpec("gds", self.path, self.cell, exp.layers,
                            AffineTransform.translation(-cx, -cy) @ self.placement)
 
     def contains(self, ccs, field_um: float) -> bool:
@@ -480,10 +477,9 @@ def exposure_fields(exp: Exposure, library: PatternLibrary | None = None) -> lis
         c = tuple(float(v) for v in np.mean(np.asarray(pts, float), axis=0))
         return [FieldDef("alignment", "", AffineTransform.identity(), (c[0], c[1], c[0], c[1]), (c[0] - ox, c[1] - oy),
                          c, 0)]
-    key = (os.path.normcase(os.path.abspath(exp.path)), exp.top, None if exp.layers is None else tuple(exp.layers),
-           json.dumps(_mapping_to_dict(exp.dose), sort_keys=True))
+    key = (os.path.normcase(os.path.abspath(exp.path)), exp.top, None if exp.layers is None else tuple(exp.layers))
     raw = library.cached_fields(key, lambda: find_fields(
-        exp.path, ImportOptions(source="auto", top=exp.top or None, layers=exp.layers, dose=exp.dose), library))
+        exp.path, ImportOptions(source="auto", top=exp.top or None, layers=exp.layers), library))
     out = []
     for f in raw:
         c = tuple(map(float, f.placement.offset)) if exp.cell_origin else f.center
@@ -491,20 +487,88 @@ def exposure_fields(exp: Exposure, library: PatternLibrary | None = None) -> lis
     return out
 
 
+#: the name of the dummy field that only holds the Global Align markers
+FIELD0_NAME = "Field 0 (Global Align)"
+
+
+def _natural_key(text: str) -> list:
+    """Cell-name order with numbers compared as numbers (Field_2 before Field_10)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
+
+
+def field_name_order(fields_: list, indices) -> list:
+    """*indices* into *fields_* in their cell-name order (then the placement name)."""
+    return sorted(indices, key=lambda i: (_natural_key(fields_[i].cell or fields_[i].name),
+                                          _natural_key(fields_[i].name)))
+
+
 @dataclass
 class MarkerAssignment:
-    global_field: int | None  # index into the fields (None: no Global Align / not in one field)
+    global_field: int | None  # index into *fields* (None: no Global Align / the markers fit no field)
     local: dict  # field index -> CCS marker
     order: list  # field indices in writing order (the Global Align field first)
     warnings: list
+    errors: list = field(default_factory=list)  # the Exposure cannot run
+    fields: list = field(default_factory=list)  # the Exposure's fields (+ Field 0 at the end, when made)
+    marker_field: list = field(default_factory=list)  # per Local marker: its field index (None: not used)
+
+    @property
+    def field0(self) -> bool:
+        """The Global Align markers are in the dummy Field 0 (the last of *fields*)."""
+        return self.global_field is not None and not self.fields[self.global_field].path \
+            and self.fields[self.global_field].name == FIELD0_NAME
+
+
+def _assign_local(fields_: list, real: int, g, markers: list, field_um: float):
+    """Local markers → fields, at most one per field, as many fields as possible covered (a maximum
+    matching of marker ↔ field whose field of view holds it), then the nearest centres (least total
+    distance).  The Global Align field takes none.  Returns ({field: marker}, [field per marker or
+    None], warnings)."""
+    from scipy.optimize import linear_sum_assignment
+
+    warns = []
+    n = len(markers)
+    per = [None] * n
+    if not n or not real:
+        return {}, per, [f"Local marker ({m[0]:g}, {m[1]:g}) is in no field's field of view" for m in markers]
+    cand = [i for i in range(real) if i != g]
+    big = 1e12  # not in the field's field of view
+    cost = np.full((n, max(1, len(cand))), big)
+    for r, m in enumerate(markers):
+        for c, i in enumerate(cand):
+            if fields_[i].contains(m, field_um):
+                cost[r, c] = float(np.hypot(fields_[i].centre_ccs[0] - m[0], fields_[i].centre_ccs[1] - m[1]))
+    local = {}
+    if cand:
+        rows, cols = linear_sum_assignment(cost)
+        for r, c in zip(rows, cols):
+            if cost[r, c] < big:
+                per[r] = cand[c]
+                local[cand[c]] = tuple(markers[r])
+    for r, m in enumerate(markers):
+        if per[r] is not None:
+            continue
+        inside = [i for i in range(real) if fields_[i].contains(m, field_um)]
+        if not inside:
+            warns.append(f"Local marker ({m[0]:g}, {m[1]:g}) is in no field's field of view")
+        elif inside == [g]:
+            warns.append(f"Local marker ({m[0]:g}, {m[1]:g}) is only in the Global Align field "
+                         f"{fields_[g].name}: not used")
+        else:
+            names = ", ".join(fields_[i].name for i in inside if i != g)
+            warns.append(f"Local marker ({m[0]:g}, {m[1]:g}) is not used: its field(s) {names} have another")
+    return local, per, warns
 
 
 def assign_markers(fields_: list, exp: Exposure, field_um: float) -> MarkerAssignment:
-    """Global Align markers → the field whose field of view holds all of them (nearest centre);
-    each Local marker → the field whose field of view holds it (nearest centre), one per field."""
-    from .fracture import order_fields
-
-    warns = []
+    """Global Align markers → the field whose field of view holds all of them (nearest centre); in no
+    field's but within one field size: a dummy Field 0 centred on them (alignment only, first); not
+    within one field size: an error.  Local markers → fields whose field of view holds them, one per
+    field, as many fields covered as possible (:func:`_assign_local`).  Writing order: the Global
+    Align field, then the others in cell-name order (with Field 0: every field in cell-name order)."""
+    warns, errors = [], []
+    fields_ = list(fields_)
+    real = len(fields_)
     g = None
     if exp.global_align:
         mk = np.asarray(exp.global_markers, float).reshape(-1, 2)
@@ -518,38 +582,30 @@ def assign_markers(fields_: list, exp: Exposure, field_um: float) -> MarkerAssig
                 c = mk.mean(0)
                 g = min(cand, key=lambda i: float(np.hypot(*(np.asarray(fields_[i].centre_ccs) - c))))
             else:
-                warns.append(f"the Global Align markers are not all inside the field of view (±{field_um / 2:.1f} µm) "
-                             "of one field")
+                lo, hi = mk.min(0), mk.max(0)
+                c = (lo + hi) / 2.0
+                if np.all(hi - lo <= field_um + 1e-9):
+                    ox, oy = exp.offset
+                    f0 = FieldDef(FIELD0_NAME, "", AffineTransform.identity(), (c[0], c[1], c[0], c[1]),
+                                  (float(c[0] - ox), float(c[1] - oy)), (float(c[0]), float(c[1])), 0)
+                    fields_.append(f0)
+                    g = len(fields_) - 1
+                else:
+                    span = hi - lo
+                    errors.append(f"the Global Align markers span {span[0]:.1f} × {span[1]:.1f} µm: they do not fit "
+                                  f"in one field ({field_um:.1f} µm)")
     local: dict = {}
+    marker_field: list = []
     if exp.local_align:
-        for m in exp.local_markers:
-            cand = [i for i, f in enumerate(fields_) if f.contains(m, field_um)]
-            if not cand:
-                warns.append(f"Local marker ({m[0]:g}, {m[1]:g}) is in no field's field of view")
-                continue
-            i = min(cand, key=lambda i: float(np.hypot(fields_[i].centre_ccs[0] - m[0], fields_[i].centre_ccs[1] - m[1])))
-            if i in local:
-                old = local[i]
-                d_old = np.hypot(fields_[i].centre_ccs[0] - old[0], fields_[i].centre_ccs[1] - old[1])
-                d_new = np.hypot(fields_[i].centre_ccs[0] - m[0], fields_[i].centre_ccs[1] - m[1])
-                keep = m if d_new < d_old else old
-                warns.append(f"field {fields_[i].name} has two Local markers ({old[0]:g}, {old[1]:g}) and "
-                             f"({m[0]:g}, {m[1]:g}): using ({keep[0]:g}, {keep[1]:g})")
-                local[i] = keep
-            else:
-                local[i] = m
-        if g is not None and g in local:
-            warns.append(f"field {fields_[g].name} is the Global Align field: its Local marker is not used")
-            del local[g]
-        missing = [f.name for i, f in enumerate(fields_) if i != g and i not in local]
-        if missing and fields_ and not exp.alignment_only:
+        local, marker_field, w = _assign_local(fields_, real, g, exp.local_markers, field_um)
+        warns.extend(w)
+        missing = [fields_[i].name for i in range(real) if i != g and i not in local]
+        if missing and real and not exp.alignment_only:
             warns.append(f"{len(missing)} field(s) without a Local marker: " + ", ".join(missing[:5])
                          + (" …" if len(missing) > 5 else ""))
-    rest = [f for i, f in enumerate(fields_) if i != g]
-    ordered = order_fields(rest, exp.order)
-    idx = {id(f): i for i, f in enumerate(fields_)}
-    order = ([g] if g is not None else []) + [idx[id(f)] for f in ordered]
-    return MarkerAssignment(g, local, order, warns)
+    rest = field_name_order(fields_, [i for i in range(real) if i != g])
+    order = ([g] if g is not None else []) + rest
+    return MarkerAssignment(g, local, order, warns, errors, fields_, marker_field)
 
 
 def find_beamcal(beamcals, condition):
@@ -740,6 +796,7 @@ class StepPlan:
     field_um: float
     current_pa: float | None
     warnings: list = field(default_factory=list)
+    errors: list = field(default_factory=list)  # the step cannot run (also in *warnings*, "ERROR: …")
     fields: list = field(default_factory=list)  # [FieldPlan] of an Exposure, in writing order
     chip: ChipTransform | None = None  # the chip map in force for the Exposure
     stage_to_beam: np.ndarray | None = None  # B used (SCS → BCS)
@@ -905,7 +962,15 @@ def _plan_exposure(sp: StepPlan, op: Exposure, schedule: Schedule, chips: dict, 
                            else "alignment only, but no markers")
         return
     asg = assign_markers(flds, op, field_um)
+    flds = asg.fields
+    sp.errors.extend(asg.errors)
+    sp.warnings.extend("ERROR: " + e for e in asg.errors)
     sp.warnings.extend(asg.warnings)
+    if op.path:
+        try:
+            sp.warnings.extend(dose_warnings(library.dose_summary(op.path, op.layers)))
+        except Exception:  # noqa: BLE001 - the file's problem shows elsewhere
+            pass
     if op.alignment_only and not op.global_align:
         sp.warnings.append("no GDS file and no Global Align: the step does nothing")
     if (op.global_align or op.local_align) and op.view_um > field_um:
@@ -920,7 +985,7 @@ def _plan_exposure(sp: StepPlan, op: Exposure, schedule: Schedule, chips: dict, 
             fp.warnings.append(f"WD {fp.wd:.3f} mm outside 4–60 mm (the height map?)")
         if tgt[0] < 0 or tgt[1] < 0:
             fp.warnings.append("stage target below 0 (the stage refuses negative coordinates)")
-        if not op.alignment_only:
+        if not op.alignment_only and f.path:
             pat = library.get(f.spec(op))
             fc = check_field(pat, fm, field_um)
             fp.fov_check = fc

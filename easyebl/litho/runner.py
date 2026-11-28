@@ -925,10 +925,16 @@ class ScheduleRunner:
             raise ScheduleError("the Exposure has no fields")
         field_um = self.field if self.field is not None else float(self.hw.field_um())
         asg = assign_markers(flds, op, field_um)
+        flds = asg.fields
         for w in asg.warnings:
             self.log(f"step {i + 1}: WARNING {w}")
+        if asg.errors:
+            raise ScheduleError("; ".join(asg.errors))
         if op.global_align and asg.global_field is None:
-            raise ScheduleError("the Global Align markers are not inside one field's field of view")
+            raise ScheduleError("the Global Align markers are not inside one field")
+        if asg.field0:
+            self.log(f"step {i + 1}: the Global Align markers are in no field: {flds[asg.global_field].name} at CCS "
+                     f"({flds[asg.global_field].centre_ccs[0]:.2f}, {flds[asg.global_field].centre_ccs[1]:.2f}) µm")
         w = chip.height.problem(self.z_cal, check_z=True)
         if w:
             raise ScheduleError(f"chip {chip.name}: {w}")
@@ -974,7 +980,7 @@ class ScheduleRunner:
                 delta = scs[0] - g.to_scs(np.asarray(m, float))
             fm = FieldMap.make(g, f.centre_ccs, stage, b, delta, bc)
             self.last_map = fm
-            if op.alignment_only:
+            if op.alignment_only or not f.path:  # nothing to write (alignment only, Field 0)
                 self._emit("field", index=i, k=k_i, n=n, name=f.name, state="done", map=fm.copy())
                 continue
             r = self._write(i, op, f, fm, field_um, params, settings)

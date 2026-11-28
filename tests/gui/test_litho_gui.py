@@ -2,6 +2,7 @@
 calibration windows, field sizes, the calibration sample (Z_cal, WD1), chip heights (WD2), SEM mark picking, the
 program's backend."""
 import math
+import os
 import threading
 
 import numpy as np
@@ -104,8 +105,13 @@ def test_window_open_edit_save_run(win, tmp_path, demo, qtbot):
     qtbot.waitUntil(lambda: isinstance(tab.editor.op, Exposure) and not tab.editor.op.local_align)
     win.schedule[2].local_align = True
     tab.editor.set_op(win.schedule[2])
-    n = tab.editor.set_local_per_field(-45.0, 45.0)
-    assert n == 9 and len(win.schedule[2].local_markers) == 9
+    win.schedule[2].local_markers = [(c[0] - 45.0, c[1] + 45.0) for c in tab.editor.field_centres(win.schedule[2])]
+    tab.editor.set_op(win.schedule[2])
+    assert len(win.schedule[2].local_markers) == 9 and tab.editor.local_table.rowCount() == 9
+    t = tab.editor.local_table
+    fields = [t.item(r, 2).text() for r in range(9)]  # the field each marker is assigned to
+    assert t.horizontalHeaderItem(2).text() == "field" and fields[0] == "—"  # FIELD_R1C1: the Global Align field
+    assert fields[1:] == [f"FIELD_R{r}C{c} #{3 * (r - 1) + c}" for r in (1, 2, 3) for c in (1, 2, 3)][1:]
     tol = [sp for sp in tab.editor.findChildren(QtWidgets.QDoubleSpinBox) if "agree" in sp.toolTip()]
     assert len(tol) == 1 and tol[0].value() == 0.5
     tol[0].setValue(0.3)
@@ -554,9 +560,9 @@ def test_every_gds_layer_is_drawn_gray(win, tmp_path):
     assert np.nanmax(x) == pytest.approx(5000.0 + 200.0) and np.nanmin(y) == pytest.approx(4800.0)
 
 
-def _dose_gds(tmp_path):
-    """Two fields (cells A, B) of squares with dose factors as GDS property 7 (1.0, 1.5, 2.0) and
-    property 3 holding text."""
+def _dose_gds(tmp_path, zero=False):
+    """Two fields (cells A, B) of squares on layer 1 with dose factors 1.0, 1.5, 2.0 in the datatype
+    (1000, 1500, 2000); *zero*: one more square of datatype 0 in A (dose 0)."""
     import gdstk
 
     lib = gdstk.Library(unit=1e-6, precision=1e-9)
@@ -564,10 +570,9 @@ def _dose_gds(tmp_path):
     for k, (name, x) in enumerate((("A", 0.0), ("B", 120.0))):
         c = lib.new_cell(name)
         for j, d in enumerate((1.0, 1.5, 2.0)):
-            r = gdstk.rectangle((-30 + 20 * j, -5), (-20 + 20 * j, 5), layer=1)
-            r.set_gds_property(7, f"{d:g}")
-            r.set_gds_property(3, "no number")
-            c.add(r)
+            c.add(gdstk.rectangle((-30 + 20 * j, -5), (-20 + 20 * j, 5), layer=1, datatype=int(d * 1000)))
+        if zero and name == "A":
+            c.add(gdstk.rectangle((-30, 20), (-20, 30), layer=1, datatype=0))
         top.add(gdstk.Reference(c, (x, 0)))
     path = str(tmp_path / "dose.gds")
     lib.write_gds(path)
@@ -590,23 +595,36 @@ def test_the_toolbar_and_the_drawing_modes(win, tmp_path, qtbot):
     win.a_color_field.setChecked(True)
     filled = [it for it in v._colored if it.xData is not None and len(it.xData)]
     assert v.color_mode == "field" and len(filled) == 2 and not len(v._patterns.xData or [])
-    # by dose (exclusive with by field): the dose factors of the GDS property
-    s.exposures[0].dose.mode = "property"
-    s.exposures[0].dose.property_attr = 7
+    # by dose (exclusive with by field): the dose factors of the datatypes, a colour bar on the plot
     win.a_color_dose.setChecked(True)
     assert not win.a_color_field.isChecked() and v.color_mode == "dose"
-    assert v.dose_range == pytest.approx((1.0, 2.0)) and v.legend.isVisibleTo(v)
+    assert v.dose_range == pytest.approx((1.0, 2.0)) and v.colorbar.isVisibleTo(v)
+    assert v.colorbar.labels() == ["1.000", "1.250", "1.500", "1.750", "2.000"] and not v.colorbar.zero
     filled = [it for it in v._colored if it.xData is not None and len(it.xData)]
-    assert len(filled) == 3  # the lowest, middle and highest bins
+    assert len(filled) == 3  # the lowest, middle and highest colours
+    assert v.colorbar.x() + v.colorbar.width() <= v.width()
     win.a_color_dose.setChecked(False)
-    assert v.color_mode == "plain" and len(v._patterns.xData)
+    assert v.color_mode == "plain" and len(v._patterns.xData) and not v.colorbar.isVisibleTo(v)
     # the writing order: the field centres in turn, numbered
     win.a_order.setChecked(True)
     assert len(v._order.xData) == 2 and len(v._order_labels) == 2
-    # the exposure points: 3 squares of 10 µm at 0.5 µm per field
+    # the exposure points (3 squares of 10 µm at 0.5 µm per field): only zoomed in to 50 × 50 µm or less
+    v.getPlotItem().getViewBox().setRange(xRange=(4800, 5200), yRange=(4800, 5200), padding=0)
     win.a_dots.setChecked(True)
-    n = len(v._dots.xData)
-    assert n == pytest.approx(2 * 3 * 20 * 20, rel=0.15) and "exposure points" in v.dots_note
+    assert not v.dots_zoomed_in() and (v._dots.xData is None or not len(v._dots.xData))
+    assert "zoom in to 50 × 50 µm" in v.dots_note and v.legend.isVisibleTo(v)
+    box, pat, params, g, c = v._dot_fields[0]
+    p0 = g.to_scs(v._field_dots(pat, params)[0] + c)  # an exposure point: the view around it, 30 µm
+    v.getPlotItem().getViewBox().setRange(xRange=(p0[0] - 15, p0[0] + 15), yRange=(p0[1] - 15, p0[1] + 15),
+                                          padding=0)
+    assert v.dots_zoomed_in()  # (the aspect is kept: Y a bit taller, still under 50 µm)
+    qtbot.waitUntil(lambda: v._dots.xData is not None and len(v._dots.xData) > 0, timeout=3000)
+    (x0, x1), (y0, y1) = v.getPlotItem().getViewBox().viewRange()
+    xs, ys = v._dots.xData, v._dots.yData
+    assert np.all((xs >= min(x0, x1)) & (xs <= max(x0, x1)) & (ys >= min(y0, y1)) & (ys <= max(y0, y1)))
+    assert 0 < len(xs) < 2 * 3 * 20 * 20 and v.dots_note.endswith("exposure points shown")  # only those in view
+    v.getPlotItem().getViewBox().setRange(xRange=(4900, 5100), yRange=(4980, 5020), padding=0)  # 200 µm wide
+    qtbot.waitUntil(lambda: v._dots.xData is None or not len(v._dots.xData), timeout=3000)
     win.a_dots.setChecked(False)
     win.a_order.setChecked(False)
     assert v._dots.xData is None or len(v._dots.xData) == 0
@@ -615,24 +633,25 @@ def test_the_toolbar_and_the_drawing_modes(win, tmp_path, qtbot):
     assert win.a_move.text() == "Move pattern…"
 
 
-def test_the_dose_factor_property_is_chosen(win, tmp_path):
-    from easyebl.litho.gds import dose_properties
-
-    path = _dose_gds(tmp_path)
-    assert dose_properties(path) == {7: (6, 1.0, 2.0)}  # property 3 holds no number
-    s = Schedule([Exposure(chip="A", path=path)], chips=[Chip("A", ORIGIN)])
+def test_the_dose_is_read_from_the_datatypes_per_layer(win, tmp_path):
+    """No dose setting: the editor shows the doses per layer; datatype 0 on a dose-encoded layer is
+    dose 0 – a warning, drawn gray (the colour bar says so)."""
+    path = _dose_gds(tmp_path, zero=True)
+    s = Schedule([ColumnSetting(field_size="250 µm"), Exposure(chip="A", path=path)], chips=[Chip("A", ORIGIN)])
     win.set_schedule(s)
+    i = s.operations.index(s.exposures[0])
+    win.tab_schedule.select(i)
     ed = win.tab_schedule.editor
-    ed.set_op(s.exposures[0])
-    box = ed.dose_box
-    items = [box.itemText(i) for i in range(box.count())]
-    assert items[:3] == ["none (all 1)", "any property with a number", "property 7 (6 shapes, 1 … 2)"]
-    box.setCurrentIndex(2)
-    d = s.exposures[0].dose
-    assert d.mode == "property" and d.property_attr == 7
+    assert not hasattr(ed, "dose_box")
+    assert ed.dose_label.text() == ("layer 1: dose factor 1.000 … 2.000 (3 levels); 1 shape(s) datatype 0 → dose 0 ⚠")
     win.replan()
-    box.setCurrentIndex(0)
-    assert s.exposures[0].dose.mode == "none"
+    assert any("datatype 0 among dose-encoded datatypes" in w for _, w in win.warnings())
+    win.tab_schedule.select(0)
+    win.replan()
+    win.a_color_dose.setChecked(True)
+    v = win.view
+    assert v.dose_range == pytest.approx((1.0, 2.0)) and v.colorbar.zero
+    assert len(v._colored[64].xData)  # the gray dose-0 level
 
 
 def _marks_gds(tmp_path):
@@ -692,6 +711,29 @@ def test_markers_are_picked_on_polygon_corners_and_centres(win, tmp_path, qtbot)
     v.pickCancelled.emit()
     assert not v.picking and op.local_markers == [(-190.0, -195.0), pytest.approx((50.0, 60.0))]
     assert tab.editor.local_table.rowCount() == 2
+    # the Local marker buttons: Add manually, Pick & Add, Pick & Replace, Remove (no "One per field")
+    ed = tab.editor
+    texts = [b.text() for b in ed.findChildren(QtWidgets.QPushButton)]
+    assert [ed.b_local_add.text(), ed.b_pick_local.text(), ed.b_local_replace.text(), ed.b_local_remove.text()]         == ["Add manually", "Pick && Add", "Pick && Replace", "Remove"] and not any("per field" in t for t in texts)
+    ed.local_table.clearSelection()
+    ed.local_table.setCurrentCell(-1, -1)
+    assert not ed.b_local_remove.isEnabled() and not ed.b_local_replace.isEnabled()
+    # Pick & Replace: the selected marker moves to the click
+    ed.local_table.selectRow(1)
+    assert ed.b_local_replace.isEnabled()
+    ed.b_local_replace.click()
+    assert v.picking and "Local marker 2: click its new position" in v.pick_banner.text()
+    assert click((15.0, 10.0)) and not v.picking
+    assert op.local_markers == [(-190.0, -195.0), (15.0, 10.0)]
+    # Remove: the selected row
+    tab.editor.local_table.selectRow(0)
+    tab.editor.b_local_remove.click()
+    assert op.local_markers == [(15.0, 10.0)] and tab.editor.local_table.rowCount() == 1
+    # Add manually: a row (0, 0), its X open for typing
+    tab.editor.b_local_add.click()
+    assert op.local_markers == [(15.0, 10.0), (0.0, 0.0)] and tab.editor.local_table.currentRow() == 1
+    tab.editor.local_table.item(1, 0).setText("7.5")
+    assert op.local_markers[1] == (7.5, 0.0)
     # snapping is in screen pixels: zoomed far out a 30 µm miss still snaps, zoomed in it does not
     win.pick_markers("global", 0)
     v.getPlotItem().getViewBox().setRange(xRange=(4990, 5010), yRange=(4990, 5010), padding=0)
@@ -894,7 +936,7 @@ def test_litho_runs_on_the_simulated_backend(ui, qtbot, demo):
     gds = Schedule.load(demo["schedule"]).exposures[0].path
     x, y, z, wd = _program_setup(w, mag=900)
     s = Schedule([ColumnSetting(preset="test", field_size="t", current_pa=200.0),
-                  Exposure(chip="A", path=gds, layers=[(1, 0)], dwell_us=0.5, step_nm=500.0)],
+                  Exposure(chip="A", path=gds, layers=[1], dwell_us=0.5, step_nm=500.0)],
                  chips=[Chip("A", (300.0, 400.0))])
     s[1].reuse = True
     w.set_schedule(s)
@@ -1027,3 +1069,68 @@ def test_the_alignment_prompt_in_the_program(ui, qtbot):
         box.buttons()[[b.text() for b in box.buttons()].index(("Repeat", "Continue anyway", "Abort")[k])].click()
         qtbot.waitUntil(lambda: "a" in out, timeout=10000)
         assert out["a"] == want
+
+
+def test_choosing_or_reloading_a_gds_file_reads_it_again(win, tmp_path):
+    """The same GDS file chosen again – or the ⟳ button – reads it from disk: a changed file updates the fields."""
+    import gdstk
+
+    path = str(tmp_path / "pat.gds")
+
+    def write(n, top="TOP"):
+        lib = gdstk.Library(unit=1e-6, precision=1e-9)
+        t = lib.new_cell(top)
+        for k in range(n):
+            c = lib.new_cell(f"F{k}")
+            c.add(gdstk.rectangle((-10, -10), (10, 10), layer=1))
+            t.add(gdstk.Reference(c, (300.0 * k, 0)))
+        lib.write_gds(path)
+
+    write(2)
+    s = Schedule([ColumnSetting(field_size="250 µm"), Exposure(chip="A", path=path)], chips=[Chip("A", ORIGIN)])
+    win.set_schedule(s)
+    i = s.operations.index(s.exposures[0])
+    win.tab_schedule.select(i)
+    win.replan()
+    assert len(win._plan_of(s.exposures[0]).fields) == 2
+    write(3)
+    win.set_pattern_file(i, path)  # the same file, chosen again
+    win.replan()
+    assert len(win._plan_of(s.exposures[0]).fields) == 3
+    # ⟳ in the editor: reloaded; a top cell no longer in the file falls back to the only top cell
+    s.exposures[0].top = "TOP"
+    write(4, top="NEW")
+    win.tab_schedule.editor.b_reload.click()
+    assert s.exposures[0].top == "" and len(win._plan_of(s.exposures[0]).fields) == 4
+    assert "reloaded pat.gds: 4 field(s)" in win.log_box.toPlainText()
+    os.remove(path)
+    assert not win.reload_pattern_file(i) and "ERROR reloading" in win.log_box.toPlainText()
+    assert s.exposures[0].path  # unchanged
+
+
+def test_the_selected_exposure_is_thicker_in_its_own_colour(win, tmp_path):
+    """Selected: the outlines thicker – the colour stays plain / by Field / by Dose (the toolbar's choice)."""
+    from easyebl.litho.module.view import C_PATTERN, SEL_WIDTH
+
+    path = _dose_gds(tmp_path)
+    s = Schedule([ColumnSetting(field_size="250 µm"), Exposure(chip="A", path=path)], chips=[Chip("A", ORIGIN)])
+    win.set_schedule(s)
+    win.tab_schedule.select(s.operations.index(s.exposures[0]))
+    win.replan()
+    v = win.view
+
+    def drawn(items):
+        return [it for it in items if it.xData is not None and len(it.xData)]
+
+    assert drawn([v._selected]) and not drawn([v._patterns])
+    pen = v._selected.opts["pen"]
+    assert pen.widthF() == SEL_WIDTH and pen.color().getRgb()[:3] == C_PATTERN
+    win.a_color_field.setChecked(True)
+    assert not drawn([v._selected]) and not drawn(v._colored) and len(drawn(v._colored_sel)) == 2
+    assert all(it.opts["pen"].widthF() == SEL_WIDTH for it in drawn(v._colored_sel))
+    win.a_color_dose.setChecked(True)
+    n = len(drawn(v._colored_sel))
+    assert n >= 1 and not drawn([v._selected]) and not drawn(v._colored)
+    win.tab_schedule.select(0)  # another step: the same colours, thin
+    win.replan()
+    assert not drawn(v._colored_sel) and len(drawn(v._colored)) == n

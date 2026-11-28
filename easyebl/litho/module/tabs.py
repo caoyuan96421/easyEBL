@@ -5,7 +5,7 @@ import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..schedule import (KEEP_AS_IS, MAGNIFICATIONS, ORDERS, BeamCalibrationStep, ColumnSetting, Exposure, Operation,
+from ..schedule import (KEEP_AS_IS, MAGNIFICATIONS, BeamCalibrationStep, ColumnSetting, Exposure, Operation,
                         dose_readout)
 
 __all__ = ["StagePositionsTab", "PositionsHub", "ChipsTab", "HeightDialog", "ScheduleTab", "OpEditor"]
@@ -743,7 +743,8 @@ class OpEditor(QtWidgets.QWidget):
     """Form for one operation; edits apply to the operation at once (``changed``).
 
     The window sets the providers: ``presets()`` (beam preset names | None), ``positions()``
-    ({name: StagePosition}), ``chips()`` (chip names), ``top_cells(path)``, ``current_for(op)``
+    ({name: StagePosition}), ``chips()`` (chip names), ``top_cells(path)``, ``dose_text(op)`` (the
+    doses per layer), ``local_fields(op)`` (the field name of each Local marker | None), ``current_for(op)``
     (nominal current at that step | None), ``fields_info(op)`` (text about the Exposure's fields
     and markers), ``field_centres(op)`` (CCS centres of its fields), ``field_sizes()``
     ([FieldSize]) and ``stored_beamcal()`` (the beam calibration stored for the schedule's field
@@ -751,7 +752,9 @@ class OpEditor(QtWidgets.QWidget):
 
     changed = QtCore.Signal()
     pickGdsRequested = QtCore.Signal()
+    reloadGdsRequested = QtCore.Signal()
     #: pick markers on the plot: ("global", k) one Global marker, ("global_all", -1) all in turn, ("local", -1)
+    #: Local markers added one per click, ("local_replace", r) a new position of Local marker r
     pickMarkersRequested = QtCore.Signal(str, int)
 
     def __init__(self, parent=None):
@@ -762,6 +765,8 @@ class OpEditor(QtWidgets.QWidget):
         self.positions = lambda: {}
         self.chips = lambda: []
         self.top_cells = lambda path: []
+        self.dose_text = lambda op: ""
+        self.local_fields = lambda op: []
         self.current_for = lambda op: None
         self.fields_info = lambda op: ""
         self.field_centres = lambda op: []
@@ -801,11 +806,36 @@ class OpEditor(QtWidgets.QWidget):
     def refresh_info(self) -> None:
         if self.info is not None and isinstance(self.op, Exposure):
             self.info.setText(self.fields_info(self.op))
+        self._local_fields()
+
+    def _local_fields(self) -> None:
+        """The field each Local marker is assigned to (the table's last column; — : not used)."""
+        t = getattr(self, "local_table", None)
+        if t is None or not isinstance(self.op, Exposure):
+            return
+        try:
+            if t.rowCount() != len(self.op.local_markers):
+                return
+        except RuntimeError:  # the table was deleted (the editor rebuilt)
+            return
+        names = list(self.local_fields(self.op))
+        t.blockSignals(True)
+        for r in range(t.rowCount()):
+            it = t.item(r, 2)
+            if it is None:
+                continue
+            name = names[r] if r < len(names) else None
+            it.setText(name or "—")
+            it.setForeground(QtGui.QBrush(QtGui.QColor("#ddd" if name else "#f88")))
+            it.setToolTip("" if name else "not used: in no field's field of view, only in the Global Align "
+                          "field, or its field has another marker (see the warnings)")
+        t.blockSignals(False)
 
     def set_op(self, op: Operation | None) -> None:
         self.op = None
         self.readout = None
         self.info = None
+        self.local_table = None
         self.msg.clear()
         self.body.setParent(None)
         self.body.deleteLater()
@@ -976,6 +1006,10 @@ class OpEditor(QtWidgets.QWidget):
         b.clicked.connect(self.pickGdsRequested.emit)
         row.addWidget(b, 1)
         if op.path:
+            rl = QtWidgets.QToolButton(text="⟳", toolTip="reload the GDS file from disk (after it was changed)")
+            rl.clicked.connect(self.reloadGdsRequested.emit)
+            row.addWidget(rl)
+            self.b_reload = rl
             clr = QtWidgets.QToolButton(text="×", toolTip="no GDS file (alignment only)")
             clr.clicked.connect(lambda: self._set("path", "", rebuild=True))
             row.addWidget(clr)
@@ -1004,12 +1038,6 @@ class OpEditor(QtWidgets.QWidget):
         co.setChecked(op.cell_origin)
         co.toggled.connect(lambda on: self._set("cell_origin", bool(on)))
         f.addRow(co)
-        order = QtWidgets.QComboBox()
-        for k, t in (("file", "as in the file"), ("raster", "rows, left → right"), ("serpentine", "serpentine rows")):
-            order.addItem(t, k)
-        order.setCurrentIndex(max(0, order.findData(op.order)))
-        order.currentIndexChanged.connect(lambda _: self._set("order", order.currentData()))
-        f.addRow("field order", order)
         self.info = QtWidgets.QLabel()
         self.info.setWordWrap(True)
         self.info.setStyleSheet("color:#9aa")
@@ -1023,7 +1051,12 @@ class OpEditor(QtWidgets.QWidget):
             self.readout = QtWidgets.QLabel()
             self.readout.setWordWrap(True)
             self.readout.setStyleSheet("color:#9aa")
-            f.addRow("dose factor from", self._dose_source(op))
+            self.dose_label = QtWidgets.QLabel(self.dose_text(op))
+            self.dose_label.setWordWrap(True)
+            self.dose_label.setToolTip("decided per layer from the GDS datatypes: a layer of datatype 0 only is "
+                                       "uniform (factor 1); otherwise factor = datatype / 1000 (2/500 → 0.500); "
+                                       "datatype 0 on such a layer is dose 0 (not written)")
+            f.addRow("dose factor", self.dose_label)
             d = self._spin_for(f, "dwell / point", "dwell_us", lo=0.001, hi=1e6, decimals=3, suffix=" µs", step=0.1)
             st = self._spin_for(f, "point step", "step_nm", lo=0.1, hi=1e5, decimals=2, suffix=" nm", step=1)
             d.valueChanged.connect(self._readout)
@@ -1067,30 +1100,40 @@ class OpEditor(QtWidgets.QWidget):
         g.toggled.connect(lambda on: self._set("local_align", bool(on), rebuild=True))
         lv = QtWidgets.QVBoxLayout(g)
         if op.local_align:
-            t = _table(["X (µm)", "Y (µm)"])
+            t = _table(["X (µm)", "Y (µm)", "field"])
             t.setRowCount(len(op.local_markers))
             for r, m in enumerate(op.local_markers):
                 t.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{m[0]:g}"))
                 t.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{m[1]:g}"))
+                it = QtWidgets.QTableWidgetItem()
+                it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                t.setItem(r, 2, it)
             t.setMinimumHeight(110)
+            t.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)  # Remove: one or several
             t.itemChanged.connect(lambda it, t=t: self._local_edited(t))
+            t.itemSelectionChanged.connect(self._local_buttons)
             self.local_table = t
+            self._local_fields()
             lv.addWidget(t)
             h = QtWidgets.QHBoxLayout()
-            b_add = QtWidgets.QPushButton("Add")
-            b_add.clicked.connect(lambda: self._local_add((0.0, 0.0)))
-            b_del = QtWidgets.QPushButton("Remove")
-            b_del.clicked.connect(lambda: self._local_remove(_selected_row(t)))
-            b_gen = QtWidgets.QPushButton("One per field…")
-            b_gen.setToolTip("a marker at the same place relative to every field centre (replaces the list)")
-            b_gen.clicked.connect(self._local_per_field)
-            b_pick = QtWidgets.QPushButton("Pick on the plot…")
-            b_pick.setToolTip("each click on a polygon corner or centre of the GDS (any layer) adds a marker; Esc: done")
+            b_add = QtWidgets.QPushButton("Add manually")
+            b_add.setToolTip("a new row (0, 0): type its X and Y")
+            b_add.clicked.connect(self.local_add_manually)
+            b_pick = QtWidgets.QPushButton("Pick && Add")
+            b_pick.setToolTip("each click on a polygon corner or centre of the GDS (any layer) adds a marker; "
+                              "Shift-click: the point itself; Esc: done")
             b_pick.clicked.connect(lambda: self.pickMarkersRequested.emit("local", -1))
-            self.b_pick_local = b_pick
-            for w in (b_add, b_del, b_gen, b_pick):
+            b_rep = QtWidgets.QPushButton("Pick && Replace")
+            b_rep.setToolTip("click on the plot: the new position of the selected marker")
+            b_rep.clicked.connect(self._local_pick_replace)
+            b_del = QtWidgets.QPushButton("Remove")
+            b_del.setToolTip("remove the selected marker(s)")
+            b_del.clicked.connect(lambda: self.local_remove(self._local_rows()))
+            self.b_local_add, self.b_pick_local, self.b_local_replace, self.b_local_remove = b_add, b_pick, b_rep, b_del
+            for w in (b_add, b_pick, b_rep, b_del):
                 h.addWidget(w)
             lv.addLayout(h)
+            self._local_buttons()
         v.addWidget(g)
         g = QtWidgets.QFormLayout()
         if op.global_align or op.local_align:
@@ -1101,46 +1144,6 @@ class OpEditor(QtWidgets.QWidget):
                          "within this, else repeat / continue / abort")
         v.addLayout(g)
         self.refresh_info()
-
-    def _dose_source(self, op) -> QtWidgets.QComboBox:
-        """Which GDS property gives each shape's dose factor (× the dwell); the properties holding a
-        number in the file are offered."""
-        from ..gds import GDSDoseMapping, dose_properties
-
-        box = QtWidgets.QComboBox()
-        box.setToolTip("the dose factor of each shape (× the dwell per point): a property of the GDS "
-                       "polygons, or none (all 1)")
-        try:
-            props = dose_properties(op.path)
-        except Exception as e:  # noqa: BLE001
-            props = {}
-            self.msg.setText(f"GDS properties: {type(e).__name__}: {e}")
-        box.addItem("none (all 1)", ("none", None))
-        box.addItem("any property with a number", ("property", None))
-        for attr, (n, lo, hi) in props.items():
-            rng = f"{lo:g}" if lo == hi else f"{lo:g} … {hi:g}"
-            box.addItem(f"property {attr} ({n} shapes, {rng})", ("property", attr))
-        m = op.dose
-        cur = (m.mode, m.property_attr if m.mode == "property" else None)
-        if m.mode == "auto":
-            box.addItem("auto (any property, else the datatype table)", ("auto", m.property_attr))
-            cur = ("auto", m.property_attr)
-        elif m.mode in ("datatype", "layer"):
-            box.addItem(f"{m.mode} table (from an older schedule)", (m.mode, None))
-            cur = (m.mode, None)
-        i = next((k for k in range(box.count()) if tuple(box.itemData(k)) == cur), -1)
-        if i < 0 and m.mode == "property":
-            box.addItem(f"property {m.property_attr} (not in the file)", cur)
-            i = box.count() - 1
-        box.setCurrentIndex(max(0, i))
-
-        def chosen(k):
-            mode, attr = box.itemData(k)
-            self._set("dose", GDSDoseMapping(mode=mode, property_attr=attr, table=dict(m.table), default=m.default,
-                                             value_scale=m.value_scale))
-        box.currentIndexChanged.connect(chosen)
-        self.dose_box = box
-        return box
 
     def _readout(self, *_):
         op = self.op
@@ -1189,32 +1192,52 @@ class OpEditor(QtWidgets.QWidget):
         self._set("local_markers", out)
         self.refresh_info()
 
-    def _local_add(self, p) -> None:
-        self._set("local_markers", list(self.op.local_markers) + [tuple(p)], rebuild=True)
+    def _local_rows(self) -> list:
+        """The selected rows of the Local marker table (else the current row; [] when none)."""
+        t = getattr(self, "local_table", None)
+        if t is None:
+            return []
+        rows = sorted({ix.row() for ix in t.selectionModel().selectedIndexes()})
+        if not rows and 0 <= t.currentRow() < t.rowCount():
+            rows = [t.currentRow()]
+        return rows
 
-    def _local_remove(self, r: int) -> None:
+    def _local_buttons(self) -> None:
+        n = len(self._local_rows())
+        self.b_local_remove.setEnabled(n > 0)
+        self.b_local_replace.setEnabled(n == 1)
+
+    def local_add_manually(self) -> None:
+        """A new marker (0, 0) at the end of the table, its X cell open for typing."""
+        self._set("local_markers", list(self.op.local_markers) + [(0.0, 0.0)])
+        op = self.op
+        self.set_op(op)
+        t = self.local_table
+        r = t.rowCount() - 1
+        t.setCurrentCell(r, 0)
+        t.editItem(t.item(r, 0))
+
+    def local_remove(self, rows) -> None:
+        """Remove the Local markers of table *rows*; the row after them is selected."""
         mk = list(self.op.local_markers)
-        if 0 <= r < len(mk):
+        rows = sorted({r for r in rows if 0 <= r < len(mk)})
+        if not rows:
+            self.msg.setText("select the marker(s) to remove in the table")
+            return
+        self.msg.clear()
+        for r in reversed(rows):
             del mk[r]
-            self._set("local_markers", mk, rebuild=True)
+        self._set("local_markers", mk)
+        self.set_op(self.op)
+        if mk:
+            self.local_table.selectRow(min(rows[0], len(mk) - 1))
 
-    def set_local_per_field(self, dx: float, dy: float) -> int:
-        cs = self.field_centres(self.op)
-        self._set("local_markers", [(c[0] + dx, c[1] + dy) for c in cs], rebuild=True)
-        return len(cs)
-
-    def _local_per_field(self) -> None:
-        d = QtWidgets.QDialog(self)
-        d.setWindowTitle("A local marker per field")
-        f = QtWidgets.QFormLayout(d)
-        p = _pair(-40.0, 40.0, lambda _: None)
-        f.addRow("relative to each field centre", p)
-        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        bb.accepted.connect(d.accept)
-        bb.rejected.connect(d.reject)
-        f.addRow(bb)
-        if d.exec() == QtWidgets.QDialog.Accepted:
-            self.set_local_per_field(p.spins[0].value(), p.spins[1].value())
+    def _local_pick_replace(self) -> None:
+        rows = self._local_rows()
+        if len(rows) != 1:
+            self.msg.setText("select one marker to replace in the table")
+            return
+        self.pickMarkersRequested.emit("local_replace", rows[0])
 
 
 # ====================================================================== schedule

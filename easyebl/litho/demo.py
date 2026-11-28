@@ -53,12 +53,10 @@ def make_multifield_gds(path: str, rows: int = 3, cols: int = 3, pitch: float = 
                 for j in range(6):
                     x, y = 12.0 + 3.0 * i, 12.0 + 3.0 * j
                     cell.add(gdstk.rectangle((x - 0.1, y - 0.1), (x + 0.1, y + 0.1), layer=1))
-            # ring (lower left), dose factor 1.2 as a property
-            ring = gdstk.ellipse((-22.0, -22.0), 10.0, inner_radius=7.0, layer=1, tolerance=0.05)
-            ring.set_gds_property(1, "1.2")
-            cell.add(ring)
+            # ring (lower left), dose factor 1.2: datatype 1200 (the rest of layer 1: 1000, factor 1)
+            cell.add(gdstk.ellipse((-22.0, -22.0), 10.0, inner_radius=7.0, layer=1, datatype=1200, tolerance=0.05))
             # single-pixel line (zero-width path, lower middle)
-            cell.add(gdstk.FlexPath([(-5.0, -35.0), (5.0, -10.0)], 0, layer=1))
+            cell.add(gdstk.FlexPath([(-5.0, -35.0), (5.0, -10.0)], 0, layer=1, datatype=1000))
             # field label (lower right)
             for poly in gdstk.text(f"R{r + 1}C{c + 1}", 6.0, (8.0, -30.0), layer=1):
                 cell.add(poly)
@@ -68,6 +66,9 @@ def make_multifield_gds(path: str, rows: int = 3, cols: int = 3, pitch: float = 
                     x, y = sx * 40.0, sy * 40.0
                     cell.add(gdstk.rectangle((x, y), (x - sx * 2.0, y - sy * 0.4), layer=1))
                     cell.add(gdstk.rectangle((x, y), (x - sx * 0.4, y - sy * 2.0), layer=1))
+            for poly in cell.polygons:  # layer 1 carries its dose in the datatype: factor 1 = 1000
+                if poly.layer == 1 and poly.datatype == 0:
+                    poly.datatype = 1000
             # alignment crosses (layer 2: on the sample already)
             for sx in (-1, 1):
                 for sy in (-1, 1):
@@ -92,14 +93,14 @@ def make_demo_files(folder: str) -> dict:
         return [ColumnSetting(field_size=DEMO_FIELD_SIZE, **column), BeamCalibrationStep()]
 
     s = Schedule(fixed() + [
-                  Exposure(chip=chip.name, path=gds, layers=[(1, 0)], order="raster", dwell_us=2.0, step_nm=20.0,
+                  Exposure(chip=chip.name, path=gds, layers=[1], dwell_us=2.0, step_nm=20.0,
                            global_align=True, global_markers=[(-MARK, -MARK), (MARK, MARK)],
                            local_align=True, local_markers=demo_local_markers(), view_um=10.0)],
                  name="multifield demo", chips=[chip])
     s.save(os.path.join(folder, "multifield_demo.ebls.json"))
 
     d = Schedule(fixed(current_pa=100.0) + [
-                  Exposure(label="no alignment", chip=chip.name, path=gds, layers=[(1, 0)], dwell_us=0.5),
+                  Exposure(label="no alignment", chip=chip.name, path=gds, layers=[1], dwell_us=0.5),
                   Exposure(label="align only", chip=chip.name, global_align=True,
                            global_markers=[(-MARK, -MARK), (MARK, MARK)])],
                  name="dummy demo", chips=[Chip("Demo chip", DEMO_ORIGIN)])
@@ -113,19 +114,19 @@ def make_demo_gds(path: str) -> str:
     from .gds import write_gds
     from .geometry import Pattern, Polygon, rectangle, regular_polygon
 
-    """Electrode-like demo layout with per-polygon dose factors (as properties and datatypes)."""
+    """Electrode-like demo layout with per-polygon dose factors (in the datatypes)."""
     els = []
     # four contact pads with tapered leads converging on a 2 µm gap
     for k, (sx, sy) in enumerate([(-1, -1), (1, -1), (1, 1), (-1, 1)]):
         px, py = sx * 30, sy * 25
-        els.append(rectangle(px - 8, py - 8, px + 8, py + 8, dose_factor=1.0, layer=1, datatype=0))
+        els.append(rectangle(px - 8, py - 8, px + 8, py + 8, dose_factor=1.0, layer=1))
         tip = np.array([sx * 1.0, sy * 1.0])
         base = np.array([px - sx * 8, py])
         lead = Polygon(np.array([[base[0], base[1] - 1.5], [base[0], base[1] + 1.5], [tip[0], tip[1] + 0.2],
-                                 [tip[0], tip[1] - 0.2]]), dose_factor=1.25, layer=1, datatype=1)
+                                 [tip[0], tip[1] - 0.2]]), dose_factor=1.25, layer=1)
         els.append(lead)
-    els.append(regular_polygon(0, 0, 0.6, 32, dose_factor=1.6, layer=1, datatype=2))
-    write_gds(Pattern(els), path, datatype_from_dose={1.0: 0, 1.25: 1, 1.6: 2})
+    els.append(regular_polygon(0, 0, 0.6, 32, dose_factor=1.6, layer=1))
+    write_gds(Pattern(els), path)  # datatypes 1000, 1250, 1600
     return path
 
 if __name__ == "__main__":  # pragma: no cover

@@ -13,14 +13,14 @@ An :class:`~easyebl.litho.schedule.Exposure` writes all of them (:func:`find_fie
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 import os
 
 import numpy as np
 
 from ..core.transforms import AffineTransform
-from .gds import GDSDoseMapping, GDSError
+from .gds import GDSError
 from .schedule import PatternLibrary, PatternSpec
 
 __all__ = ["FractureField", "ImportOptions", "find_fields", "order_fields", "reference_transform"]
@@ -52,7 +52,6 @@ class ImportOptions:
     top: str | None = None
     cells: list | None = None
     layers: list | None = None
-    dose: GDSDoseMapping = field(default_factory=GDSDoseMapping)
 
 
 def reference_transform(ref) -> AffineTransform:
@@ -108,7 +107,7 @@ def find_fields(path: str, options: ImportOptions | None = None, library: Patter
         raise ValueError("source must be 'auto', 'references' or 'cells'")
     out = []
     for label, cell, t in items:
-        pat = library.get(PatternSpec("gds", path, cell, o.layers, o.dose, t))
+        pat = library.get(PatternSpec("gds", path, cell, o.layers, t))
         if len(pat):
             out.append(FractureField(label, path, cell, t, pat.bbox, len(pat)))
     return out

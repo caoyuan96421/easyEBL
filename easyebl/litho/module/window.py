@@ -97,12 +97,15 @@ class LithoWindow(QtWidgets.QMainWindow):
         ed.positions = self.settings.positions
         ed.chips = lambda: [c.name for c in self.schedule.chips]
         ed.top_cells = self.library.top_cells
+        ed.dose_text = self._dose_text
+        ed.local_fields = self._local_fields
         ed.current_for = self._current_for
         ed.fields_info = self._fields_info
         ed.field_centres = self._field_centres
         ed.field_sizes = lambda: self.settings.field_sizes
         ed.stored_beamcal = self._stored_beamcal
         ed.pickGdsRequested.connect(self.pattern_for_selected)
+        ed.reloadGdsRequested.connect(self.reload_pattern_for_selected)
         ed.pickMarkersRequested.connect(lambda kind, k: self.pick_markers(kind, k))
         self.tab_schedule.changed.connect(self._schedule_edited)
         self.tab_schedule.selectionChanged.connect(lambda i: self._replan_soon())
@@ -256,7 +259,8 @@ class LithoWindow(QtWidgets.QMainWindow):
                                 "GDS: the Exposure's dose source)", lambda on: self._color_mode("dose", on), True)
         self.a_order = act("order", "Writing order", "the fields in the order they are written (numbers), and "
                            "the shapes in each field", lambda on: self.view.set_modes(order=on), True)
-        self.a_dots = act("dots", "Show dots", "the exposure points themselves (every n-th when there are very many)",
+        self.a_dots = act("dots", "Show dots", "the exposure points themselves, once the plot is zoomed in to "
+                          "50 × 50 µm or less (every n-th when there are very many)",
                           lambda on: self.view.set_modes(dots=on), True)
         self.field_actions = list(self.field_actions) + [self.a_move_pattern]
 
@@ -441,11 +445,24 @@ class LithoWindow(QtWidgets.QMainWindow):
             return f"{type(e).__name__}: {e}"
         parts = [f"{len(flds)} field(s) of {p.field_um:.4g} µm"]
         if op.global_align:
-            parts.append("Global Align in " + (flds[asg.global_field].name if asg.global_field is not None
-                                                else "NO field (not all markers in one field)"))
+            parts.append("Global Align in " + (asg.fields[asg.global_field].name + (", written: all fields in cell-name "
+                                                "order" if asg.field0 else ", then the others in cell-name order")
+                                                if asg.global_field is not None
+                                                else "NO field: the markers do not fit in one field"))
         if op.local_align:
             parts.append(f"{len(asg.local)} field(s) with a Local marker")
         return " · ".join(parts)
+
+    def _local_fields(self, op) -> list:
+        """The field name each Local marker of *op* is assigned to (None: not used)."""
+        p = self._plan_of(op)
+        if p is None:
+            return []
+        try:
+            asg = assign_markers(exposure_fields(op, self.library), op, p.field_um)
+        except Exception:  # noqa: BLE001
+            return []
+        return [asg.fields[k].name if k is not None else None for k in asg.marker_field]
 
     def _field_centres(self, op) -> list:
         try:
@@ -596,6 +613,7 @@ class LithoWindow(QtWidgets.QMainWindow):
             self.add_exposure_from_gds(p)
 
     def add_exposure_from_gds(self, path: str) -> Exposure | None:
+        self.library.forget(path)  # always the file as it is on disk now
         try:
             self.library.top_cells(path)
         except Exception as e:  # noqa: BLE001
@@ -620,6 +638,8 @@ class LithoWindow(QtWidgets.QMainWindow):
             self.set_pattern_file(i, p)
 
     def set_pattern_file(self, i: int, path: str) -> None:
+        """Exposure *i* patterns from GDS *path* – read again from disk, also when it is the same file."""
+        self.library.forget(path)
         try:
             self.library.top_cells(path)
         except Exception as e:  # noqa: BLE001
@@ -631,6 +651,44 @@ class LithoWindow(QtWidgets.QMainWindow):
         self._remember_dir(path)
         self.tab_schedule.refresh(select=i)
         self._schedule_edited()
+
+    def _dose_text(self, op) -> str:
+        """The Exposure's doses per layer (from the GDS datatypes)."""
+        from ..gds import dose_text
+
+        try:
+            return dose_text(self.library.dose_summary(op.path, op.layers))
+        except Exception as e:  # noqa: BLE001
+            return f"{type(e).__name__}: {e}"
+
+    def reload_pattern_for_selected(self):
+        i = self.tab_schedule.selected()
+        if i >= 0 and isinstance(self.schedule[i], Exposure):
+            self.reload_pattern_file(i)
+
+    def reload_pattern_file(self, i: int) -> bool:
+        """Read Exposure *i*'s GDS file again from disk (every Exposure of that file sees the new
+        contents); the top cell is kept while the file still has it."""
+        op = self.schedule[i]
+        if not op.path:
+            return False
+        self.library.forget(op.path)
+        try:
+            tops = self.library.top_cells(op.path)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"ERROR reloading {op.path}: {e}")
+            return False
+        if op.top and op.top not in tops:
+            self.log(f"reload: top cell {op.top!r} is no longer in {os.path.basename(op.path)} – "
+                     "the only top-level cell is used")
+            op.top = ""
+        self.tab_schedule.refresh(select=i)
+        self.modified = True
+        self._title()
+        self.replan()
+        p = self._plan_of(op)
+        self.log(f"reloaded {os.path.basename(op.path)}: {len(p.fields) if p else 0} field(s)")
+        return True
 
     # ================================================================ chips / view
     def _chip_fields_scs(self, name: str) -> list:
@@ -785,7 +843,8 @@ class LithoWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- marker picking
     def pick_markers(self, kind: str, index: int = -1) -> bool:
         """Pick markers of the selected Exposure on the plot: *kind* "global" (marker *index*),
-        "global_all" (1 … n in turn) or "local" (each click adds one; Esc: done).  A click snaps to the
+        "global_all" (1 … n in turn), "local" (each click adds one; Esc: done) or "local_replace" (Local
+        marker *index* moved to the click).  A click snaps to the
         nearest corner or centre of any polygon of its GDS (every layer); Shift-click takes the point."""
         if self._running():
             return False
@@ -809,6 +868,8 @@ class LithoWindow(QtWidgets.QMainWindow):
         p = self._picking
         if p["kind"] == "local":
             return f"Local markers: click a polygon corner or centre to add one ({p['added']} added)"
+        if p["kind"] == "local_replace":
+            return f"Local marker {p['k'] + 1}: click its new position (a polygon corner or centre)"
         return f"Global marker {p['k'] + 1} of {p['n']}: click a polygon corner or centre"
 
     def _marker_picked(self, x: float, y: float) -> None:
@@ -821,6 +882,12 @@ class LithoWindow(QtWidgets.QMainWindow):
             op.local_markers = list(op.local_markers) + [pt]
             p["added"] += 1
             self.log(f"Local marker {len(op.local_markers)} at CCS ({pt[0]:.3f}, {pt[1]:.3f}) µm")
+        elif p["kind"] == "local_replace":
+            mk = list(op.local_markers)
+            if 0 <= p["k"] < len(mk):
+                mk[p["k"]] = pt
+                op.local_markers = mk
+                self.log(f"Local marker {p['k'] + 1} moved to CCS ({pt[0]:.3f}, {pt[1]:.3f}) µm")
         else:
             mk = list(op.global_markers)
             mk[p["k"]] = pt
@@ -832,7 +899,7 @@ class LithoWindow(QtWidgets.QMainWindow):
             ed.set_op(op)  # the new values in the form
         self.tab_schedule.refresh(select=self.tab_schedule.selected())
         self._schedule_edited()
-        if p["kind"] == "global" or (p["kind"] == "global_all" and p["k"] >= p["n"]):
+        if p["kind"] in ("global", "local_replace") or (p["kind"] == "global_all" and p["k"] >= p["n"]):
             self.stop_pick()
         else:
             self.view.set_pick_text(self._pick_text())
@@ -1116,6 +1183,14 @@ class LithoWindow(QtWidgets.QMainWindow):
                 w = chip.height.problem(cal.z_um, check_z=True)
                 if w:
                     out.append(f"chip {chip.name}: {w}")
+        try:
+            plans = self.plans or self.replan()
+        except Exception:  # noqa: BLE001
+            plans = []
+        for p in plans or []:
+            op = self.schedule[p.index] if p.index < len(self.schedule) else None
+            if p.index >= start and op is not None and op.enabled:
+                out.extend(f"step {p.index + 1}: {e}" for e in getattr(p, "errors", []))
         if start >= len(FIXED_STEPS) and fs is not None:
             try:
                 mag = self.hw.magnification()

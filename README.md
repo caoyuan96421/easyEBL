@@ -436,14 +436,16 @@ image*).  It shows:
 
 - every chip: its CCS origin and x / y axes (nominal, or as measured by a Global Align);
 - every field of every Exposure: its field of view (dashed), its pattern where the chip map puts
-  it, and the selected step's fields highlighted; the whole GDS – every layer, also shapes in no
+  it, and the selected step's fields drawn thicker (in the same colours); the whole GDS – every layer, also shapes in no
   field such as markers placed in the top cell itself – is drawn gray underneath, so what the
   Exposure does not write stays gray;
-- with the toolbar's drawing modes: the patterns **coloured by field** or **by dose factor** (a
-  colour scale from the lowest to the highest factor, shown top right), the **writing order** (the
+- with the toolbar's drawing modes: the patterns **coloured by field** or **by dose factor** (the
+  viridis colour map from the lowest to the highest factor, its **colour bar** with labelled ticks on
+  the plot's right edge; dose 0 gray), the **writing order** (the
   fields numbered in turn, ▲ the first, and dotted lines through the shapes of each field in the
-  order they are written) and the **exposure points** themselves (*Show dots*; above 400 000 points
-  every n-th is drawn);
+  order they are written) and the **exposure points** themselves (*Show dots*: once the plot is zoomed in
+  to 50 × 50 µm or less, only the points in the region shown – computed again as it moves; above
+  400 000 points every n-th is drawn);
 - the alignment markers (Global: magenta, Local: cyan);
 - the named stage positions, and the stage with its current field of view: the full deflection
   field (green) and, when the SEM imaging window scans a reduced or shifted area, that area (red).
@@ -586,22 +588,32 @@ step.  When nothing could be fitted at all (no grid found) there is nothing to u
   - *Column setting*: the field size (the first one: the schedule's), a beam preset of the
     microscope module (or *Keep as is*), an optional nominal current for the dose readout.
   - *Beam calibration*: on the calibration sample, with its settings.
-  - *Exposure*: a chip and a whole GDS file (top cell, layers, offset of the GDS origin in CCS).
+  - *Exposure*: a chip and a whole GDS file (top cell, layers, offset of the GDS origin in CCS); choosing the
+    file – also the same one again – reads it from disk, and **⟳** next to it reloads it after it changed.
     Each top-level cell (the references placed by the top cell, array elements included) is one
     field; its centre is the cell's bounding-box centre, or (checkbox) the cell's origin.
-    Dwell per point and point step (GDS dose factors multiply the dwell).  *Dose factor from*: none
-    (all 1), any property with a number, or one GDS property – the properties holding numbers in the
-    file are listed with their shape count and range.  Markers are CCS
-    points: **Global Align** 2–4 markers, all inside one field's field of view – that field is
-    written first; they are measured twice (1 → 2 → 1 → 2), the second pass predicted from the
+    Dwell per point and point step (GDS dose factors multiply the dwell).  **The dose factor comes
+    from the datatype, decided layer by layer** (no setting; the editor shows it per layer): a layer
+    whose shapes all have datatype 0 is written at the plain dose (factor 1); a layer with other
+    datatypes carries the dose in them – factor = datatype / 1000 (2/500 → 0.500, 2/1000 → 1.000,
+    2/1250 → 1.250); datatype 0 on such a layer is dose 0 (not written, a warning).  With layers
+    1 and 2 selected, 1/0 and 2/500, 2/1000 in the file: layer 1 at the plain dose, layer 2 at 0.5×
+    and 1×.  Markers are CCS points: **Global Align** 2–4 markers – inside one field's field of view:
+    that field is aligned and written first, then the others in cell-name order; in no field's but
+    within one field size: a dummy **Field 0** centred on them (drawn and labelled on the plot) is
+    aligned first and nothing written there, then every field in cell-name order (with its Local
+    marker, or no further alignment); wider than a field: an error, the schedule does not run.
+    Cell-name order compares numbers as numbers (Field_2 before Field_10).  They are measured twice (1 → 2 → 1 → 2), the second pass predicted from the
     first, and the two passes must agree within the *alignment tolerance* (default 0.5 µm; the
     mean is used) – else *Repeat*, *Continue anyway* (an override) or *Abort*; **Local
-    markers**, assigned automatically to the field whose field of view holds them (nearest
-    centre), at most one per field (*One per field…* puts one at the same place in every
-    field).  Wrong assignments are warnings.  Without a GDS file the step only aligns.
+    markers**, assigned automatically to fields whose field of view holds them, at most one per
+    field, so that as many fields as possible get one (then the nearest centres) – the table's
+    *field* column shows each marker's field (— : not used); its buttons: *Add manually* (a row to type X, Y
+    in), *Pick & Add*, *Pick & Replace* (the selected marker moved to a click) and *Remove* (the
+    selected rows).  Wrong assignments are warnings.  Without a GDS file the step only aligns.
     **Markers are picked on the plot**: *Pick* (one Global marker), *Pick all on the plot…*
-    (marker 1, 2, … in turn) and, for Local markers, *Pick on the plot…* (each click adds one,
-    Esc ends).  A click snaps to the nearest corner or centre of any polygon of the Exposure's
+    (marker 1, 2, … in turn) and, for Local markers, *Pick & Add* (each click adds one, Esc
+    ends) and *Pick & Replace* (one click).  A click snaps to the nearest corner or centre of any polygon of the Exposure's
     GDS – every layer, exposed or not, also shapes in the top cell itself – within 12 screen
     pixels (ringed in yellow while the mouse moves; nothing near: nothing taken); Shift-click
     takes the clicked point itself; Esc or a right click ends picking.
@@ -632,8 +644,8 @@ step.  When nothing could be fitted at all (no grid found) there is nothing to u
   the run.  Then the SEM scan stops and the pattern is written through the chain.  A pattern
   outside the field is skipped or aborts, as set in *Schedule settings*.
 * **Demo files**: `python -m easyebl.litho.demo` writes them to `examples/litho/`:
-  `multifield_demo.gds` (3 × 3 fields of 80 µm on a 100 µm pitch; layer 1 the pattern, layer 2
-  alignment crosses at (±45, ±45) µm), `multifield_demo.ebls.json` (field size 250 µm, chip at
+  `multifield_demo.gds` (3 × 3 fields of 80 µm on a 100 µm pitch; layer 1 the pattern, its dose in
+  the datatype – 1000, the rings 1200 –, layer 2 alignment crosses at (±45, ±45) µm), `multifield_demo.ebls.json` (field size 250 µm, chip at
   stage (5000, 5000) µm, the fixed steps – record the calibration sample and its WD1 –, one
   Exposure of layer 1 with Global Align in the first field and a Local marker in every other) and
   `dummy_demo.ebls.json` (the GDS without alignment, then an alignment-only Exposure).
@@ -681,7 +693,7 @@ handle sharing, lag handling, dose quantisation).
 | **Imaging** | Pixel staircase with configurable **pre‑line** (overscan ramp or hold, optionally blanked), **flyback** (linear/cosine/step, blanked by default), frame settle, bidirectional scans, scan rotation, frame averaging, per‑pixel settle discard, fractional **lag compensation**, live rows, sync marker lines for EDS. |
 | **Alignment** | Sub‑pixel normalised cross‑correlation; cross/square/image templates; **bidirectional averaging** cancels deflection/video lag (the lag is reported as a health check); translation/rigid/similarity/affine fits; rejection of weak or inconsistent marks. |
 | **Vector litho** | Grid‑aligned raster fill (even–odd, so holes and keyhole polygons work), serpentine or unidirectional fill along x or y; single‑pass lines; dots; blanked jumps with distance‑dependent settle; step‑and‑blank mode; **blanker‑delay compensation**; dose **error diffusion**; streaming in chunks; abort. |
-| **GDS** | Flattened hierarchy and arrays; layer/datatype filter; dose factor from a GDS **property** (e.g. `"1.25"` or `"dose=1.25"`) or a **datatype/layer → factor table** (dose classes from fractured/PEC'd exports such as BEAMER); paths become polygons. |
+| **GDS** | Flattened hierarchy and arrays; layer/datatype filter; dose factor from the **datatype, per layer** (datatype 0 only: uniform; else datatype / 1000; written back the same way); paths become polygons. |
 | **Dose utility** | Area/line/dot dose ↔ dwell, step from field and points, DAC resolution, clock quantisation, write time, plus warnings. |
 
 ## Tests
@@ -697,7 +709,7 @@ Subsystem tests check physical outcomes on the simulator. For example:
 * images match the specimen, and the measured lag shift and its compensation are correct;
 * alignment recovers a known transform to well below a pixel, and a unidirectional scan is biased;
 * exposed dose is uniform and correct inside polygons, and **zero** outside;
-* dose factors from GDS properties or datatypes scale the delivered dose;
+* dose factors from GDS datatypes scale the delivered dose;
 * a late blanker leaves dose trails, and compensating for it removes them;
 * imaging, alignment and lithography share one device without conflicts.
 

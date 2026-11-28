@@ -17,7 +17,7 @@ from easyebl.litho.height import ChipHeight, fit_plane, z_problem
 from easyebl.litho.runner import ScheduleRunner, SimulatedHardware, StageError
 from easyebl.litho.schedule import (FIXED_STEPS, BeamCalibrationStep, Chip, ColumnSetting, Exposure, PatternLibrary,
                                     Schedule, ScheduleError, assign_markers, dose_readout, exposure_fields,
-                                    find_beamcal, plan)
+                                    FIELD0_NAME, find_beamcal, plan)
 from easyebl.litho.settings import FieldSize, LithoSettings, StagePosition
 
 CAL = FieldCalConfig(settle_s=0.0)
@@ -169,15 +169,26 @@ def test_marker_assignment(frac_gds):
     f = exposure_fields(e, lib)
     a = assign_markers(f, e, 100.0)
     assert a.global_field == 1 and a.order == [1, 0, 2]  # the Global Align field first
-    assert a.local == {0: (-40.0, 40.0), 2: (210.0, 5.0)}  # nearest wins, the global field's is dropped
+    assert a.local == {0: (-40.0, 40.0), 2: (210.0, 5.0)}  # nearest wins, the global field takes none
+    assert a.marker_field == [0, None, None, None, 2]
     w = "\n".join(a.warnings)
-    assert "is the Global Align field" in w and "(500, 0) is in no field" in w and "two Local markers" in w
-    e.global_markers = [(0.0, 0.0), (120.0, 0.0)]  # in two fields
+    assert "only in the Global Align field" in w and "(500, 0) is in no field" in w
+    assert "(240, 0) is not used: its field(s) F2 #3 have another" in w
+    # in no field's field of view, but within one field size: a dummy Field 0 (last), aligned first,
+    # then every field in cell-name order
+    e.global_markers = [(55.0, -10.0), (65.0, 10.0)]
     a = assign_markers(f, e, 100.0)
-    assert a.global_field is None and any("not all inside" in x for x in a.warnings)
+    assert a.field0 and a.global_field == 3 and len(a.fields) == 4 and not a.errors
+    f0 = a.fields[3]
+    assert f0.name == FIELD0_NAME and f0.centre_ccs == (60.0, 0.0) and not f0.path
+    assert a.order == [3, 0, 1, 2] and 3 not in a.local
+    # wider than a field: an error (the step cannot run)
+    e.global_markers = [(0.0, 0.0), (120.0, 0.0)]
+    a = assign_markers(f, e, 100.0)
+    assert a.global_field is None and a.errors and "do not fit in one field" in a.errors[0]
     e.global_markers = [(0.0, 0.0)]
     assert any("2–4 markers" in x for x in assign_markers(f, e, 100.0).warnings)
-    e2 = Exposure(chip="c", path=frac_gds, local_align=True, local_markers=[(0.0, 0.0)], order="raster")
+    e2 = Exposure(chip="c", path=frac_gds, local_align=True, local_markers=[(0.0, 0.0)])
     a = assign_markers(f, e2, 100.0)
     assert a.global_field is None and any("2 field(s) without a Local marker" in x for x in a.warnings)
 
@@ -297,8 +308,6 @@ def test_schedule_chips_roundtrip_and_errors(tmp_path, frac_gds):
         Schedule.from_dict(d)
     with pytest.raises(ScheduleError):
         Schedule.from_dict({"format": "other"})
-    with pytest.raises(ScheduleError):
-        Exposure(order="random")
     with pytest.raises(ScheduleError, match="tolerance"):
         Exposure(align_tolerance_um=0.0)
     assert "µC/cm²" in dose_readout(1.0, 20.0, 100.0) and "unknown" in dose_readout(1.0, 20.0, None)
@@ -457,7 +466,7 @@ def test_global_align_holds_for_later_exposures_of_the_chip(demo):
     gds = Schedule.load(demo["schedule"]).exposures[0].path
     chip = Chip("C", ORIGIN)
     s = _schedule(Exposure(chip="C", global_align=True, global_markers=[(-MARK, -MARK), (MARK, MARK)]),
-                  Exposure(chip="C", path=gds, layers=[(1, 0)]), fs="250 µm", chips=[chip])
+                  Exposure(chip="C", path=gds, layers=[1]), fs="250 µm", chips=[chip])
     hw = SimulatedHardware(_rot(0.3), **DEMO_HW)
     events = []
     kw = _calibrated(mag=500, fs="250 µm")
@@ -944,3 +953,40 @@ def test_a_run_starts_with_the_sem_running_and_parks_only_when_done(frac_gds):
     hw = SimulatedHardware(start=ORIGIN)
     assert ScheduleRunner(s, hw, **_calibrated()).run(N_FIXED) == "failed"
     assert hw.calls == [("prepare",)]
+
+
+def test_global_align_in_a_dummy_field_0(demo):
+    """The Global Align markers in no field (but within one field size): Field 0 is aligned first,
+    nothing written there, then every field in cell-name order; markers wider than a field: the
+    Exposure cannot run."""
+    gds = Schedule.load(demo["schedule"]).exposures[0].path
+    chip = Chip("C", ORIGIN)
+    e = Exposure(chip="C", path=gds, layers=[1], global_align=True, global_markers=[(-200.0, -200.0), (-160.0, -160.0)])
+    s = _schedule(e, fs="250 µm", chips=[chip])
+    hw = SimulatedHardware(_rot(0.3), **DEMO_HW)
+    events = []
+    kw = _calibrated(mag=500, fs="250 µm")
+    kw["field_sizes"] = None
+    r = ScheduleRunner(s, hw, on_event=lambda k, d: events.append((k, d)), **kw)
+    assert r.run(N_FIXED) == "done" and len(hw.exposures) == 9
+    names = [d["name"] for k, d in events if k == "field" and d["state"] == "running"]
+    assert names[0] == FIELD0_NAME and names[1:] == sorted(names[1:]) and len(names) == 10
+    e.global_markers = [(-200.0, -200.0), (200.0, 200.0)]  # wider than a field: cannot run
+    log = []
+    r = ScheduleRunner(s, SimulatedHardware(_rot(0.3), **DEMO_HW), on_event=lambda k, d: log.append(d.get("text", "")),
+                       **kw)
+    assert r.run(N_FIXED) == "failed" and any("do not fit in one field" in t for t in log)
+
+
+def test_local_markers_cover_as_many_fields_as_possible(frac_gds):
+    """Nearest-centre alone would give F1 both markers; the assignment covers both fields."""
+    lib = PatternLibrary()
+    e = Exposure(chip="c", path=frac_gds, local_align=True, local_markers=[(50.0, 0.0), (10.0, 0.0)])
+    f = exposure_fields(e, lib)
+    a = assign_markers(f, e, 200.0)  # ±100 µm: (50, 0) is in F1 and F2 #2, (10, 0) only in F1
+    assert a.marker_field == [1, 0] and a.local == {0: (10.0, 0.0), 1: (50.0, 0.0)}
+    assert any("1 field(s) without a Local marker: F2 #3" in w for w in a.warnings)
+    # several ways to cover the same fields: the nearest centres
+    e.local_markers = [(20.0, 0.0), (5.0, 0.0), (130.0, 0.0)]
+    a = assign_markers(f, e, 200.0)
+    assert a.local[0] == (5.0, 0.0) and a.marker_field[0] in (1, 2) and a.marker_field[2] in (1, 2)

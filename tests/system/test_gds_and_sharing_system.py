@@ -10,7 +10,6 @@ from easyebl.hal import DeviceBusyError, SimParams, make_demo_sample
 from easyebl.imaging import RasterConfig, RasterImager
 from easyebl.litho import (
     ExposureParameters,
-    GDSDoseMapping,
     LithoWriter,
     Pattern,
     VectorScanSettings,
@@ -35,15 +34,12 @@ def dose_in(sim, poly, shrink=2):
     return float(np.median(sim.dose.dose_uC_cm2()[core]))
 
 
-@pytest.mark.parametrize("mode", ["property", "datatype"])
-def test_beamer_like_gds_doses(make_manager, calibration, tmp_path, mode):
-    # three dose classes, carried both as properties and as datatypes
+def test_beamer_like_gds_doses(make_manager, calibration, tmp_path):
+    # three dose classes, carried as datatypes (factor × 1000)
     pads = [rectangle(-30 + 22 * k, -5, -18 + 22 * k, 5, dose_factor=f, layer=1) for k, f in enumerate([0.8, 1.0, 1.4])]
     f = tmp_path / "pec.gds"
-    write_gds(Pattern(pads), f, datatype_from_dose={0.8: 10, 1.0: 11, 1.4: 12})
-    mapping = GDSDoseMapping("property") if mode == "property" else GDSDoseMapping(
-        "datatype", table={10: 0.8, 11: 1.0, 12: 1.4})
-    pat = read_gds(f, dose=mapping)
+    write_gds(Pattern(pads), f)
+    pat = read_gds(f)
     assert sorted(pat.dose_factors()) == [0.8, 1.0, 1.4]
 
     m = make_manager(SimParams(beam_current_a=I, lag_tau_s=3e-6, dose_pixel_um=0.1))
