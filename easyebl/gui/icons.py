@@ -78,6 +78,24 @@ def _capture(p):
     p.drawEllipse(QtCore.QPointF(16, 18), 5, 5)
 
 
+def _record(p):
+    """A red dot in a ring (start recording)."""
+    _pen(p, FG, 2.0)
+    p.drawEllipse(QtCore.QPointF(16, 16), 11, 11)
+    p.setPen(QtCore.Qt.NoPen)
+    p.setBrush(RED)
+    p.drawEllipse(QtCore.QPointF(16, 16), 7, 7)
+
+
+def _record_stop(p):
+    """A red square in a red ring (recording: stop it)."""
+    _pen(p, RED, 2.0)
+    p.drawEllipse(QtCore.QPointF(16, 16), 11, 11)
+    p.setPen(QtCore.Qt.NoPen)
+    p.setBrush(RED)
+    p.drawRect(QtCore.QRectF(11, 11, 10, 10))
+
+
 def _full_fov(p):
     _pen(p)
     for sx, sy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
@@ -309,7 +327,8 @@ def _dots(p):
 
 
 _DRAW = {
-    "run": _run, "stop": _stop, "single": _single, "capture": _capture, "full_fov": _full_fov,
+    "run": _run, "stop": _stop, "single": _single, "capture": _capture, "record": _record,
+    "record_stop": _record_stop, "full_fov": _full_fov,
     "focus": _focus, "stig": _stig, "gun": _gun, "acb": _acb, "crosshair": _crosshair,
     "scan_line": _scan_line, "inset": _inset, "advanced": _advanced, "full_screen": _full_screen, "column": _column,
     "pan": _pan, "point": _point, "rect": _rect, "ellipse": _ellipse, "line": _line, "map": _map,

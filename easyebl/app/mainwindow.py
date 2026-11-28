@@ -3,7 +3,7 @@
 * **Centre** – tabs *SEM*, *EDS*, *Lithography*: the image / spectrum / stage plot of each, with
   its tools at the top (icon, text under it).
 * **Left** – the microscope: column (HV, field size, magnification, focus, stigmator, beam, display)
-  and stage (STOP, position, moves), the stage positions, and the beam monitor (the scan coils'
+  and stage (STOP, position, moves, the stage positions), and the beam monitor (the scan coils'
   X / Y as an oscilloscope in XY mode).
 * **Right** – the settings of the subsystem of the active tab (SEM scan / field of view / column,
   EDS acquire / map / composition with the Data Manager under them, lithography chips and
@@ -524,7 +524,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_dock = self._dock("Microscope", "main_left", QtCore.Qt.LeftDockWidgetArea)
         self.right_dock = self._dock("Settings", "main_right", QtCore.Qt.RightDockWidgetArea)
         self.bottom_dock = self._dock("Data", "main_bottom", QtCore.Qt.BottomDockWidgetArea)
-        # left: the microscope's tools, Column / Stage, the stage positions, the beam monitor
+        # left: the microscope's tools, Column / Stage (with the stage positions), the beam monitor
         self.left = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(self.left)
         lv.setContentsMargins(2, 2, 2, 2)
@@ -532,14 +532,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.left_split.setChildrenCollapsible(False)
         self.left_tabs = QtWidgets.QTabWidget()
-        self.positions_box = QtWidgets.QGroupBox("Stage positions")
-        QtWidgets.QVBoxLayout(self.positions_box).setContentsMargins(*_BOX_MARGINS)
         self.monitor_box = QtWidgets.QGroupBox("Beam monitor")
         QtWidgets.QVBoxLayout(self.monitor_box).setContentsMargins(*_BOX_MARGINS)
-        for w in (self.left_tabs, self.positions_box, self.monitor_box):
+        for w in (self.left_tabs, self.monitor_box):
             self.left_split.addWidget(w)
-        self.left_split.setStretchFactor(0, 1)
-        self.left_split.setStretchFactor(2, 1)
+        self.left_split.setStretchFactor(0, 3)
+        self.left_split.setStretchFactor(1, 1)
         lv.addWidget(self.left_split, 1)
         self.left_dock.setWidget(self.left)
         # right: the active subsystem's settings
@@ -674,6 +672,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.notify(f"{title}: cannot open – {why}")
             self._install(key, title, win, why)
         self._install_microscope(st)
+        self._litho_positions_back()
         self._install_monitor()
         if self.mic is not None and self.sem is not None:  # the column's AGA: the SEM tab's (scan handed back)
             self.mic.aga_handler = self.sem.auto_gun_alignment
@@ -682,8 +681,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sem_mini.on_pick = self._pick_started
             self.bottom.addTab(self.sem_mini, "SEM view")
         self._order_bottom()
-        if self.positions_box.layout().count() == 0:
-            self._fill(self.positions_box, _placeholder("Stage positions: the Lithography is not available"))
         if self.spectrum_box.layout().count() == 0:
             self._fill(self.spectrum_box, _placeholder("EDS not available"))
         self._activate()
@@ -780,17 +777,23 @@ class MainWindow(QtWidgets.QMainWindow):
         w = host.window
         tabs = _take_dock(w, "litho-side")
         host.log = _take_dock(w, "litho-log")
-        i = tabs.indexOf(w.tab_positions)
+        i = tabs.indexOf(w.tab_positions)  # the Stage tab has the same list (put back without a microscope)
         if i >= 0:
+            self._litho_positions = (tabs, i, tabs.tabText(i), w.tab_positions)
             tabs.removeTab(i)
         host.right = tabs
-        self._fill(self.positions_box, w.tab_positions)
-        host.moved.append(w.tab_positions)
         cal = CalibrationView(w)
         self._bottom_page(host, cal, "Calibration")
         al = AlignmentView(w)
         self._bottom_page(host, al, "Alignment")
         self.calibration_view, self.alignment_view = cal, al
+
+    def _litho_positions_back(self) -> None:
+        """No microscope (no Stage tab): the Lithography keeps its own Stage positions tab."""
+        kept, self._litho_positions = getattr(self, "_litho_positions", None), None
+        if kept is not None and self.mic is None:
+            tabs, i, title, w = kept
+            tabs.insertTab(i, w, title)
 
     def _bottom_page(self, host: ModuleHost, widget, title: str) -> None:
         if widget is None:
@@ -824,7 +827,6 @@ class MainWindow(QtWidgets.QMainWindow):
             p.setParent(None)
         for p, title in zip(panels, ("Column", "Stage")):
             self.left_tabs.addTab(p, title)
-        self._hide_stage_position_copy(panels[1] if len(panels) > 1 else None)
         for tb in mic.findChildren(QtWidgets.QToolBar):
             if tb.parent() is mic:
                 mic.removeToolBar(tb)
@@ -844,14 +846,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().addWidget(lab)
             lab.show()
         self.left_tabs.setCurrentIndex(0)
-
-    def _hide_stage_position_copy(self, stage_panel) -> None:
-        """The Stage tab's own copy of the stage positions: the Stage positions panel has them."""
-        if stage_panel is None:
-            return
-        for g in stage_panel.findChildren(QtWidgets.QGroupBox):
-            if g.title().replace("&", "").lower().startswith("stage positions"):
-                g.hide()
 
     def _install_monitor(self) -> None:
         from ..gui.scanmonitor import ScanMonitorWidget
@@ -909,7 +903,7 @@ class MainWindow(QtWidgets.QMainWindow):
             w.setParent(None)
             w.deleteLater()
         self._filled.clear()
-        for box in (self.positions_box, self.spectrum_box):
+        for box in (self.spectrum_box,):
             while box.layout().count():
                 box.layout().takeAt(0)
         self.live_spectrum = None
@@ -1090,7 +1084,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resizeDocks([self.bottom_dock], [230], QtCore.Qt.Vertical)
         w = max(900, self.width() - 760)
         self.bottom_split.setSizes([int(w * 0.38), int(w * 0.32), int(w * 0.30)])
-        self.left_split.setSizes([480, 300, 260])
+        self.left_split.setSizes([780, 260])
 
     def reset_layout(self) -> None:
         self.default_layout()

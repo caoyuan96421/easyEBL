@@ -23,6 +23,10 @@ from .sem import MAGNIFICATIONS, PRESET_KEYS, SCAN_MODES, SEMControl
 from .settings import MicroscopeSettings
 from .stage import AXES, StageControl
 
+_DRO_STYLE = "background:#111;color:%s;border:1px solid #333;padding:0px 4px"
+#: a stage axis's motion state -> its DRO's colour (normal: green)
+_STATE_COLOR = {"moving": "#fb4", "halted": "#f90", "limit": "#f55", "fault": "#f55", "uncertain": "#f55"}
+
 __all__ = ["MicroscopeWindow", "BeamPresetDialog"]
 
 STATE_COLORS = {"connected": "#4c4", "uncertain": "#fb4", "disconnected": "#f55", "closed": "#888"}
@@ -145,12 +149,74 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.b_hv.setStyleSheet("QPushButton{background:%s;color:white;font-weight:bold}"
                                 % ("#8a2c2c" if on else "#2e7d32"))
 
-    def toggle_hv(self) -> None:
+    #: how long HV ON / OFF may take before the window gives up waiting (s); re-read every HV_POLL_S
+    HV_TIMEOUT_S = 120.0
+    HV_POLL_S = 1.0
+
+    def toggle_hv(self):
+        """HV ON / OFF (asks first); a modal window until the SEM reports it on / off."""
         sem = self.sem
         if sem.state.get("hv_on"):
-            self._confirmed("Switch the high voltage OFF?", sem.hv_off, "HV OFF")
+            target, title = False, "HV OFF"
+            fut = self._confirmed("Switch the high voltage OFF?", sem.hv_off, title)
+            text = "Switching the high voltage OFF – waiting until the SEM reports it off."
         else:
-            self._confirmed(f"Switch the high voltage ON at {sem.DEFAULT_HV_KV:g} kV?", sem.hv_on, "HV ON")
+            kv = self._hv_value()
+            target, title = True, "HV ON"
+            fut = self._confirmed(f"Switch the high voltage ON at {kv:g} kV?", lambda: sem.hv_on(kv), title)
+            text = f"Switching the high voltage ON at {kv:g} kV – waiting until the SEM reports it on."
+        if fut is None:
+            return None
+        self._wait_hv(fut, target, title, text)
+        return fut
+
+    def _wait_hv(self, fut, target: bool, title: str, text: str) -> None:
+        """The blocking window of HV ON / OFF: closes when the command has been answered and HV reads
+        *target* (HV is read again every HV_POLL_S while it does not), or on an error / time-out."""
+        from ..gui.busy import BusyDialog
+
+        dlg = BusyDialog(title, text, self)
+        self.hv_busy = dlg
+        t0 = time.monotonic()
+        st = {"read": None, "t_read": t0}
+        timer = QtCore.QTimer(dlg)
+
+        def end(ok: bool, msg: str = "") -> None:
+            timer.stop()
+            if msg:
+                self.notify(msg)
+            dlg.finish(ok)
+            if self.hv_busy is dlg:
+                self.hv_busy = None
+            self._sync_all()
+
+        def check() -> None:
+            if not fut.done():
+                pass
+            elif fut.exception() is not None:
+                e = fut.exception()
+                return end(False, f"{title}: {type(e).__name__}: {e}")
+            elif self.sem.state.get("hv_on") is target:
+                kv = self.sem.state.get("hv_kv")
+                return end(True, f"high voltage ON at {kv:g} kV" if target and kv else
+                           f"high voltage {'ON' if target else 'OFF'}")
+            elif ((st["read"] is None or st["read"].done())
+                  and time.monotonic() - st["t_read"] >= self.HV_POLL_S):  # answered, not there yet: read HV
+                st["t_read"] = time.monotonic()
+                try:
+                    st["read"] = self.sem.refresh(("HV", "EMI"))
+                except Exception:  # noqa: BLE001
+                    pass
+            el = time.monotonic() - t0
+            dlg.set_progress(f"{el:.0f} s")
+            if el > self.HV_TIMEOUT_S:
+                end(False, f"{title}: the SEM did not report HV {'on' if target else 'off'} "
+                           f"within {self.HV_TIMEOUT_S:.0f} s")
+
+        timer.timeout.connect(check)
+        timer.start(250)
+        dlg.show_busy()
+        check()
 
     def _sem_panel(self):
         """The column, compact (it fits the left side bar of the main window at 1080p): every
@@ -177,18 +243,19 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.l_emi = QtWidgets.QLabel("emission —")
         self.l_emi.setStyleSheet(_NOTE)
         self.l_emi.setToolTip("emission current (R EMI, in µA)")
-        self.hv_set = _dspin(0.3, 30.0, 2, 20.0, 0.1, " kV")
-        self.hv_set.setToolTip("setpoint: 0.30–9.99 kV in 0.01 kV, 10.0–30.0 kV in 0.1 kV steps")
-        self.b_hv_set = QtWidgets.QPushButton("Set")
-        self.b_hv_set.clicked.connect(self.apply_hv)
+        self.hv_set = _dspin(0.3, 30.0, 2, sem.DEFAULT_HV_KV, 0.1, " kV")
+        self.hv_set.setToolTip("0.30–9.99 kV in 0.01 kV, 10.0–30.0 kV in 0.1 kV steps.  HV on: Enter (or leaving "
+                               "the box) sets it on the SEM.  HV off: not sent – HV ON switches on at this value "
+                               "(30 kV at start unless HV is already on)")
+        self.hv_set.editingFinished.connect(self.apply_hv)
         self.b_hv = QtWidgets.QPushButton("HV ON")  # one button: switches to the other state (asks first)
         self.b_hv.setToolTip("switch the high voltage on / off (asks first)")
         self.b_hv.clicked.connect(self.toggle_hv)
+        self.hv_busy = None  # the modal window while HV switches (easyebl.gui.busy.BusyDialog)
         self._hv_button(None)
         f.addWidget(self.l_hv, 0, 0)
         f.addWidget(self.l_emi, 0, 1, 1, 3)
-        f.addWidget(self.hv_set, 1, 0)
-        f.addWidget(self.b_hv_set, 1, 1)
+        f.addWidget(self.hv_set, 1, 0, 1, 2)
         f.addWidget(self.b_hv, 1, 2, 1, 2)
 
         # --- exposure field size (the Lithography's) and magnification
@@ -328,8 +395,11 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         grid = QtWidgets.QGridLayout(g)
         grid.setContentsMargins(6, 4, 6, 4)
         grid.setVerticalSpacing(2)
-        self.dro, self.dro_state = {}, {}
-        for i, a in enumerate(AXES):
+        self.dro, self.dro_state = {}, {}  # dro_state: the axis's motion state (the value's colour)
+        rows = (("X", "Y", "Z"), ("R", "T"))  # several axes per row: compact
+        cell = {a: (i, j) for i, row in enumerate(rows) for j, a in enumerate(row)}
+        for a in AXES:
+            i, j = cell[a]
             name = QtWidgets.QLabel(a)
             name.setStyleSheet("font-weight:bold;color:#9cf")
             val = DROLabel("—")
@@ -338,18 +408,19 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             fv.setFamily("Consolas")
             fv.setBold(True)
             val.setFont(fv)
-            val.setStyleSheet("background:#111;color:#7f7;border:1px solid #333;padding:0px 6px")
-            val.setMinimumWidth(140)
+            val.setStyleSheet(_DRO_STYLE % "#7f7")
+            val.setMinimumWidth(70)
+            val.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
             val.setToolTip(f"double-click: move {a}")
             val.double_clicked.connect(lambda a=a: self.open_move_dialog(a))
-            state = QtWidgets.QLabel("—")
-            state.setStyleSheet("color:#bbb")
-            grid.addWidget(name, i, 0)
-            grid.addWidget(val, i, 1)
-            grid.addWidget(QtWidgets.QLabel(st.unit(a)), i, 2)
-            grid.addWidget(state, i, 3)
-            self.dro[a], self.dro_state[a] = val, state
-        grid.setColumnStretch(1, 1)
+            unit = QtWidgets.QLabel(st.unit(a))
+            unit.setMinimumWidth(18)
+            grid.addWidget(name, i, 3 * j)
+            grid.addWidget(val, i, 3 * j + 1)
+            grid.addWidget(unit, i, 3 * j + 2)
+            self.dro[a], self.dro_state[a] = val, "—"
+        for j in range(3):
+            grid.setColumnStretch(3 * j + 1, 1)
         r = QtWidgets.QHBoxLayout()
         b = QtWidgets.QPushButton("Read now")
         b.clicked.connect(self.refresh_stage)
@@ -364,7 +435,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.l_read = QtWidgets.QLabel("")
         self.l_read.setStyleSheet(_NOTE)
         r.addWidget(self.l_read)
-        grid.addLayout(r, len(AXES), 0, 1, 4)
+        grid.addLayout(r, len(rows), 0, 1, 9)
         lay.addWidget(g)
 
         # --- jog
@@ -556,9 +627,21 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             return None
         return self._call(fn, what=what)
 
+    def _hv_value(self) -> float:
+        """The box's voltage in the S-3000's steps (0.01 kV below 10 kV, 0.1 kV above)."""
+        v = self.hv_set.value()
+        return round(v, 2 if v < 10 else 1)
+
     def apply_hv(self):
-        v = round(self.hv_set.value(), 2 if self.hv_set.value() < 10 else 1)
-        self._call(self.sem.set_hv, f"{v:.2f}" if v < 10 else f"{v:.1f}", what="HV setpoint")
+        """The voltage box (Enter / leaving it): while HV is on, sent to the SEM (in its steps);
+        while off, only kept for the next HV ON."""
+        v = self._hv_value()
+        if abs(self.hv_set.value() - v) > 1e-9:
+            self.hv_set.setValue(v)
+        s = self.sem.state
+        if not s.get("hv_on") or (s.get("hv_kv") is not None and abs(s["hv_kv"] - v) < 1e-6):
+            return None
+        return self._call(self.sem.set_hv, f"{v:.2f}" if v < 10 else f"{v:.1f}", what="HV")
 
     def _backlash_changed(self, v):
         self.settings.stage_backlash_um = float(v)
@@ -671,8 +754,8 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             self._hv_button(hv_on)
             emi = s.get("emission")
             self.l_emi.setText(f"emission {emi} µA" if emi is not None else "emission —")
-            sp = s.get("hv_setpoint_kv")
-            if sp is not None and not self.hv_set.hasFocus():
+            sp = s.get("hv_kv")  # on: the SEM's voltage; off: the box keeps the value HV ON will use
+            if hv_on and sp is not None and not self.hv_set.hasFocus():
                 self.hv_set.setValue(sp)
             self.l_mag.setText(_fmt_mag(s.get("mag")))
             if s.get("mag") in MAGNIFICATIONS and not self.mag_combo.view().isVisible():
@@ -703,10 +786,10 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             p = st.positions.get(a)
             self.dro[a].setText("—" if p is None else (f"{p:,.1f}" if st.unit(a) == "µm" else f"{p:.3f}"))
             state = st.motion_state(a)
-            self.dro_state[a].setText(state)
-            self.dro_state[a].setStyleSheet("color:" + {"moving": "#fb4", "completed": "#4c4", "halted": "#f90",
-                                                        "limit": "#f55", "fault": "#f55",
-                                                        "uncertain": "#f55"}.get(state, "#bbb"))
+            if state != self.dro_state[a]:  # the motion state: the value's colour, in its tooltip
+                self.dro_state[a] = state
+                self.dro[a].setStyleSheet(_DRO_STYLE % _STATE_COLOR.get(state, "#7f7"))
+                self.dro[a].setToolTip(f"{a}: {state} – double-click: move {a}")
         self._show_move_state()
         t = max((v for v in st.t_read.values() if v), default=None)
         self.l_read.setText("read " + time.strftime("%H:%M:%S", time.localtime(t)) if t else "not read yet")

@@ -148,6 +148,57 @@ def test_external_scan_follows_scanning(qtbot, sem):
     qtbot.waitUntil(lambda: mgr.backend.external_control is False, timeout=5000)
 
 
+def test_record_saves_mp4_or_avi_and_can_be_discarded(qtbot, sem, tmp_path):
+    """Record: a video of the image as displayed (data bar included), saved where the dialog says
+    (MP4 or AVI by its type); cancelling the dialog asks to discard it."""
+    import os
+
+    w = sem
+    assert w.a_record.text() == "Record" and w.a_record.icon() is not None
+    assert [a.text() for a in w.record_fps_menu.actions()] == ["5 frames/s", "10 frames/s", "25 frames/s"]
+    w.record_fps_menu.actions()[2].trigger()
+    assert w.record_fps == 25.0
+    w.scan.b_run.click()
+    qtbot.waitUntil(lambda: w.view.frame() is not None, timeout=15000)
+    w.a_record.trigger()  # start
+    assert w.recording and not w.record_fps_menu.isEnabled()
+    qtbot.wait(700)
+    w._update_status()
+    assert w.a_record.text().startswith("REC 0:00")
+    asked = []
+    w.ask_record_path = lambda default: asked.append(default) or str(tmp_path / "clip.avi")
+    w.a_record.trigger()  # stop: saved as AVI
+    assert not w.recording and w.a_record.text() == "Record" and w.record_fps_menu.isEnabled()
+    assert asked and asked[0].startswith(str(tmp_path)) and asked[0].endswith(".mp4")
+    b = (tmp_path / "clip.avi").read_bytes()
+    assert b[:4] == b"RIFF" and b[8:12] == b"AVI "
+    n = int.from_bytes(b[b.index(b"dmlh") + 8:b.index(b"dmlh") + 12], "little")  # the frames
+    assert 12 <= n <= 30  # ≈ 0.7 s at 25 frames/s
+    i = b.index(b"strf") + 8
+    width = int.from_bytes(b[i + 4:i + 8], "little")
+    height = int.from_bytes(b[i + 8:i + 12], "little")
+    assert width == 128 and height > 96  # the scan, with the data bar under it
+    assert not [f for f in os.listdir(tmp_path) if f.endswith(".gray")]  # the temporary frames are gone
+    # MP4 (a name without a type: MP4)
+    w.start_record()
+    qtbot.wait(400)
+    w.ask_record_path = lambda default: str(tmp_path / "clip2")
+    assert w.stop_record() == str(tmp_path / "clip2.mp4")
+    assert (tmp_path / "clip2.mp4").read_bytes()[4:8] == b"ftyp"
+    # cancel the dialog: discard? no -> asked again; yes -> nothing saved
+    w.start_record()
+    qtbot.wait(300)
+    answers = iter([None, str(tmp_path / "late.mp4")])
+    w.ask_record_path = lambda default: next(answers)
+    w.ask_discard = lambda text: False
+    assert w.stop_record() == str(tmp_path / "late.mp4")
+    w.start_record()
+    qtbot.wait(300)
+    w.ask_record_path = lambda default: None
+    w.ask_discard = lambda text: True
+    assert w.stop_record() is None and not (tmp_path / "late2.mp4").exists()
+
+
 def test_sem_view_annotated_render():
     from easyebl.imaging.engine import Frame
     from easyebl.imaging.raster import RasterConfig

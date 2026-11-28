@@ -45,7 +45,7 @@ def test_microscope_window(qtbot, bundle):
     qtbot.waitUntil(lambda: bundle.sem.magnification() == 5000 and bundle.sem.state["contrast"] == 1234, timeout=5000)
     qtbot.waitUntil(lambda: w.l_mag.text() == "×5k", timeout=2000)
     w.hv_set.setValue(12.5)
-    w.apply_hv()
+    w.hv_set.editingFinished.emit()  # Enter: HV is on, sent
     qtbot.waitUntil(lambda: bundle.sem.state.get("hv_setpoint_kv") == 12.5, timeout=3000)
     # readbacks changed elsewhere (the SEM panel) appear without sending anything back
     n_sent = len(bundle.link.session.simulator.received)

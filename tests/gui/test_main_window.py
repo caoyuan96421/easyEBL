@@ -44,12 +44,11 @@ def test_the_main_window_holds_every_subsystem(ui):
     assert [mw.bottom_split.widget(i) for i in range(3)] == [mw.messages_box, mw.bottom, mw.spectrum_box]
     assert [mw.bottom.tabText(i) for i in range(mw.bottom.count())] == ["Calibration", "Alignment", "SEM view"]
     assert mw.live_spectrum is not None and mw.live_spectrum.parent() is mw.spectrum_box
-    # left: Column / Stage, the stage positions, the beam monitor; the Stage tab's own copy hidden
-    assert [mw.left_split.widget(i) for i in range(3)] == [mw.left_tabs, mw.positions_box, mw.monitor_box]
-    assert mw.litho.tab_positions.parent() is mw.positions_box and mw.litho.tab_positions.isVisibleTo(mw)
+    # left: Column / Stage (with the stage positions), the beam monitor; not in the Lithography's tabs
+    assert [mw.left_split.widget(i) for i in range(mw.left_split.count())] == [mw.left_tabs, mw.monitor_box]
     stage_tab = mw.left_tabs.widget(1)
-    assert not any(g.isVisibleTo(stage_tab) for g in stage_tab.findChildren(QtWidgets.QGroupBox)
-                   if g.title().startswith("Stage positions"))
+    assert mw.mic.positions_tab.isVisibleTo(stage_tab)
+    assert mw.hosts["litho"].right.indexOf(mw.litho.tab_positions) < 0
     # the EDS Data Manager under the EDS settings (right)
     assert mw.eds.data_tabs.parent() is mw.eds_right
     # no toolbar of the main window: each tab has its own tools at its top
@@ -237,6 +236,90 @@ def test_one_hv_button(ui):
     assert asked == ["HV OFF", "HV ON"]
 
 
+def test_hv_voltage_box(ui, qtbot):
+    """No Set button.  HV on: the box shows the SEM's voltage; Enter / leaving it sends a new one.
+    HV off: the box keeps its value, changes are not sent, HV ON switches on at it."""
+    mic = ui.main.mic
+    sem = mic.sem
+    mic.confirm = False
+    assert not hasattr(mic, "b_hv_set")
+    qtbot.waitUntil(lambda: mic.hv_set.value() == 20.0, timeout=5000)  # the simulator starts on at 20 kV
+    # on: edit + Enter -> sent (in the SEM's 0.1 kV steps above 10 kV)
+    mic.hv_set.setValue(12.34)
+    mic.hv_set.editingFinished.emit()
+    assert mic.hv_set.value() == 12.3
+    qtbot.waitUntil(lambda: sem.accelerating_voltage_kv() == 12.3, timeout=5000)
+    # off: a modal window until the SEM reports it off; the box keeps 12.3; a change is not sent
+    mic.toggle_hv()
+    dlg = mic.hv_busy
+    assert dlg is not None and dlg.isModal() and dlg.windowTitle() == "HV OFF"
+    qtbot.waitUntil(lambda: mic.hv_busy is None, timeout=10000)
+    assert dlg.finished_ok and sem.state.get("hv_on") is False and mic.b_hv.text() == "HV ON"
+    assert mic.hv_set.value() == 12.3
+    n = len(sem.link.session.simulator.received)
+    mic.hv_set.setValue(7.5)
+    mic.hv_set.editingFinished.emit()
+    qtbot.wait(300)
+    assert not [c for c in sem.link.session.simulator.received[n:] if c.startswith("HV ")]
+    # HV ON: at the box's value, the window until it reads on
+    mic.toggle_hv()
+    assert mic.hv_busy is not None and mic.hv_busy.windowTitle() == "HV ON"
+    qtbot.waitUntil(lambda: mic.hv_busy is None, timeout=10000)
+    assert sem.state.get("hv_on") is True
+    assert sem.accelerating_voltage_kv() == 7.5 and mic.hv_set.value() == 7.5
+
+
+def test_hv_window_waits_for_the_readback_and_times_out(ui, qtbot, monkeypatch):
+    """The command answered but HV not yet reading on: HV is read again until it does; never: the
+    window gives up after HV_TIMEOUT_S."""
+    import concurrent.futures
+
+    mic = ui.main.mic
+    sem = mic.sem
+    mic.confirm = False
+    qtbot.waitUntil(lambda: sem.state.get("hv_on") is True and mic.b_hv.text() == "HV OFF", timeout=5000)
+    sim = sem.link.session.simulator
+    done = concurrent.futures.Future()
+    done.set_result(None)
+    monkeypatch.setattr(sem, "hv_off", lambda: done)  # "answered", HV still on
+    monkeypatch.setattr(mic, "HV_POLL_S", 0.2)
+    monkeypatch.setattr(mic, "HV_TIMEOUT_S", 30.0)
+    mic.toggle_hv()
+    qtbot.wait(600)
+    assert mic.hv_busy is not None
+    n = len(sim.received)
+    sim.sem["HV_ON"] = False  # now it is off: the next read closes the window
+    qtbot.waitUntil(lambda: mic.hv_busy is None, timeout=5000)
+    assert any(c.startswith("R HV") for c in sim.received[n:]) and sem.state.get("hv_on") is False
+    # never reaching it: given up after the time-out
+    monkeypatch.setattr(sem, "hv_on", lambda kv=None: done)
+    monkeypatch.setattr(mic, "HV_TIMEOUT_S", 0.5)
+    mic.toggle_hv()
+    dlg = mic.hv_busy
+    qtbot.waitUntil(lambda: mic.hv_busy is None, timeout=5000)
+    assert not dlg.finished_ok and sem.state.get("hv_on") is False
+
+
+def test_hv_box_starts_at_30_kv_when_hv_is_off(qtbot):
+    """At start: 30 kV in the box if HV is off; the SEM's voltage if it is on."""
+    from easyebl.microscope import MicroscopeLink, SEMControl, StageControl
+    from easyebl.microscope.gui import MicroscopeWindow
+
+    for on, expect in ((False, 30.0), (True, 20.0)):
+        link = MicroscopeLink.simulated(command_delay_s=0.0)
+        sim = link.session.simulator
+        sim.sem["HV_ON"] = on
+        if not on:
+            sim.sem["HV"] = "OFF"
+        sem, stage = SEMControl(link, polling=False), StageControl(link, polling=False)
+        sem.refresh().result(10)
+        w = MicroscopeWindow(link, sem, stage, owns_link=True)
+        qtbot.addWidget(w)
+        w._sync_all()
+        assert w.hv_set.value() == expect, on
+        w.close()
+
+
 def test_one_font_size_everywhere(ui):
     mw = ui.main
     pt = QtWidgets.QApplication.instance().font().pointSizeF()
@@ -253,7 +336,6 @@ def test_calibration_and_alignment_pages(ui):
     assert rows[0][3][0] == "not recorded" and rows[0][5][0] == "none"
     lw = mw.litho
     assert mw.alignment_view.rows() == [] or all(len(r) == 4 for r in mw.alignment_view.rows())
-    assert lw.tab_positions.parent() is mw.positions_box
 
 
 def test_layout_is_saved_and_restored(ui, tmp_path):
@@ -271,7 +353,7 @@ def test_reconnect_rebuilds_the_subsystems(ui):
     assert ui.restart_backend(ask=False)
     assert mw.sem is not None and mw.sem is not old and mw.sem.engine is ui.backend.engine
     assert mw.tabs.count() == 3 and mw.left_tabs.count() == 2 and mw.bottom.count() == 3
-    assert mw.litho.tab_positions.parent() is mw.positions_box and mw.live_spectrum.parent() is mw.spectrum_box
+    assert mw.mic.positions_tab is not None and mw.live_spectrum.parent() is mw.spectrum_box
     assert sum(1 for a in mw.menuBar().actions() if a.text() == "&Schedule") == 1
 
 

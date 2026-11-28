@@ -107,6 +107,13 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.busy = None  # the modal window of a running automatic function (easyebl.gui.busy.BusyDialog)
         self._disp_times: list = []
         self._sub = engine.subscribe(maxlen=200)
+        # Record: a video of the displayed image (recorder.py); the save path / discard questions
+        # can be replaced (tests): ask_record_path(default) -> path | None, ask_discard(text) -> bool
+        self.recorder = None
+        self.record_fps = 10.0
+        self._rec_key = self._rec_img = None
+        self.ask_record_path = None
+        self.ask_discard = None
 
         self.view = SEMImageView()
         self.pick_bar = self._make_pick_bar()
@@ -216,6 +223,21 @@ class SEMWindow(QtWidgets.QMainWindow):
         self.a_single = act("single", "Single", lambda: self.scan._do(self.engine.single),
                             "scan one frame, then freeze (F6)")
         self.a_capture = act("capture", "Capture", self.capture.request, "photo scan with the Capture settings (F9)")
+        self.a_record = act("record", "Record", self.toggle_record,
+                            "record a video of the image as displayed (with the data bar), in real time; "
+                            "stop to save it as MP4 (H.264) or uncompressed AVI.  The arrow: frame rate")
+        self.record_fps_menu = m = QtWidgets.QMenu(self)
+        grp = QtGui.QActionGroup(m)
+        for fps in (5, 10, 25):
+            a = m.addAction(f"{fps} frames/s")
+            a.setCheckable(True)
+            a.setChecked(fps == self.record_fps)
+            grp.addAction(a)
+            a.triggered.connect(lambda _=False, v=float(fps): setattr(self, "record_fps", v))
+        b = tb.widgetForAction(self.a_record)
+        if isinstance(b, QtWidgets.QToolButton):
+            b.setMenu(m)
+            b.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
         self.a_full = act("full_fov", "Full FoV", lambda: self.fov._do(self.engine.full_field),
                           "the whole field of view, no shift or rotation (Ctrl+0)")
         tb.addSeparator()
@@ -491,6 +513,7 @@ class SEMWindow(QtWidgets.QMainWindow):
             self.notify(f"auto contrast/brightness: {lo:.3g} … {hi:.3g} V")
 
     def _update_status(self):
+        self._show_recording()
         s = self.engine.status()
         col = STATE_COLORS.get(s.state, "#ccc")
         self.l_state.setText(f"<b style='color:{col}'>{s.state.value.upper()}</b>")
@@ -815,6 +838,128 @@ class SEMWindow(QtWidgets.QMainWindow):
         if path:
             self.save_frame(f, os.path.splitext(path)[0])
 
+    # ---------------------------------------------------------------- record (video)
+    @property
+    def recording(self) -> bool:
+        return self.recorder is not None
+
+    def toggle_record(self):
+        return self.stop_record() if self.recording else self.start_record()
+
+    def start_record(self) -> bool:
+        """Start recording the image as displayed (:mod:`.recorder`), at :attr:`record_fps`."""
+        from .recorder import SEMRecorder
+
+        if self.recording:
+            return False
+        self.recorder = SEMRecorder(self._record_image, self.record_fps, parent=self)
+        self.recorder.start()
+        self.record_fps_menu.setEnabled(False)
+        self.notify(f"recording ({self.record_fps:g} frames/s) – Record again to stop and save")
+        self._show_recording()
+        return True
+
+    def _record_image(self):
+        """The image as displayed, with the data bar (the same image object while nothing changed)."""
+        f = self.view.frame()
+        if f is None:
+            return None
+        lv = self.levels()
+        key = (id(f), f.seq, getattr(f, "rows_done", None), None if lv is None else tuple(lv),
+               self.view.info.get("column_mag"))
+        if key != self._rec_key:
+            self._rec_key, self._rec_img = key, render_annotated(f, lv, self.view.info)
+        return self._rec_img
+
+    def _show_recording(self) -> None:
+        a = getattr(self, "a_record", None)
+        if a is None:
+            return
+        rec = self.recorder
+        if rec is None:
+            if a.text() != "Record":
+                a.setText("Record")
+                a.setIcon(icon("record"))
+            return
+        t = int(rec.elapsed_s)
+        a.setText(f"REC {t // 60}:{t % 60:02d}")
+        a.setIcon(icon("record_stop"))
+
+    def stop_record(self, ask: bool = True) -> str | None:
+        """Stop recording and save the video (asks where; MP4 or AVI by the file type); the saved
+        path, or None (nothing recorded, discarded, cancelled).  *ask* False: discard."""
+        from .recorder import FORMATS, write_avi, write_mp4
+
+        rec, self.recorder = self.recorder, None
+        self.record_fps_menu.setEnabled(True)
+        self._rec_key = self._rec_img = None
+        self._show_recording()
+        if rec is None:
+            return None
+        fps = rec.fps
+        store = rec.stop()
+        rec.deleteLater()
+        if store is None or store.count == 0:
+            self.notify("recording stopped: no image was shown, nothing recorded")
+            if store is not None:
+                store.discard()
+            return None
+        n, dur = store.count, int(store.count / fps)
+        what = f"{n} frames, {dur // 60}:{dur % 60:02d} at {fps:g} frames/s, {store.width}×{store.height}"
+        try:
+            path = None
+            while ask and not path:
+                os.makedirs(self.save_settings.folder, exist_ok=True)
+                default = os.path.join(self.save_settings.folder, time.strftime("sem_%Y%m%d_%H%M%S.mp4"))
+                path = self._ask_record_path(default, what)
+                if not path and self._ask_discard(f"Discard the recording ({what})?"):
+                    break
+            if not path:
+                self.notify(f"recording discarded ({what})")
+                return None
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in FORMATS.values():
+                path, ext = path + ".mp4", ".mp4"
+            prog = QtWidgets.QProgressDialog(f"Saving {os.path.basename(path)}…", "Cancel", 0, n, self)
+            prog.setWindowTitle("Save the recording")
+            prog.setWindowModality(QtCore.Qt.WindowModal)
+            prog.setMinimumDuration(300)
+
+            def progress(done, total):
+                prog.setValue(done)
+                QtWidgets.QApplication.processEvents()
+                return not prog.wasCanceled()
+
+            try:
+                ok = (write_avi if ext == ".avi" else write_mp4)(path, store, fps, progress)
+            except Exception as e:  # noqa: BLE001
+                self.notify(f"saving the recording failed: {e}")
+                QtWidgets.QMessageBox.warning(self, "Record", f"Saving the recording failed:\n{e}")
+                return None
+            finally:
+                prog.close()
+            if not ok:
+                self.notify("saving the recording cancelled")
+                return None
+            self.notify(f"saved recording {os.path.basename(path)} ({what}) in {os.path.dirname(path)}")
+            return path
+        finally:
+            store.discard()
+
+    def _ask_record_path(self, default: str, what: str) -> str | None:
+        from .recorder import FORMATS
+
+        if self.ask_record_path is not None:
+            return self.ask_record_path(default)
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, f"Save the recording ({what})", default,
+                                                        ";;".join(FORMATS))
+        return path or None
+
+    def _ask_discard(self, text: str) -> bool:
+        if self.ask_discard is not None:
+            return self.ask_discard(text)
+        return QtWidgets.QMessageBox.question(self, "Record", text) == QtWidgets.QMessageBox.Yes
+
     def open_advanced(self):
         if self._adv is None:
             self._adv = AdvancedDialog(self.engine, self.save_settings, self, field_scale=self.field_scale,
@@ -858,6 +1003,8 @@ class SEMWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, ev):  # noqa: N802
         self.cancel_pick()
+        if self.recording:  # offer to save what was recorded
+            self.stop_record()
         tuner = self.autotune
         self.column.set_autotune(None)
         if tuner is not None and self._own_autotune:

@@ -56,7 +56,7 @@ window of the program, which runs in the foreground:
 
 * **Centre – tabs SEM, EDS, Lithography**: the SEM image, the EDS electron image and spectrum,
   the lithography stage plot – each with its tools at the top (icon, text under it):
-  - *SEM*: Run / Stop, Single, Capture, Full FoV, Autofocus (fine / coarse / with stigmation in its
+  - *SEM*: Run / Stop, Single, Capture, Record, Full FoV, Autofocus (fine / coarse / with stigmation in its
     menu), Auto stigmation, Auto gun align (the SEM's AGA), **Auto C/B** (the SEM's ABC), Crosshair, Scan
     line, Field inset, Advanced…, Full screen;
   - *EDS*: the electron-image tools Pan, Point, Rectangle, Ellipse, Line, Map area;
@@ -64,8 +64,9 @@ window of the program, which runs in the foreground:
     Writing order, Show dots.
 * **Left – the microscope**: *Column* (one HV ON / OFF button, exposure field size and
   magnification, focus and stigmator, beam current, SEM display), *Stage* (STOP ALL AXES,
-  position, jog), the lithography's **Stage positions** (ΔZ, Record WD, Go to) and the **beam
-  monitor** (the scan monitor described below).
+  position – X / Y / Z on one row, R / T on the next –, jog, and the lithography's **Stage
+  positions**: the list on the left, ΔZ, Record WD, Go to in a column on the right) and the **beam
+  monitor** (its settings on the left, the screen on the right; the scan monitor described below).
 * **Right – the active tab's settings**: SEM scan / capture / image / field of view / column; EDS acquire /
   map / composition with the **Data Manager** under them; lithography chips and exposure schedule.
 * **Bottom – three side by side**: **Messages** of every subsystem in one list (the source in its
@@ -154,6 +155,12 @@ Open → *SEM imaging*.  The window looks and works like a commercial SEM screen
   their own, so whole-image work (an 8000 × 8000 frame is 256 MB) never holds up the DAQ output buffer;
   partial frames of a large scan are published less often (copying kept under 10 % of the time).
 * **Capture** (F9): photo scan at its own size, speed and integration. Saved automatically as a 16‑bit TIFF (raw volts), a PNG, a PNG with the data bar, and JSON metadata.
+* **Record**: a video of the image as displayed (the Image contrast / brightness levels, the data bar
+  under it; no crosshair or other overlays), in real time at 5, 10 or 25 frames/s (the button's arrow;
+  10 by default): a slow scan shows line by line, a frozen image stands still.  While recording the
+  button shows **REC m:ss**; the frames go to a temporary file.  Record again stops and asks where to
+  save: **MP4** (H.264, Qt Multimedia – no extra package) or **AVI** (uncompressed 8-bit grey, OpenDML,
+  so recordings beyond 1 GB play); cancelling asks whether to discard the recording.
 * **Image** group: display **contrast / brightness**, **Auto levels** (Ctrl+A, one-shot or continuous: the
   display stretched to the image), and running **averaging**.
 * **Auto C/B** (toolbar, also in the small SEM view of the main window) runs the **SEM's own ABC**
@@ -396,7 +403,8 @@ S-3000. On top of it:
   the right is a compact stage panel:
   - **STOP ALL** (also *Esc*);
   - the line showing who drives the stage;
-  - a digital readout of X, Y, Z, R and T (double-click a value to move that axis to / by a value);
+  - a digital readout of X, Y, Z, R and T (double-click a value to move that axis to / by a value;
+    a value turns orange while its axis moves, red on a limit or fault);
   - the X/Y/Z/R/T jogs, with the step sizes and the X/Y approach beside them;
   - the lithography's **Stage positions** (the same list and buttons as the Lithography window's
     Stage Positions tab: X, Y, ΔZ, *Record WD*; see *Lithography*);
@@ -404,7 +412,10 @@ S-3000. On top of it:
 
   On the real instrument, HV switching, the automatic routines and moves ask for confirmation.  The
   SEM's own routine left in the window is **Auto gun alignment** (`AGA ON`, in the beam current
-  group; also in the SEM toolbar).  HV is one button: *HV ON* while off, *HV OFF* while on.  Auto focus and stigma are in the SEM imaging window.  The SEM's own scan mode is read back (`R SCAN`: answered by the S-3000
+  group; also in the SEM toolbar).  HV is one button: *HV ON* while off.  The voltage box has no Set button: while HV is on it shows
+  the SEM's voltage and Enter (or leaving the box) sets a new one; while HV is off a change is only
+  kept, and HV ON switches on at it (at start: **30 kV** unless HV is already on), *HV OFF* while on; the
+  emission current is shown in µA.  Auto focus and stigma are in the SEM imaging window.  The SEM's own scan mode is read back (`R SCAN`: answered by the S-3000
   although its manual does not list it) and shown in the display group.
 * **Beam presets** (*Beam presets…* in the toolbar or *Presets…* in the beam group): any number of
   named settings of beam 1 coarse / fine, stigmator X / Y and contrast / brightness.  *Save current…*
