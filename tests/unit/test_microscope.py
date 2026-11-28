@@ -60,6 +60,19 @@ def test_readbacks_and_settings(mic):
     assert snap["mag"] == 2500 and "hv_setpoint_kv" in snap
 
 
+def test_hv_on_from_off_starts_at_30_kv(mic):
+    link, sem, _stage = mic
+    sem.hv_off().result(10)
+    sem.hv_on().result(10)  # was off: 30 kV (the setpoint was 20 kV)
+    assert sem.accelerating_voltage_kv() == 30.0 and sem.state["hv_setpoint_kv"] == 30.0
+    sem.set_hv(15).result(10)
+    sem.hv_on().result(10)  # already on: the voltage stays
+    assert sem.accelerating_voltage_kv() == 15.0
+    sem.hv_off().result(10)
+    sem.hv_on(kv=None).result(10)  # keep the SEM's setpoint
+    assert sem.accelerating_voltage_kv() == 15.0
+
+
 def test_wd_from_focus_table():
     """WD is the objective focus read through the S-3000's table (measured 2026-11-23)."""
     from easyebl.microscope.s3000.focus_wd import (FINE_WEIGHT, WD_TABLE, effective_focus, focus_for_wd,

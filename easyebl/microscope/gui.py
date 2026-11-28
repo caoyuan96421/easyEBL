@@ -150,7 +150,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         if sem.state.get("hv_on"):
             self._confirmed("Switch the high voltage OFF?", sem.hv_off, "HV OFF")
         else:
-            self._confirmed("Switch the high voltage ON?", sem.hv_on, "HV ON")
+            self._confirmed(f"Switch the high voltage ON at {sem.DEFAULT_HV_KV:g} kV?", sem.hv_on, "HV ON")
 
     def _sem_panel(self):
         """The column, compact (it fits the left side bar of the main window at 1080p): every
@@ -176,7 +176,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
         self.l_hv.setStyleSheet(_BIG)
         self.l_emi = QtWidgets.QLabel("emission —")
         self.l_emi.setStyleSheet(_NOTE)
-        self.l_emi.setToolTip("R EMI (raw – the protocol does not give its units)")
+        self.l_emi.setToolTip("emission current (R EMI, in µA)")
         self.hv_set = _dspin(0.3, 30.0, 2, 20.0, 0.1, " kV")
         self.hv_set.setToolTip("setpoint: 0.30–9.99 kV in 0.01 kV, 10.0–30.0 kV in 0.1 kV steps")
         self.b_hv_set = QtWidgets.QPushButton("Set")
@@ -670,7 +670,7 @@ class MicroscopeWindow(QtWidgets.QMainWindow):
             self.l_hv.setStyleSheet(_BIG + (";color:#7d7" if hv_on else ";color:#bbb"))
             self._hv_button(hv_on)
             emi = s.get("emission")
-            self.l_emi.setText(f"emission {emi} (raw)" if emi is not None else "emission —")
+            self.l_emi.setText(f"emission {emi} µA" if emi is not None else "emission —")
             sp = s.get("hv_setpoint_kv")
             if sp is not None and not self.hv_set.hasFocus():
                 self.hv_set.setValue(sp)

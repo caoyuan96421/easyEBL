@@ -263,8 +263,16 @@ class SEMControl(MicroscopeControl):
 
         return self._set_latest("hv", text, send, text)
 
-    def hv_on(self) -> concurrent.futures.Future:
+    #: the accelerating voltage HV ON starts at (when HV was off)
+    DEFAULT_HV_KV = 30.0
+
+    def hv_on(self, kv: float | None = DEFAULT_HV_KV) -> concurrent.futures.Future:
+        """Switch HV on; from off, the setpoint is first set to *kv* (30 kV; None: keep the SEM's)."""
         def job(session):
+            if kv is not None and not self.state.get("hv_on"):
+                text = C.hv_setting(kv)
+                session.sem.command(text)
+                self._update({"hv_setpoint_kv": float(text.split()[1])})
             session.sem.hv_on()
             return self._read_items(session, ("HV", "EMI"))
 

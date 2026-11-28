@@ -22,7 +22,7 @@ from .errors import ValidationError
 #: Every read request listed in source section 5.2 (manual section 9), with a description.
 READ_COMMANDS: dict[str, str] = {
     "RUN": "RUN/FREEZE status",
-    "EMI": "Emission current (units and scaling unspecified)",
+    "EMI": "Emission current (µA)",
     "HV": "Accelerating voltage or OFF",
     "BEAM C": "Beam current 1 coarse setting (0-99, raw)",
     "BEAM F": "Beam current 1 fine setting (0-99, raw)",

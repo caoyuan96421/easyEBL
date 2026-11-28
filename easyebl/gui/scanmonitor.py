@@ -137,11 +137,9 @@ class ScanMonitorWidget(QtWidgets.QWidget):
         self.worker.skip_frame = lambda: self._busy
         self._frame.connect(self._show_frame, QtCore.Qt.QueuedConnection)
 
-        lay = QtWidgets.QVBoxLayout(self)
+        lay = QtWidgets.QHBoxLayout(self)  # the controls on the left, the screen on the right
         lay.setContentsMargins(0, 0, 0, 0)
         self.screen = ScopeScreen()
-        lay.addWidget(self.screen, 1)
-        row = QtWidgets.QHBoxLayout()
         self.res = QtWidgets.QComboBox()
         for r in RESOLUTIONS:
             self.res.addItem(f"{r}²", r)
@@ -163,17 +161,25 @@ class ScanMonitorWidget(QtWidgets.QWidget):
         b = QtWidgets.QToolButton()
         b.setText("Clear")
         b.clicked.connect(self.clear)
-        row.addWidget(QtWidgets.QLabel("Resolution"))
-        row.addWidget(self.res)
-        row.addWidget(QtWidgets.QLabel("Persistence"))
-        row.addWidget(self.retention)
-        row.addWidget(self.fade)
-        row.addStretch(1)
-        row.addWidget(b)
-        lay.addLayout(row)
+        col = QtWidgets.QVBoxLayout()
+        col.setSpacing(3)
+        col.addWidget(QtWidgets.QLabel("Resolution"))
+        col.addWidget(self.res)
+        col.addWidget(QtWidgets.QLabel("Persistence"))
+        col.addWidget(self.retention)
+        col.addWidget(self.fade)
+        col.addWidget(b)
         self.l_stats = QtWidgets.QLabel("idle")
         self.l_stats.setStyleSheet("color:#9aa")
-        lay.addWidget(self.l_stats)
+        self.l_stats.setWordWrap(True)
+        self.l_stats.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        col.addWidget(self.l_stats, 1)
+        self.controls = QtWidgets.QWidget()
+        self.controls.setLayout(col)
+        self.controls.setFixedWidth(110)
+        col.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.controls)
+        lay.addWidget(self.screen, 1)
         self.res.currentIndexChanged.connect(self._changed)
         self.retention.valueChanged.connect(self._changed)
         self.fade.toggled.connect(self._changed)
@@ -218,14 +224,14 @@ class ScanMonitorWidget(QtWidgets.QWidget):
         self.screen.spot = stats.spot
         self.screen.update()
         if stats.rate > 0:
-            txt = f"{stats.rate / 1e3:.0f} kS/s · {stats.unblanked * 100:.0f}% unblanked"
+            txt = f"{stats.rate / 1e3:.0f} kS/s\n{stats.unblanked * 100:.0f}% unblanked"
         else:
             txt = "no stream"
-        if stats.spot is not None:
+        if stats.spot is not None:  # one item per line (the column is narrow)
             x, y, b = stats.spot
-            txt += f" · beam ({x:+.2f}, {y:+.2f}) V {'blanked' if b else 'ON'}"
+            txt += f"\nbeam {'blanked' if b else 'ON'}\n({x:+.2f}, {y:+.2f}) V"
         if stats.dropped:
-            txt += f" · {stats.dropped:,} samples skipped"
+            txt += f"\n{stats.dropped:,} skipped"
         self.l_stats.setText(txt)
 
     def showEvent(self, ev):  # noqa: N802
